@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+client_convo
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights (large binaries — download or copy separately)
+*.pt
+!app/model/
+!app/model/jersey_number_yolo11m.pt
+
+# Video files
+*.mp4
+*.mp4.part
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Debug / test artifacts
+debug_output.*
+*.log
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# OS
+Thumbs.db
+.DS_Store
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage

@@ -1,0 +1,30 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Tests (not needed in production image)
+tests/
+
+# Dev files
+*.md
+*.log
+*.png
+.env
+.env.example
+.dockerignore
+
+# Video / debug artifacts
+*.mp4
+*.mp4.part
+debug_output.*
+
+# IDE
+.vscode/
+.idea/

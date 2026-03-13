@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
@@ -35,6 +36,7 @@ from app.services.detection_visualizer import DebugFrameData, write_debug_video
 
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_SPORTS = {"basketball", "football", "lacrosse"}
+_LOGGED_COLORS: set[str] = set()
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 NAMED_COLOR_OVERRIDES = {
     "royal blue": "#4169E1",
@@ -307,6 +309,7 @@ def _iter_frames_in_memory(
         "pipe:1",
     ]
 
+    print(f"CLIPT DEBUG: ffmpeg command: {' '.join(command)}", flush=True)
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
 
@@ -339,6 +342,14 @@ def _iter_frames_in_memory(
         proc.stdout.close()
         proc.terminate()
         proc.wait()
+        if proc.stderr:
+            try:
+                stderr_data = proc.stderr.read()
+                if stderr_data.strip():
+                    print(f"CLIPT DEBUG: ffmpeg stderr: {stderr_data.decode('utf-8', errors='replace')[:1000]}", flush=True)
+            except Exception:
+                pass
+        print(f"CLIPT DEBUG: ffmpeg finished, decoded {index} total frames", flush=True)
 
     if batch:
         yield batch
@@ -411,6 +422,12 @@ def _build_jersey_mask(
     # try HSV-range table first
     normalized = _normalize_color_input(jersey_color)
     hsv_ranges = COLOR_HSV_RANGES.get(normalized)
+    if normalized not in _LOGGED_COLORS:
+        _LOGGED_COLORS.add(normalized)
+        if hsv_ranges is not None:
+            print(f"CLIPT DEBUG: jersey color '{jersey_color}' → HSV table: {hsv_ranges}", flush=True)
+        else:
+            print(f"CLIPT DEBUG: jersey color '{jersey_color}' → not in HSV table, will use fallback", flush=True)
     if hsv_ranges is not None:
         mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
         for h_lo, h_hi, s_lo, s_hi, v_lo, v_hi in hsv_ranges:
@@ -723,6 +740,7 @@ def detect_jersey_in_frames(
     position: str | None = None,
     settings: PipelineSettings | None = None,
 ) -> list[dict[str, float]]:
+    print(f"CLIPT DEBUG: detect_jersey_in_frames called — videoUrl={video_url} jerseyNumber={jersey_number} jerseyColor={jersey_color} sport={sport} position={position}", flush=True)
     _validate_inputs(
         jersey_number=jersey_number,
         jersey_color=jersey_color,
@@ -732,6 +750,7 @@ def detect_jersey_in_frames(
 
     settings = settings or PipelineSettings()
     settings.validate()
+    print(f"CLIPT DEBUG: settings — fps={settings.fps} max_frames={settings.max_frames} batch_size={settings.frame_batch_size} strategy={settings.detection_strategy} conf_export={settings.conf_threshold_export} conf_internal={settings.conf_threshold_internal}", flush=True)
     started_at = time.perf_counter()
     detections: list[DetectedFrame] = []
     total_frames = 0
@@ -740,19 +759,28 @@ def detect_jersey_in_frames(
 
     with TemporaryDirectory(prefix="layer1-") as temp_dir:
         work_dir = Path(temp_dir)
-        video_file = _resolve_video_source(
-            video_url=video_url,
-            video_path=video_path,
-            video_bytes=video_bytes,
-            work_dir=work_dir,
-            settings=settings,
-        )
+        print(f"CLIPT DEBUG: downloading video from {video_url}", flush=True)
+        try:
+            video_file = _resolve_video_source(
+                video_url=video_url,
+                video_path=video_path,
+                video_bytes=video_bytes,
+                work_dir=work_dir,
+                settings=settings,
+            )
+        except Exception as err:
+            print(f"CLIPT DEBUG: EXCEPTION downloading video: {type(err).__name__}: {err}", flush=True)
+            traceback.print_exc()
+            raise
+        video_size = video_file.stat().st_size
+        print(f"CLIPT DEBUG: video downloaded to {video_file}, size={video_size} bytes ({video_size/1024/1024:.1f} MB)", flush=True)
         duration_seconds = _get_video_duration_seconds(video_file, settings)
         max_frames_cap = settings.max_frames if settings.max_frames is not None else "unlimited"
         estimated_frames = min(
             int(duration_seconds * settings.fps),
             settings.max_frames if settings.max_frames is not None else int(duration_seconds * settings.fps),
         )
+        print(f"CLIPT DEBUG: video duration={duration_seconds:.1f}s estimated_frames={estimated_frames} max_frames_cap={max_frames_cap}", flush=True)
         LOGGER.info(
             "CLIPT: processing up to %s frames at %s FPS from %.1fs video (estimated ~%s frames)",
             max_frames_cap,
@@ -830,6 +858,8 @@ def detect_jersey_in_frames(
                     # person seg -> colour filter -> number model
                     min_h = settings.min_person_crop_height
                     all_persons = detector.detect_persons_batch(frame_images)
+                    total_persons_batch = sum(len(p) for p in all_persons)
+                    print(f"CLIPT DEBUG: batch {batch_index} — {len(frame_images)} frames, {total_persons_batch} total persons detected", flush=True)
                     color_filter_futures = [
                         pool.submit(
                             _color_filter_persons_for_frame,
@@ -844,6 +874,8 @@ def detect_jersey_in_frames(
                     color_filter_results = [
                         future.result() for future in color_filter_futures
                     ]
+                    total_color_matches = sum(len(r[0]) for r in color_filter_results)
+                    print(f"CLIPT DEBUG: batch {batch_index} — {total_color_matches} color-matched persons (color='{jersey_color}')", flush=True)
 
                     for frame, frame_image, persons, color_filter_result in zip(
                         frames_to_process, frame_images, all_persons, color_filter_results
@@ -1064,6 +1096,7 @@ def detect_jersey_in_frames(
 
     stable_detections = _dedupe_frames(detections)
     elapsed_s = time.perf_counter() - started_at
+    print(f"CLIPT DEBUG: pipeline complete — processed_frames={total_frames} skipped={skipped_frames} final_detections={len(stable_detections)} elapsed={elapsed_s:.2f}s", flush=True)
     LOGGER.info(
         "Layer1 complete processed_frames=%s skipped=%s final_detections=%s elapsed=%.2fs",
         total_frames,

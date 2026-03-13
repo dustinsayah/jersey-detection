@@ -6,6 +6,7 @@ import gc
 import logging
 import os
 import re
+import traceback
 from pathlib import Path
 from statistics import mean
 
@@ -110,6 +111,7 @@ class YoloDigitDetector:
         model.to(self.device)
         gc.collect()
         _log_memory("after jersey-number model load")
+        print(f"CLIPT DEBUG: jersey model loaded, classes={model.names}", flush=True)
         return model
 
     def _load_person_model(self) -> YOLO:
@@ -198,6 +200,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in _predict_roi_digits: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("ROI inference failed: %s", error)
             return []
         if not predictions:
@@ -273,6 +277,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in _predict_roi_digits_batched: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("Batched ROI inference failed: %s", error)
             return {}
 
@@ -329,6 +335,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in _predict_people: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("Person fallback inference failed: %s", error)
             return []
         if not predictions:
@@ -511,6 +519,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in _predict_roi_numbers: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("Whole-number ROI inference failed: %s", error)
             return []
 
@@ -635,6 +645,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in detect_numbers_full_frame: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("Full-frame number detection failed: %s", error)
             return []
         if not predictions:
@@ -696,6 +708,8 @@ class YoloDigitDetector:
                 )
             torch.cuda.empty_cache()
         except Exception as error:
+            print(f"CLIPT DEBUG: EXCEPTION in detect_persons_batch: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
             LOGGER.warning("Batch person detection failed: %s", error)
             return [[] for _ in frames]
         if not predictions:

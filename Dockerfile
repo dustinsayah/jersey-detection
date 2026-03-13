@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PERSON_MODEL_SOURCE=app/model/yolo26n-seg.pt \
     DETECTION_STRATEGY=detection_first \
     FPS=2 \
-    CONF_THRESHOLD_EXPORT=0.55 \
+    CONF_THRESHOLD_EXPORT=0.25 \
+    CONF_THRESHOLD_INTERNAL=0.25 \
     GUNICORN_TIMEOUT=1800 \
     PORT=8000 \
     FRAME_BATCH_SIZE=8 \
@@ -34,10 +35,12 @@ ENV DENO_DIR=/tmp/deno
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
+# cache-bust 2026-03-12
 RUN pip install --no-cache-dir "numpy>=1.23.5,<2.0" --force-reinstall
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r /app/requirements.txt
+RUN python -c "import numpy; print(f'[BUILD CHECK] numpy version: {numpy.__version__}')"
 
 # bundle the person seg model so it doesn't download at runtime
 RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \

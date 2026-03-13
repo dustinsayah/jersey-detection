@@ -221,10 +221,10 @@ class PipelineSettings:
     yolo_imgsz: int = field(default_factory=lambda: _env_int("YOLO_IMGSZ", 416))
 
     conf_threshold_export: float = field(
-        default_factory=lambda: _env_float("CONF_THRESHOLD_EXPORT", 0.55)
+        default_factory=lambda: _env_float("CONF_THRESHOLD_EXPORT", 0.25)
     )
     conf_threshold_internal: float = field(
-        default_factory=lambda: _env_float("CONF_THRESHOLD_INTERNAL", 0.55)
+        default_factory=lambda: _env_float("CONF_THRESHOLD_INTERNAL", 0.25)
     )
     position_prior_weight: float = field(
         default_factory=lambda: _env_float("POSITION_PRIOR_WEIGHT", 0.10)

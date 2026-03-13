@@ -25,6 +25,7 @@ async def detect(
     detect_request: DetectRequest,
     detection_service: DetectionService = Depends(get_detection_service),
 ) -> Any:
+    print(f"CLIPT DEBUG: /detect endpoint hit — {request.method} from {request.client}", flush=True)
     if not getattr(request.app.state, "detector_ready", False):
         detail = getattr(
             request.app.state,

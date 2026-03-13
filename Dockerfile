@@ -10,7 +10,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FPS=2 \
     CONF_THRESHOLD_EXPORT=0.55 \
     GUNICORN_TIMEOUT=1800 \
-    PORT=8000
+    PORT=8000 \
+    FRAME_BATCH_SIZE=8 \
+    MAX_FRAMES=120 \
+    EARLY_EXIT_CONSECUTIVE=3 \
+    YOLO_IMGSZ=416 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    MALLOC_TRIM_THRESHOLD_=100000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import gc
 import logging
+import os
 import re
 from pathlib import Path
 from statistics import mean
 
 import numpy as np
 import cv2
+import psutil
+import torch
 from ultralytics import YOLO
 
 from app.services.detection_runtime import (
@@ -20,6 +24,17 @@ from app.services.detection_runtime import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _log_memory(label: str) -> None:
+    """Log current RSS memory to help diagnose Railway OOM crashes."""
+    try:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        LOGGER.info("CLIPT: memory %s: %.1f MB", label, mem_mb)
+    except Exception:
+        pass
+
 
 # keep one detector per model combo so we don't reload every request
 _detector_cache: dict[tuple[str, str], "YoloDigitDetector"] = {}
@@ -93,6 +108,8 @@ class YoloDigitDetector:
         LOGGER.info("Loading YOLO model: %s", model_ref)
         model = YOLO(model_ref)
         model.to(self.device)
+        gc.collect()
+        _log_memory("after jersey-number model load")
         return model
 
     def _load_person_model(self) -> YOLO:
@@ -103,6 +120,8 @@ class YoloDigitDetector:
         LOGGER.info("Loading person-detection model: %s", model_ref)
         model = YOLO(model_ref)
         model.to(self.device)
+        gc.collect()
+        _log_memory("after person-seg model load")
         return model
 
     def _class_label(self, class_id: int) -> str:
@@ -168,14 +187,16 @@ class YoloDigitDetector:
         if crop.size == 0:
             return []
         try:
-            predictions = self.model.predict(
-                source=crop,
-                conf=self.settings.detector_conf_threshold,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-                imgsz=320,
-            )
+            with torch.no_grad():
+                predictions = self.model.predict(
+                    source=crop,
+                    conf=self.settings.detector_conf_threshold,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=320,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("ROI inference failed: %s", error)
             return []
@@ -241,14 +262,16 @@ class YoloDigitDetector:
             resized_crops.append(resized)
 
         try:
-            predictions = self.model.predict(
-                source=resized_crops,
-                conf=self.settings.detector_conf_threshold,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-                imgsz=320,
-            )
+            with torch.no_grad():
+                predictions = self.model.predict(
+                    source=resized_crops,
+                    conf=self.settings.detector_conf_threshold,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=320,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("Batched ROI inference failed: %s", error)
             return {}
@@ -295,13 +318,16 @@ class YoloDigitDetector:
         self, frame_bgr: np.ndarray
     ) -> list[tuple[float, float, float, float, float]]:
         try:
-            predictions = self.model.predict(
-                source=frame_bgr,
-                conf=self.settings.person_fallback_min_conf,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-            )
+            with torch.no_grad():
+                predictions = self.model.predict(
+                    source=frame_bgr,
+                    conf=self.settings.person_fallback_min_conf,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=self.settings.yolo_imgsz,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("Person fallback inference failed: %s", error)
             return []
@@ -474,14 +500,16 @@ class YoloDigitDetector:
             resized_crops.append(cv2.resize(crop, (target_size, target_size)))
 
         try:
-            predictions = self.model.predict(
-                source=resized_crops if len(resized_crops) > 1 else resized_crops[0],
-                conf=self.settings.detector_conf_threshold,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-                imgsz=320,
-            )
+            with torch.no_grad():
+                predictions = self.model.predict(
+                    source=resized_crops if len(resized_crops) > 1 else resized_crops[0],
+                    conf=self.settings.detector_conf_threshold,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=320,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("Whole-number ROI inference failed: %s", error)
             return []
@@ -596,13 +624,16 @@ class YoloDigitDetector:
         self, frame_bgr: np.ndarray, target_number: int
     ) -> list[NumberCandidate]:
         try:
-            predictions = self.model.predict(
-                source=frame_bgr,
-                conf=self.settings.detector_conf_threshold,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-            )
+            with torch.no_grad():
+                predictions = self.model.predict(
+                    source=frame_bgr,
+                    conf=self.settings.detector_conf_threshold,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=self.settings.yolo_imgsz,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("Full-frame number detection failed: %s", error)
             return []
@@ -654,13 +685,16 @@ class YoloDigitDetector:
         person_mdl = self.person_model if self.person_model is not None else self.model
         source = frames if len(frames) > 1 else frames[0]
         try:
-            predictions = person_mdl.predict(
-                source=source,
-                conf=self.settings.person_fallback_min_conf,
-                iou=self.settings.detector_iou_threshold,
-                device=self.device,
-                verbose=False,
-            )
+            with torch.no_grad():
+                predictions = person_mdl.predict(
+                    source=source,
+                    conf=self.settings.person_fallback_min_conf,
+                    iou=self.settings.detector_iou_threshold,
+                    device=self.device,
+                    verbose=False,
+                    imgsz=self.settings.yolo_imgsz,
+                )
+            torch.cuda.empty_cache()
         except Exception as error:
             LOGGER.warning("Batch person detection failed: %s", error)
             return [[] for _ in frames]

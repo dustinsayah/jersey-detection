@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import os
@@ -747,6 +748,18 @@ def detect_jersey_in_frames(
             settings=settings,
         )
         duration_seconds = _get_video_duration_seconds(video_file, settings)
+        max_frames_cap = settings.max_frames if settings.max_frames is not None else "unlimited"
+        estimated_frames = min(
+            int(duration_seconds * settings.fps),
+            settings.max_frames if settings.max_frames is not None else int(duration_seconds * settings.fps),
+        )
+        LOGGER.info(
+            "CLIPT: processing up to %s frames at %s FPS from %.1fs video (estimated ~%s frames)",
+            max_frames_cap,
+            settings.fps,
+            duration_seconds,
+            estimated_frames,
+        )
         detector = get_or_create_detector(settings)
         num_workers = max(1, min(settings.pipeline_workers, os.cpu_count() or 1))
 
@@ -1047,6 +1060,7 @@ def detect_jersey_in_frames(
                     skipped_frames,
                     batch_detection_count,
                 )
+                gc.collect()
 
     stable_detections = _dedupe_frames(detections)
     elapsed_s = time.perf_counter() - started_at

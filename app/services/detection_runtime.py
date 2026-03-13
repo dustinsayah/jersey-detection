@@ -216,8 +216,9 @@ def _default_position_priors() -> dict[str, dict[str, PriorRegion]]:
 @dataclass(frozen=True)
 class PipelineSettings:
     fps: int = field(default_factory=lambda: _env_int("FPS", 2))
-    frame_batch_size: int = field(default_factory=lambda: _env_int("FRAME_BATCH_SIZE", 50))
-    max_frames: int | None = field(default_factory=lambda: _env_optional_int("MAX_FRAMES"))
+    frame_batch_size: int = field(default_factory=lambda: _env_int("FRAME_BATCH_SIZE", 8))
+    max_frames: int | None = field(default_factory=lambda: _env_optional_int("MAX_FRAMES", 120))
+    yolo_imgsz: int = field(default_factory=lambda: _env_int("YOLO_IMGSZ", 416))
 
     conf_threshold_export: float = field(
         default_factory=lambda: _env_float("CONF_THRESHOLD_EXPORT", 0.55)
@@ -287,7 +288,7 @@ class PipelineSettings:
         default_factory=lambda: _env_float("SKIP_SIMILARITY_THRESHOLD", 0.97)
     )
     early_exit_consecutive: int = field(
-        default_factory=lambda: _env_int("EARLY_EXIT_CONSECUTIVE", 0)
+        default_factory=lambda: _env_int("EARLY_EXIT_CONSECUTIVE", 3)
     )
     detection_strategy: str = field(
         default_factory=lambda: _env_optional_str("DETECTION_STRATEGY", "detection_first")
@@ -327,3 +328,5 @@ class PipelineSettings:
             raise ValueError("YOUTUBE_CLIP_SECONDS must be greater than 0 when set.")
         if self.early_exit_consecutive < 0:
             raise ValueError("EARLY_EXIT_CONSECUTIVE cannot be negative.")
+        if self.yolo_imgsz < 128:
+            raise ValueError("YOLO_IMGSZ must be >= 128.")

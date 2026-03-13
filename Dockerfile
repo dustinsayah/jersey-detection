@@ -35,8 +35,6 @@ ENV DENO_DIR=/tmp/deno
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-# cache-bust 2026-03-12
-RUN pip install --no-cache-dir "numpy>=1.23.5,<2.0" --force-reinstall
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r /app/requirements.txt

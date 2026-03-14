@@ -1,5 +1,3 @@
-"""Temporary script to run detection with debug video output."""
-
 import logging
 import os
 import sys
@@ -16,8 +14,8 @@ os.environ.setdefault("YOUTUBE_CLIP_SECONDS", "60")
 os.environ.setdefault("MAX_FRAMES", "120")  # 60s * 2fps = 120 frames
 os.environ.setdefault("EARLY_EXIT_CONSECUTIVE", "0")  # process all frames, no early exit
 
-from app.services.detection_pipeline import detect_jersey_in_frames
 from app.services.detection_detector import clear_detector_cache
+from app.services.detection_pipeline import detect_jersey_in_frames
 from app.services.detection_runtime import PipelineSettings
 
 # Clear cached detector so it reloads with dual-model config

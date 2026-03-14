@@ -8,18 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PERSON_MODEL_SOURCE=app/model/yolo26n-seg.pt \
     DETECTION_STRATEGY=detection_first \
     FPS=2 \
-    CONF_THRESHOLD_EXPORT=0.25 \
-    CONF_THRESHOLD_INTERNAL=0.25 \
+    CONF_THRESHOLD_EXPORT=0.55 \
     GUNICORN_TIMEOUT=1800 \
-    PORT=8000 \
-    FRAME_BATCH_SIZE=8 \
-    MAX_FRAMES=120 \
-    EARLY_EXIT_CONSECUTIVE=3 \
-    YOLO_IMGSZ=416 \
-    OMP_NUM_THREADS=1 \
-    OPENBLAS_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    MALLOC_TRIM_THRESHOLD_=100000
+    PORT=8000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -38,7 +29,6 @@ COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r /app/requirements.txt
-RUN python -c "import numpy; print(f'[BUILD CHECK] numpy version: {numpy.__version__}')"
 
 # bundle the person seg model so it doesn't download at runtime
 RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \

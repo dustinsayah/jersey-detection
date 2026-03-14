@@ -117,9 +117,17 @@ def create_app() -> FastAPI:
         for err in exc.errors():
             loc = " -> ".join(str(p) for p in err.get("loc", []))
             messages.append(f"{loc}: {err.get('msg', 'invalid')}")
+        message = "; ".join(messages) if messages else "Validation error"
+        body = getattr(exc, "body", None)
+        LOGGER.warning(
+            "detect.validation_failed path=%s body_type=%s error=%s",
+            request.url.path,
+            type(body).__name__ if body is not None else "none",
+            message,
+        )
         return JSONResponse(
             status_code=400,
-            content={"error": "; ".join(messages) if messages else "Validation error"},
+            content={"error": message},
         )
 
     return application

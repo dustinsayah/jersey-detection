@@ -7,6 +7,7 @@ Validates request parsing, error handling, and response shape.
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Any
 
 import pytest
@@ -164,6 +165,15 @@ class TestDetectValidation:
         assert "error" in body
         assert isinstance(body["error"], str)
 
+    def test_validation_failure_is_logged(self, client: TestClient, caplog) -> None:
+        caplog.set_level(logging.WARNING)
+
+        response = client.post("/detect", json={})
+
+        assert response.status_code == 400
+        assert "detect.validation_failed" in caplog.text
+        assert "path=/detect" in caplog.text
+
 
 # ---- Integration guide curl example reproduction -------------------------
 
@@ -216,3 +226,18 @@ class TestIntegrationGuideExamples:
             "sport": "basketball",
         })
         assert response.status_code == 200
+
+
+class TestDetectLogging:
+    def test_request_start_and_completion_logged(
+        self, client: TestClient, basketball_payload: dict[str, Any], caplog
+    ) -> None:
+        caplog.set_level(logging.INFO)
+
+        response = client.post("/detect", json=basketball_payload)
+
+        assert response.status_code == 200
+        assert "detect.request_started" in caplog.text
+        assert "detect.request_completed" in caplog.text
+        assert "source=video_url" in caplog.text
+        assert "result_count=" in caplog.text

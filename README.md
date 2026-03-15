@@ -136,6 +136,8 @@ CPU-friendly build:
 docker build -t layer1-cv:latest .
 ```
 
+The default CPU image is pinned around `torch==2.1.0+cpu`, so keep NumPy on the 1.x line for Railway-style CPU deployments.
+
 GPU build:
 
 ```bash
@@ -167,6 +169,7 @@ docker run --rm -p 8000:8000 \
 Railway deployment handoff:
 
 - See `docs/RAILWAY_DEPLOYMENT.md` for step-by-step Railway setup, required env vars, health checks, sample verification requests, and CPU vs GPU image guidance.
+- See `docs/CLAUDE_CODE_INTEGRATION_GUIDE.md` for the detailed Next.js / server-side proxy integration handoff.
 
 ### Browser Testing / CORS
 

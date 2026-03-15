@@ -13,6 +13,7 @@ Important note:
 
 - The current repo `Dockerfile` installs CPU-only PyTorch to keep the image size smaller for Railway-style deployment limits.
 - The repo also includes `Dockerfile.gpu` for CUDA-based deployment on a GPU machine.
+- For the current CPU Railway path, keep the Python dependency matrix aligned with `torch==2.1.0+cpu` / `torchvision==0.16.0+cpu`. In practice that means using a NumPy 1.x line and an OpenCV build compatible with it, rather than NumPy 2.x.
 
 ## What The Client Needs Before Deploying
 

@@ -7,6 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     YOLO_MODEL_SOURCE=app/model/jersey_number_yolo11m.pt \
     PERSON_MODEL_SOURCE=app/model/yolo26n-seg.pt \
     DETECTION_STRATEGY=detection_first \
+    JERSEY_READER_BACKEND=public_reader_ensemble \
+    PUBLIC_READER_ALLOW_LEGACY_FALLBACK=true \
     FPS=2 \
     CONF_THRESHOLD_EXPORT=0.55 \
     GUNICORN_TIMEOUT=1800 \
@@ -16,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
-    curl unzip \
+    curl unzip git \
     && rm -rf /var/lib/apt/lists/*
 
 # deno is needed by yt-dlp for YouTube JS extraction
@@ -37,6 +39,10 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \
 
 # The jersey-number model is project-specific and must be provided separately
 # at runtime or baked into a derivative image at app/model/jersey_number_yolo11m.pt.
+
+# Bootstrap public reader: clone external repos + download public checkpoints
+COPY scripts /app/scripts
+RUN python /app/scripts/bootstrap_public_reader.py
 
 COPY app /app/app
 COPY asgi.py /app/asgi.py

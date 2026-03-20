@@ -10,6 +10,9 @@ from pathlib import Path
 import numpy as np
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return default if raw is None else int(raw.strip())
@@ -70,6 +73,15 @@ def _default_ffprobe_binary() -> str:
         return env_value
     system_ffprobe = shutil.which("ffprobe")
     return system_ffprobe or "ffprobe"
+
+
+def _default_person_model_source() -> str:
+    bundled_path = _PROJECT_ROOT / "app" / "model" / "yolo26n-seg.pt"
+    if bundled_path.exists():
+        return str(bundled_path)
+    # Official Ultralytics model name. If the bundled file is absent,
+    # Ultralytics can download/cache it on first use.
+    return "yolo26n-seg.pt"
 
 
 @dataclass(frozen=True)
@@ -254,10 +266,81 @@ class PipelineSettings:
         or "app/model/jersey_number_yolo11m.pt"
     )
     person_model_source: str = field(
-        default_factory=lambda: _env_optional_str("PERSON_MODEL_SOURCE", "app/model/yolo26n-seg.pt")
-        or "app/model/yolo26n-seg.pt"
+        default_factory=lambda: _env_optional_str(
+            "PERSON_MODEL_SOURCE", _default_person_model_source()
+        )
+        or _default_person_model_source()
     )
     yolo_device: str = field(default_factory=lambda: os.getenv("YOLO_DEVICE", "auto"))
+    jersey_reader_backend: str = field(
+        default_factory=lambda: _env_optional_str(
+            "JERSEY_READER_BACKEND", "public_reader_ensemble"
+        )
+        or "public_reader_ensemble"
+    )
+    public_reader_allow_legacy_fallback: bool = field(
+        default_factory=lambda: _env_bool("PUBLIC_READER_ALLOW_LEGACY_FALLBACK", True)
+    )
+    public_reader_auto_download: bool = field(
+        default_factory=lambda: _env_bool("PUBLIC_READER_AUTO_DOWNLOAD", False)
+    )
+    public_reader_repo_dir: str = field(
+        default_factory=lambda: _env_optional_str(
+            "PUBLIC_READER_REPO_DIR", "external/uncertainty-jnr"
+        )
+        or "external/uncertainty-jnr"
+    )
+    parseq_repo_dir: str = field(
+        default_factory=lambda: _env_optional_str(
+            "PARSEQ_REPO_DIR", "external/jersey-number-pipeline/str/parseq"
+        )
+        or "external/jersey-number-pipeline/str/parseq"
+    )
+    public_models_dir: str = field(
+        default_factory=lambda: _env_optional_str(
+            "PUBLIC_MODELS_DIR", "app/model/public"
+        )
+        or "app/model/public"
+    )
+    grad_checkpoint_path: str = field(
+        default_factory=lambda: _env_optional_str(
+            "GRAD_CHECKPOINT_PATH", "app/model/public/uncertainty_jnr_vitb.pth"
+        )
+        or "app/model/public/uncertainty_jnr_vitb.pth"
+    )
+    grad_config_path: str = field(
+        default_factory=lambda: _env_optional_str(
+            "GRAD_CONFIG_PATH", "external/uncertainty-jnr/configs/base8_reid.yaml"
+        )
+        or "external/uncertainty-jnr/configs/base8_reid.yaml"
+    )
+    grad_min_confidence: float = field(
+        default_factory=lambda: _env_float("GRAD_MIN_CONFIDENCE", 0.60)
+    )
+    grad_max_uncertainty: float = field(
+        default_factory=lambda: _env_float("GRAD_MAX_UNCERTAINTY", 0.25)
+    )
+    legibility_model_path: str = field(
+        default_factory=lambda: _env_optional_str(
+            "LEGIBILITY_MODEL_PATH", "app/model/public/koshkina_legibility_soccer.pth"
+        )
+        or "app/model/public/koshkina_legibility_soccer.pth"
+    )
+    legibility_threshold: float = field(
+        default_factory=lambda: _env_float("LEGIBILITY_THRESHOLD", 0.50)
+    )
+    parseq_checkpoint_path: str = field(
+        default_factory=lambda: _env_optional_str(
+            "PARSEQ_CHECKPOINT_PATH", "app/model/public/koshkina_parseq_soccer.ckpt"
+        )
+        or "app/model/public/koshkina_parseq_soccer.ckpt"
+    )
+    parseq_use_pretrained_fallback: bool = field(
+        default_factory=lambda: _env_bool("PARSEQ_USE_PRETRAINED_FALLBACK", True)
+    )
+    parseq_min_confidence: float = field(
+        default_factory=lambda: _env_float("PARSEQ_MIN_CONFIDENCE", 0.55)
+    )
 
     enable_person_fallback: bool = field(
         default_factory=lambda: _env_bool("ENABLE_PERSON_FALLBACK", True)
@@ -327,3 +410,15 @@ class PipelineSettings:
             raise ValueError("YOUTUBE_CLIP_SECONDS must be greater than 0 when set.")
         if self.early_exit_consecutive < 0:
             raise ValueError("EARLY_EXIT_CONSECUTIVE cannot be negative.")
+        if self.jersey_reader_backend not in {"legacy_yolo", "public_reader_ensemble"}:
+            raise ValueError(
+                "JERSEY_READER_BACKEND must be 'legacy_yolo' or 'public_reader_ensemble'."
+            )
+        if not (0.0 <= self.grad_min_confidence <= 1.0):
+            raise ValueError("GRAD_MIN_CONFIDENCE must be in [0, 1].")
+        if self.grad_max_uncertainty < 0.0:
+            raise ValueError("GRAD_MAX_UNCERTAINTY must be >= 0.")
+        if not (0.0 <= self.legibility_threshold <= 1.0):
+            raise ValueError("LEGIBILITY_THRESHOLD must be in [0, 1].")
+        if not (0.0 <= self.parseq_min_confidence <= 1.0):
+            raise ValueError("PARSEQ_MIN_CONFIDENCE must be in [0, 1].")

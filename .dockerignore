@@ -24,7 +24,13 @@ tests/
 *.mp4
 *.mp4.part
 debug_output.*
+logs/
 
 # IDE
 .vscode/
 .idea/
+
+# Public-reader assets / vendor repos
+app/model/public/
+external/
+.external/

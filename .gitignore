@@ -14,8 +14,13 @@ env/
 
 # Model weights (large binaries — download or copy separately)
 *.pt
+*.pth
+*.ckpt
+*.part
 !app/model/
 !app/model/jersey_number_yolo11m.pt
+app/model/public/*
+!app/model/public/.gitkeep
 
 # Video files
 *.mp4
@@ -29,6 +34,12 @@ env/
 debug_output.*
 *.log
 *.png
+logs/
+
+# Local research/vendor checkouts
+.external/
+external/*
+!external/.gitkeep
 
 # IDE
 .vscode/

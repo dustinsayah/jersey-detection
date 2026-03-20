@@ -11,6 +11,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from app.main import app, create_app
+from app.services.detection_detector import _resolve_model_reference
 from app.services.detection_pipeline import detect_jersey_in_frames
 from app.services.detection_pipeline import _download_youtube_video
 from app.services.detection_runtime import DetectedFrame, InMemoryFrame, PipelineSettings
@@ -36,6 +37,23 @@ class TestPipelineSettings:
 
         assert settings.youtube_clip_seconds is None
         assert settings.early_exit_consecutive == 0
+
+    def test_person_model_default_points_to_official_model_name_or_bundled_copy(self) -> None:
+        settings = PipelineSettings()
+
+        assert settings.person_model_source.endswith("yolo26n-seg.pt")
+
+    def test_missing_local_person_model_falls_back_to_ultralytics_model_name(
+        self, tmp_path
+    ) -> None:
+        unresolved_path = tmp_path / "models" / "yolo26n-seg.pt"
+
+        model_ref = _resolve_model_reference(
+            str(unresolved_path),
+            allow_ultralytics_name_fallback=True,
+        )
+
+        assert model_ref == "yolo26n-seg.pt"
 
     def test_detected_frame_exports_bbox_percentages(self) -> None:
         payload = DetectedFrame(

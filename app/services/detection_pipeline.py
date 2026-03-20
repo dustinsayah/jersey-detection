@@ -569,12 +569,35 @@ def _blend_confidence(
 
 
 def _dedupe_frames(detections: list[DetectedFrame]) -> list[DetectedFrame]:
-    by_timestamp: dict[float, DetectedFrame] = {}
-    for item in detections:
-        current = by_timestamp.get(item.timestamp)
-        if current is None or item.confidence > current.confidence:
-            by_timestamp[item.timestamp] = item
-    return sorted(by_timestamp.values(), key=lambda item: item.timestamp)
+    if not detections:
+        return []
+
+    deduped: list[DetectedFrame] = []
+    for item in sorted(detections, key=lambda entry: (entry.timestamp, -entry.confidence)):
+        replaced = False
+        for idx, current in enumerate(deduped):
+            if current.timestamp != item.timestamp:
+                continue
+            ix1 = max(current.x1, item.x1)
+            iy1 = max(current.y1, item.y1)
+            ix2 = min(current.x2, item.x2)
+            iy2 = min(current.y2, item.y2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            current_area = max(1.0, (current.x2 - current.x1) * (current.y2 - current.y1))
+            item_area = max(1.0, (item.x2 - item.x1) * (item.y2 - item.y1))
+            union = current_area + item_area - intersection
+            overlap = float(intersection / union) if union > 0 else 0.0
+            if overlap < 0.85:
+                continue
+            if item.confidence > current.confidence:
+                deduped[idx] = item
+            replaced = True
+            break
+        if not replaced:
+            deduped.append(item)
+    return sorted(deduped, key=lambda item: (item.timestamp, -item.confidence))
 
 
 def _validate_inputs(
@@ -689,22 +712,23 @@ def _color_filter_persons_for_frame(
     jersey_color: str,
     settings: PipelineSettings,
     min_person_crop_height: int,
-) -> tuple[list[PersonBox], dict[int, float]]:
-    filtered_persons = [
-        person for person in persons if (person.y2 - person.y1) >= min_person_crop_height
+) -> tuple[list[PersonBox], dict[int, float], list[int]]:
+    candidate_indices = [
+        idx for idx, person in enumerate(persons)
+        if (person.y2 - person.y1) >= min_person_crop_height
     ]
-    if not filtered_persons:
-        return [], {}
+    if not candidate_indices:
+        return [], {}, []
 
     color_ratios = {
-        idx: _compute_color_ratio_in_box(frame_bgr, person, jersey_color, settings)
-        for idx, person in enumerate(filtered_persons)
+        idx: _compute_color_ratio_in_box(frame_bgr, persons[idx], jersey_color, settings)
+        for idx in candidate_indices
     }
-    matching_persons = [
-        person for idx, person in enumerate(filtered_persons)
-        if color_ratios.get(idx, 0.0) >= 0.15
+    matching_person_indices = [
+        idx for idx in candidate_indices if color_ratios.get(idx, 0.0) >= 0.15
     ]
-    return matching_persons, color_ratios
+    matching_persons = [persons[idx] for idx in matching_person_indices]
+    return matching_persons, color_ratios, matching_person_indices
 
 
 def _score_candidates(
@@ -737,6 +761,13 @@ def _score_candidates(
             if best is None or blended > best[0]:
                 best = (blended, candidate)
     return best
+
+
+def _strict_reader_mode(detector) -> bool:
+    if not hasattr(detector, "read_numbers_in_person_crops"):
+        return False
+    backend = getattr(detector, "reader_backend", None)
+    return backend is None or str(backend).strip().lower() == "public_reader_ensemble"
 
 
 def detect_jersey_in_frames(
@@ -786,6 +817,7 @@ def detect_jersey_in_frames(
             else 0.0
         )
         detector = get_or_create_detector(settings)
+        strict_reader_mode = _strict_reader_mode(detector)
         num_workers = max(1, min(settings.pipeline_workers, os.cpu_count() or 1))
         empty_result_counts = {
             "no_persons": 0,
@@ -816,7 +848,7 @@ def detect_jersey_in_frames(
                 "YouTube input clipping enabled for first %ss",
                 settings.youtube_clip_seconds,
             )
-        if settings.early_exit_consecutive > 0:
+        if settings.early_exit_consecutive > 0 and not strict_reader_mode:
             LOGGER.info(
                 "Early exit optimization enabled after %s consecutive detections",
                 settings.early_exit_consecutive,
@@ -852,6 +884,10 @@ def detect_jersey_in_frames(
                 for frame in valid_frames:
                     thumb = _frame_to_thumb(frame.image)
                     if (
+                        not strict_reader_mode
+                        and
+                        settings.skip_similarity_threshold > 0.0
+                        and
                         prev_thumb is not None
                         and _frame_similarity(prev_thumb, thumb)
                         >= settings.skip_similarity_threshold
@@ -894,9 +930,15 @@ def detect_jersey_in_frames(
         # Shared debug state for this frame
                         matching_persons: list[PersonBox] = []
                         color_ratios: dict[int, float] = {}
+                        matching_person_indices: list[int] = []
+                        matched_person_numbers: dict[int, tuple[int, float]] = {}
                         candidates: list[NumberCandidate] = []
 
-                        matching_persons, color_ratios = color_filter_result
+                        if len(color_filter_result) == 3:
+                            matching_persons, color_ratios, matching_person_indices = color_filter_result
+                        else:
+                            matching_persons, color_ratios = color_filter_result
+                            matching_person_indices = list(range(len(matching_persons)))
                         if not persons:
                             empty_result_counts["no_persons"] += 1
                             consecutive_detections = 0
@@ -916,13 +958,45 @@ def detect_jersey_in_frames(
                                     image=frame_image,
                                     persons=persons,
                                     color_ratios=color_ratios,
+                                    matching_person_indices=set(matching_person_indices),
                                 ))
                             continue
 
                         # Step 3: jersey-number detection on matching crops
-                        if (
-                            detector.whole_number_detection_enabled
-                            or detector.digit_detection_enabled
+                        if hasattr(detector, "read_numbers_in_person_crops"):
+                            read_results = detector.read_numbers_in_person_crops(
+                                frame_bgr=frame_image,
+                                persons=matching_persons,
+                            )
+                            for local_idx, read_candidate in read_results.items():
+                                if local_idx >= len(matching_persons):
+                                    continue
+                                original_idx = (
+                                    matching_person_indices[local_idx]
+                                    if local_idx < len(matching_person_indices)
+                                    else local_idx
+                                )
+                                matched_person_numbers[original_idx] = (
+                                    read_candidate.number,
+                                    read_candidate.confidence,
+                                )
+                                if read_candidate.number != jersey_number:
+                                    continue
+                                person_box = matching_persons[local_idx]
+                                candidates.append(
+                                    NumberCandidate(
+                                        number=read_candidate.number,
+                                        confidence=read_candidate.confidence,
+                                        digits=read_candidate.digits,
+                                        x1=person_box.x1,
+                                        y1=person_box.y1,
+                                        x2=person_box.x2,
+                                        y2=person_box.y2,
+                                    )
+                                )
+                        elif (
+                            getattr(detector, "whole_number_detection_enabled", False)
+                            or getattr(detector, "digit_detection_enabled", False)
                         ):
                             candidates = detector.find_digits_in_person_crops(
                                 frame_bgr=frame_image,
@@ -955,19 +1029,35 @@ def detect_jersey_in_frames(
                                     persons=persons,
                                     color_persons=matching_persons,
                                     color_ratios=color_ratios,
+                                    matching_person_indices=set(matching_person_indices),
+                                    matched_person_numbers=matched_person_numbers,
                                 ))
                             continue
 
                         frame_h, frame_w = frame_image.shape[:2]
-                        scored = _score_candidates(
-                            candidates,
-                            sport=sport,
-                            position=position,
-                            frame_width=frame_w,
-                            frame_height=frame_h,
-                            settings=settings,
-                        )
-                        frame_best = scored[0] if scored else None
+                        if strict_reader_mode and hasattr(detector, "read_numbers_in_person_crops"):
+                            accepted_candidates = [
+                                candidate
+                                for candidate in candidates
+                                if candidate.confidence >= settings.conf_threshold_export
+                            ]
+                            frame_best = (
+                                max((candidate.confidence for candidate in accepted_candidates), default=None)
+                                if accepted_candidates
+                                else None
+                            )
+                            scored = None
+                        else:
+                            accepted_candidates = []
+                            scored = _score_candidates(
+                                candidates,
+                                sport=sport,
+                                position=position,
+                                frame_width=frame_w,
+                                frame_height=frame_h,
+                                settings=settings,
+                            )
+                            frame_best = scored[0] if scored else None
 
                         if collect_debug:
                             debug_frames.append(DebugFrameData(
@@ -978,9 +1068,27 @@ def detect_jersey_in_frames(
                                 candidates=candidates,
                                 best_confidence=frame_best,
                                 color_ratios=color_ratios,
+                                matching_person_indices=set(matching_person_indices),
+                                matched_person_numbers=matched_person_numbers,
                             ))
 
-                        if scored is not None:
+                        if accepted_candidates:
+                            for candidate in accepted_candidates:
+                                detections.append(
+                                    DetectedFrame(
+                                        timestamp=frame.timestamp,
+                                        confidence=candidate.confidence,
+                                        x1=candidate.x1,
+                                        y1=candidate.y1,
+                                        x2=candidate.x2,
+                                        y2=candidate.y2,
+                                        frame_w=frame_w,
+                                        frame_h=frame_h,
+                                    )
+                                )
+                            batch_detection_count += len(accepted_candidates)
+                            consecutive_detections = 0
+                        elif scored is not None:
                             best_conf, best_cand = scored
                             detections.append(
                                 DetectedFrame(
@@ -997,6 +1105,8 @@ def detect_jersey_in_frames(
                             batch_detection_count += 1
                             consecutive_detections += 1
                             if (
+                                not strict_reader_mode
+                                and
                                 settings.early_exit_consecutive > 0
                                 and consecutive_detections
                                 >= settings.early_exit_consecutive
@@ -1034,11 +1144,23 @@ def detect_jersey_in_frames(
                                 ))
                             continue
 
-                        candidates = detector.find_target_matches(
-                            frame_bgr=frame_image,
-                            rois=rois,
-                            target_number=jersey_number,
-                        )
+                        if hasattr(detector, "read_numbers_in_rois"):
+                            roi_reads = detector.read_numbers_in_rois(
+                                frame_bgr=frame_image,
+                                rois=rois,
+                            )
+                            candidates = [
+                                candidate
+                                for candidate in roi_reads.values()
+                                if candidate.number == jersey_number
+                            ]
+                            candidates.sort(key=lambda item: item.confidence, reverse=True)
+                        else:
+                            candidates = detector.find_target_matches(
+                                frame_bgr=frame_image,
+                                rois=rois,
+                                target_number=jersey_number,
+                            )
                         if not candidates:
                             empty_result_counts["no_number_candidates"] += 1
                             consecutive_detections = 0
@@ -1051,15 +1173,29 @@ def detect_jersey_in_frames(
                             continue
 
                         frame_h, frame_w = frame_image.shape[:2]
-                        scored = _score_candidates(
-                            candidates,
-                            sport=sport,
-                            position=position,
-                            frame_width=frame_w,
-                            frame_height=frame_h,
-                            settings=settings,
-                        )
-                        frame_best = scored[0] if scored else None
+                        if strict_reader_mode and hasattr(detector, "read_numbers_in_rois"):
+                            accepted_candidates = [
+                                candidate
+                                for candidate in candidates
+                                if candidate.confidence >= settings.conf_threshold_export
+                            ]
+                            frame_best = (
+                                max((candidate.confidence for candidate in accepted_candidates), default=None)
+                                if accepted_candidates
+                                else None
+                            )
+                            scored = None
+                        else:
+                            accepted_candidates = []
+                            scored = _score_candidates(
+                                candidates,
+                                sport=sport,
+                                position=position,
+                                frame_width=frame_w,
+                                frame_height=frame_h,
+                                settings=settings,
+                            )
+                            frame_best = scored[0] if scored else None
 
                         if collect_debug:
                             debug_frames.append(DebugFrameData(
@@ -1070,7 +1206,23 @@ def detect_jersey_in_frames(
                                 best_confidence=frame_best,
                             ))
 
-                        if scored is not None:
+                        if accepted_candidates:
+                            for candidate in accepted_candidates:
+                                detections.append(
+                                    DetectedFrame(
+                                        timestamp=frame.timestamp,
+                                        confidence=candidate.confidence,
+                                        x1=candidate.x1,
+                                        y1=candidate.y1,
+                                        x2=candidate.x2,
+                                        y2=candidate.y2,
+                                        frame_w=frame_w,
+                                        frame_h=frame_h,
+                                    )
+                                )
+                            batch_detection_count += len(accepted_candidates)
+                            consecutive_detections = 0
+                        elif scored is not None:
                             best_conf, best_cand = scored
                             detections.append(
                                 DetectedFrame(
@@ -1087,6 +1239,8 @@ def detect_jersey_in_frames(
                             batch_detection_count += 1
                             consecutive_detections += 1
                             if (
+                                not strict_reader_mode
+                                and
                                 settings.early_exit_consecutive > 0
                                 and consecutive_detections
                                 >= settings.early_exit_consecutive

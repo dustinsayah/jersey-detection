@@ -17,8 +17,13 @@ Video → ffmpeg (2 FPS frames)
 
 | Model | File | Purpose |
 |-------|------|---------|
-| YOLOv8n-seg | `app/model/yolo26n-seg.pt` | Person instance segmentation (COCO) |
+| YOLOv8n-seg | `yolo26n-seg.pt` (or `app/model/yolo26n-seg.pt` when bundled) | Person instance segmentation (COCO) |
 | YOLOv11m | `app/model/jersey_number_yolo11m.pt` | Jersey number recognition (classes 0-99) |
+
+The detection-first path now supports a second backend behind the same API:
+
+- `public_reader_ensemble` (default): Grad uncertainty-JNR ViT-B on player crops, with Koshkina legibility gating and PARSeq fallback when the primary read is uncertain.
+- `legacy_yolo`: the previous YOLO-only jersey-number reader, kept as a compatibility fallback.
 
 ## Folder Structure
 
@@ -39,20 +44,78 @@ app/
     detection_service.py       # Top-level entry point
   main.py                      # FastAPI app factory + lifespan
 asgi.py                        # ASGI entry point for gunicorn/uvicorn
+scripts/
+  bootstrap_public_reader.py   # Clones public repos + downloads public checkpoints
 Dockerfile
 requirements.txt
+setup.bat                       # Windows one-command setup
 ```
 
 ## Install
+
+### Windows Quick Start
+
+```bat
+setup.bat
+```
+
+Useful options:
+
+```bat
+setup.bat --skip-models
+setup.bat --skip-repos --skip-models
+setup.bat --smoke-test
+```
+
+### Manual Setup
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # Linux/macOS
 pip install -r requirements.txt
+python scripts/bootstrap_public_reader.py
+```
+The repository includes the default jersey-number model under `app/model/`. The person model can be provided as a local file or auto-downloaded by Ultralytics on first run when `PERSON_MODEL_SOURCE=yolo26n-seg.pt`.
+
+You can still override both model locations with `YOLO_MODEL_SOURCE` and `PERSON_MODEL_SOURCE` if needed.
+
+To use the public ensemble reader, keep the public repos available under:
+
+- `external/uncertainty-jnr`
+- `external/jersey-number-pipeline/str/parseq`
+
+and place the public checkpoints under `app/model/public/`, or enable `PUBLIC_READER_AUTO_DOWNLOAD=true`.
+
+## GitHub / Fresh Clone Setup
+
+The following directories are intentionally excluded from Git so the repo stays push-friendly:
+
+- `external/`
+- `.external/`
+- `app/model/public/`
+- `logs/`
+
+After cloning from GitHub on Windows, the easiest path is:
+
+```bat
+setup.bat
 ```
 
-The repository includes the default jersey-number and person-detection weights under `app/model/`. You can still override them with `YOLO_MODEL_SOURCE` and `PERSON_MODEL_SOURCE` if needed.
+If you want the repo without downloading public checkpoints yet:
+
+```bat
+setup.bat --skip-models
+```
+
+Manual setup still works too:
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python scripts/bootstrap_public_reader.py
+```
 
 ## Run Locally
 
@@ -119,8 +182,13 @@ All settings can be tuned via env vars. See `.env.example` for the full list.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `JERSEY_READER_BACKEND` | `public_reader_ensemble` | Selects the crop-reader backend (`public_reader_ensemble` or `legacy_yolo`) |
 | `YOLO_MODEL_SOURCE` | `app/model/jersey_number_yolo11m.pt` | Path to jersey number model |
-| `PERSON_MODEL_SOURCE` | `app/model/yolo26n-seg.pt` | Path to person segmentation model |
+| `PERSON_MODEL_SOURCE` | `yolo26n-seg.pt` | Person segmentation model path or Ultralytics model name |
+| `GRAD_CHECKPOINT_PATH` | `app/model/public/uncertainty_jnr_vitb.pth` | Primary Grad ViT-B checkpoint |
+| `LEGIBILITY_MODEL_PATH` | `app/model/public/koshkina_legibility_soccer.pth` | Koshkina legibility checkpoint |
+| `PARSEQ_CHECKPOINT_PATH` | `app/model/public/koshkina_parseq_soccer.ckpt` | Koshkina PARSeq checkpoint |
+| `PUBLIC_READER_AUTO_DOWNLOAD` | `false` | Enables optional `gdown`-based checkpoint download |
 | `DETECTION_STRATEGY` | `detection_first` | Pipeline strategy |
 | `FPS` | `2` | Frames per second to sample |
 | `CONF_THRESHOLD_EXPORT` | `0.55` | Minimum confidence for exported detections |
@@ -183,3 +251,12 @@ Override this with `CORS_ALLOW_ORIGINS` for production deployments:
 ```bash
 CORS_ALLOW_ORIGINS=https://your-app.com,https://www.your-app.com
 ```
+
+## Practical Portability Notes
+
+- Fresh clones should work without a checked-in `app/model/yolo26n-seg.pt`. If the file is missing and `PERSON_MODEL_SOURCE` is an official Ultralytics model name such as `yolo26n-seg.pt`, the model downloads automatically on first use.
+- The public reader still requires a heavier first-time bootstrap because it downloads public checkpoints and research repos. That setup is reproducible through `python scripts/bootstrap_public_reader.py`, but it is not a tiny install.
+- For the smoothest local setup on another PC, use Python 3.11, install from `requirements.txt`, then run the bootstrap script before starting FastAPI.
+
+
+

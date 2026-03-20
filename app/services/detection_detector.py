@@ -18,6 +18,7 @@ from app.services.detection_runtime import (
     PipelineSettings,
     ROI,
 )
+from app.services.jersey_reader import PublicCheckpointReaderEnsemble
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +27,16 @@ _detector_cache: dict[tuple[str, str], "YoloDigitDetector"] = {}
 
 
 def get_or_create_detector(settings: PipelineSettings) -> "YoloDigitDetector":
-    cache_key = (settings.yolo_model_source, settings.person_model_source, settings.yolo_device)
+    cache_key = (
+        settings.yolo_model_source,
+        settings.person_model_source,
+        settings.yolo_device,
+        settings.jersey_reader_backend,
+        settings.grad_checkpoint_path,
+        settings.grad_config_path,
+        settings.legibility_model_path,
+        settings.parseq_checkpoint_path,
+    )
     if cache_key not in _detector_cache:
         LOGGER.info("Creating new YoloDigitDetector for key=%s", cache_key)
         _detector_cache[cache_key] = YoloDigitDetector(settings)
@@ -41,11 +51,45 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _looks_like_ultralytics_model_name(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(re.fullmatch(r"yolo[\w.-]+\.pt", normalized))
+
+
+def _resolve_model_reference(
+    raw_reference: str,
+    *,
+    allow_ultralytics_name_fallback: bool = False,
+) -> str:
+    model_ref = str(raw_reference).strip()
+    local_path = Path(model_ref).expanduser()
+    if local_path.exists():
+        return str(local_path.resolve())
+
+    basename = local_path.name
+    if (
+        allow_ultralytics_name_fallback
+        and basename
+        and basename != model_ref
+        and _looks_like_ultralytics_model_name(basename)
+    ):
+        LOGGER.info(
+            "Local model path %s was not found; falling back to Ultralytics model name %s.",
+            local_path,
+            basename,
+        )
+        return basename
+
+    return model_ref
+
+
 class YoloDigitDetector:
 
     def __init__(self, settings: PipelineSettings) -> None:
         self.settings = settings
         self.device = self._resolve_device()
+        self.reader_backend = settings.jersey_reader_backend.strip().lower()
+        self.crop_reader: PublicCheckpointReaderEnsemble | None = None
         self.model = self._load_model()
         self._label_to_number: dict[int, int] = self._build_label_number_map()
         self.whole_number_detection_enabled = self._supports_whole_number_detection()
@@ -53,12 +97,28 @@ class YoloDigitDetector:
             not self.whole_number_detection_enabled and self._supports_digit_detection()
         )
 
-        # separate COCO person model when the jersey model doesn't have person classes
-        self.person_model: YOLO | None = None
-        if self.whole_number_detection_enabled:
-            self.person_model = self._load_person_model()
+        # separate COCO person model for player localization
+        self.person_model: YOLO | None = self._load_person_model()
 
-        if self.whole_number_detection_enabled:
+        if self.reader_backend == "public_reader_ensemble":
+            self.crop_reader = PublicCheckpointReaderEnsemble(
+                settings,
+                device=self.device,
+            )
+            if not self.crop_reader.is_available():
+                if self.settings.public_reader_allow_legacy_fallback:
+                    LOGGER.warning(
+                        "Public checkpoint ensemble is unavailable; falling back to legacy YOLO number reader."
+                    )
+                    self.reader_backend = "legacy_yolo"
+                else:
+                    raise RuntimeError(
+                        "Public checkpoint ensemble backend is enabled but its checkpoints or dependencies are unavailable."
+                    )
+
+        if self.reader_backend == "public_reader_ensemble":
+            LOGGER.info("Public checkpoint ensemble reader is active.")
+        elif self.whole_number_detection_enabled:
             LOGGER.info(
                 "Dual-model mode: person model=%s, jersey number model=%s (%d classes).",
                 settings.person_model_source,
@@ -86,20 +146,20 @@ class YoloDigitDetector:
         return "cpu"
 
     def _load_model(self) -> YOLO:
-        model_ref = self.settings.yolo_model_source
-        local_path = Path(model_ref).expanduser()
-        if local_path.exists():
-            model_ref = str(local_path.resolve())
+        model_ref = _resolve_model_reference(
+            self.settings.yolo_model_source,
+            allow_ultralytics_name_fallback=False,
+        )
         LOGGER.info("Loading YOLO model: %s", model_ref)
         model = YOLO(model_ref)
         model.to(self.device)
         return model
 
     def _load_person_model(self) -> YOLO:
-        model_ref = self.settings.person_model_source
-        local_path = Path(model_ref).expanduser()
-        if local_path.exists():
-            model_ref = str(local_path.resolve())
+        model_ref = _resolve_model_reference(
+            self.settings.person_model_source,
+            allow_ultralytics_name_fallback=True,
+        )
         LOGGER.info("Loading person-detection model: %s", model_ref)
         model = YOLO(model_ref)
         model.to(self.device)
@@ -442,6 +502,57 @@ class YoloDigitDetector:
             )
         return candidates
 
+    def _build_all_number_candidates(
+        self,
+        *,
+        digits: list[DigitDetection],
+    ) -> list[NumberCandidate]:
+        if not digits:
+            return []
+
+        ordered = sorted(digits, key=lambda item: item.center_x)
+        candidates: list[NumberCandidate] = []
+
+        for digit in ordered:
+            score = _clamp01((0.8 * digit.confidence) + 0.2)
+            candidates.append(
+                NumberCandidate(
+                    number=int(digit.digit),
+                    confidence=score,
+                    digits=(digit,),
+                    x1=digit.x1,
+                    y1=digit.y1,
+                    x2=digit.x2,
+                    y2=digit.y2,
+                )
+            )
+
+        for left, right in zip(ordered, ordered[1:]):
+            gap = right.x1 - left.x2
+            allowed_gap = max(left.width, right.width) * self.settings.digit_max_gap_ratio
+            vertical_distance = abs(left.center_y - right.center_y)
+            allowed_vertical = max(left.height, right.height) * 0.8
+            if gap > allowed_gap or vertical_distance > allowed_vertical:
+                continue
+
+            avg_conf = mean((left.confidence, right.confidence))
+            min_conf = min(left.confidence, right.confidence)
+            score = _clamp01((0.55 * avg_conf) + (0.35 * min_conf) + 0.10)
+            candidates.append(
+                NumberCandidate(
+                    number=int(f"{left.digit}{right.digit}"),
+                    confidence=score,
+                    digits=(left, right),
+                    x1=min(left.x1, right.x1),
+                    y1=min(left.y1, right.y1),
+                    x2=max(left.x2, right.x2),
+                    y2=max(left.y2, right.y2),
+                )
+            )
+
+        candidates.sort(key=lambda item: item.confidence, reverse=True)
+        return candidates
+
     def _predict_roi_numbers(
         self,
         frame_bgr: np.ndarray,
@@ -555,6 +666,253 @@ class YoloDigitDetector:
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         return candidates
 
+    def _predict_best_numbers_in_rois(
+        self,
+        frame_bgr: np.ndarray,
+        rois: list[ROI],
+    ) -> dict[int, NumberCandidate]:
+        if not rois:
+            return {}
+
+        crops: list[np.ndarray] = []
+        crop_roi_indices: list[int] = []
+        for idx, roi in enumerate(rois):
+            crop = frame_bgr[roi.y1 : roi.y2, roi.x1 : roi.x2]
+            if crop.size == 0:
+                continue
+            crops.append(crop)
+            crop_roi_indices.append(idx)
+
+        if not crops:
+            return {}
+
+        target_size = 640
+        resized_crops: list[np.ndarray] = []
+        scale_factors: list[tuple[float, float]] = []
+        for crop in crops:
+            h, w = crop.shape[:2]
+            sx, sy = w / target_size, h / target_size
+            scale_factors.append((sx, sy))
+            resized_crops.append(cv2.resize(crop, (target_size, target_size)))
+
+        try:
+            predictions = self.model.predict(
+                source=resized_crops if len(resized_crops) > 1 else resized_crops[0],
+                conf=self.settings.detector_conf_threshold,
+                iou=self.settings.detector_iou_threshold,
+                device=self.device,
+                verbose=False,
+                imgsz=320,
+            )
+        except Exception as error:
+            LOGGER.warning("Whole-number ROI inference failed: %s", error)
+            return {}
+
+        if not predictions:
+            return {}
+
+        best_by_roi: dict[int, NumberCandidate] = {}
+        pred_list = predictions if isinstance(predictions, list) else [predictions]
+        for pred_idx, result in enumerate(pred_list):
+            if pred_idx >= len(crop_roi_indices):
+                break
+            roi_idx = crop_roi_indices[pred_idx]
+            roi = rois[roi_idx]
+            sx, sy = scale_factors[pred_idx]
+            crop_w = float(roi.x2 - roi.x1)
+            crop_h = float(roi.y2 - roi.y1)
+
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+
+            xyxy = result.boxes.xyxy.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+
+            for (x1, y1, x2, y2), conf, class_id in zip(xyxy, confs, classes):
+                number = self._class_to_jersey_number(int(class_id))
+                if number is None:
+                    continue
+
+                det_w = float(x2 - x1) * sx
+                det_h = float(y2 - y1) * sy
+                w_ratio = det_w / crop_w if crop_w > 0 else 0.0
+                h_ratio = det_h / crop_h if crop_h > 0 else 0.0
+                det_center_y = float(y1 + y2) / 2.0 * sy
+                relative_y = det_center_y / crop_h if crop_h > 0 else 0.5
+
+                if w_ratio > 0.85 or w_ratio < 0.03:
+                    continue
+                if h_ratio > 0.60 or h_ratio < 0.02:
+                    continue
+                if relative_y < 0.10 or relative_y > 0.75:
+                    continue
+
+                candidate = NumberCandidate(
+                    number=number,
+                    confidence=_clamp01(float(conf)),
+                    digits=tuple(),
+                    x1=float(roi.x1 + x1 * sx),
+                    y1=float(roi.y1 + y1 * sy),
+                    x2=float(roi.x1 + x2 * sx),
+                    y2=float(roi.y1 + y2 * sy),
+                )
+                current = best_by_roi.get(roi_idx)
+                if current is None or candidate.confidence > current.confidence:
+                    best_by_roi[roi_idx] = candidate
+
+        return best_by_roi
+
+    def _best_digit_candidates_in_rois(
+        self,
+        frame_bgr: np.ndarray,
+        rois: list[ROI],
+    ) -> dict[int, NumberCandidate]:
+        if not rois:
+            return {}
+
+        best_by_roi: dict[int, NumberCandidate] = {}
+        roi_digits_map = self._predict_roi_digits_batched(frame_bgr, rois)
+        for roi_idx, digits in roi_digits_map.items():
+            candidates = self._build_all_number_candidates(digits=digits)
+            if candidates:
+                best_by_roi[roi_idx] = candidates[0]
+        return best_by_roi
+
+    def _build_person_torso_rois(
+        self,
+        *,
+        frame_bgr: np.ndarray,
+        persons: list[PersonBox],
+    ) -> tuple[list[ROI], list[int]]:
+        if not persons:
+            return [], []
+
+        frame_h, frame_w = frame_bgr.shape[:2]
+        rois: list[ROI] = []
+        person_indices: list[int] = []
+        for person_idx, person in enumerate(persons):
+            x1 = max(0, int(person.x1))
+            y1 = max(0, int(person.y1))
+            x2 = min(frame_w, int(person.x2))
+            y2 = min(frame_h, int(person.y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            box_h = y2 - y1
+            torso_y1 = y1 + int(box_h * 0.15)
+            torso_y2 = y1 + int(box_h * 0.70)
+            if torso_y2 <= torso_y1:
+                continue
+
+            rois.append(
+                ROI(
+                    x1=x1,
+                    y1=torso_y1,
+                    x2=x2,
+                    y2=torso_y2,
+                    area=float((x2 - x1) * (torso_y2 - torso_y1)),
+                )
+            )
+            person_indices.append(person_idx)
+        return rois, person_indices
+
+    def read_numbers_in_rois(
+        self,
+        *,
+        frame_bgr: np.ndarray,
+        rois: list[ROI],
+    ) -> dict[int, NumberCandidate]:
+        if not rois:
+            return {}
+
+        if self.reader_backend == "public_reader_ensemble" and self.crop_reader is not None:
+            results: dict[int, NumberCandidate] = {}
+            for roi_idx, roi in enumerate(rois):
+                crop = frame_bgr[roi.y1 : roi.y2, roi.x1 : roi.x2]
+                if crop.size == 0:
+                    continue
+                read_result = self.crop_reader.read_crop(crop)
+                if not read_result.readable or read_result.number is None:
+                    continue
+                results[roi_idx] = NumberCandidate(
+                    number=int(read_result.number),
+                    confidence=_clamp01(read_result.confidence),
+                    digits=tuple(),
+                    x1=float(roi.x1),
+                    y1=float(roi.y1),
+                    x2=float(roi.x2),
+                    y2=float(roi.y2),
+                )
+            return results
+
+        if self.whole_number_detection_enabled:
+            return self._predict_best_numbers_in_rois(frame_bgr, rois)
+        if self.digit_detection_enabled:
+            return self._best_digit_candidates_in_rois(frame_bgr, rois)
+        return {}
+
+    def read_numbers_in_person_crops(
+        self,
+        *,
+        frame_bgr: np.ndarray,
+        persons: list[PersonBox],
+    ) -> dict[int, NumberCandidate]:
+        if self.reader_backend == "public_reader_ensemble" and self.crop_reader is not None:
+            frame_h, frame_w = frame_bgr.shape[:2]
+            person_reads: dict[int, NumberCandidate] = {}
+            for person_idx, person in enumerate(persons):
+                x1 = max(0, int(person.x1))
+                y1 = max(0, int(person.y1))
+                x2 = min(frame_w, int(person.x2))
+                y2 = min(frame_h, int(person.y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                crop = frame_bgr[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+
+                read_result = self.crop_reader.read_crop(crop)
+                if not read_result.readable or read_result.number is None:
+                    continue
+
+                person_reads[person_idx] = NumberCandidate(
+                    number=int(read_result.number),
+                    confidence=_clamp01(read_result.confidence),
+                    digits=tuple(),
+                    x1=float(person.x1),
+                    y1=float(person.y1),
+                    x2=float(person.x2),
+                    y2=float(person.y2),
+                )
+            return person_reads
+
+        rois, person_indices = self._build_person_torso_rois(
+            frame_bgr=frame_bgr,
+            persons=persons,
+        )
+        if not rois:
+            return {}
+
+        roi_reads = self.read_numbers_in_rois(frame_bgr=frame_bgr, rois=rois)
+        person_reads: dict[int, NumberCandidate] = {}
+        for roi_idx, candidate in roi_reads.items():
+            if roi_idx >= len(person_indices):
+                continue
+            person_idx = person_indices[roi_idx]
+            person = persons[person_idx]
+            person_reads[person_idx] = NumberCandidate(
+                number=candidate.number,
+                confidence=candidate.confidence,
+                digits=candidate.digits,
+                x1=float(person.x1),
+                y1=float(person.y1),
+                x2=float(person.x2),
+                y2=float(person.y2),
+            )
+        return person_reads
+
     def find_target_matches(
         self,
         *,
@@ -562,6 +920,19 @@ class YoloDigitDetector:
         rois: list[ROI],
         target_number: int,
     ) -> list[NumberCandidate]:
+        if self.reader_backend == "public_reader_ensemble":
+            generic_reads = self.read_numbers_in_rois(
+                frame_bgr=frame_bgr,
+                rois=rois,
+            )
+            candidates = [
+                candidate
+                for candidate in generic_reads.values()
+                if candidate.number == target_number
+            ]
+            candidates.sort(key=lambda item: item.confidence, reverse=True)
+            return candidates
+
         # Whole-number detection path (SultanRafi22-style models)
         if self.whole_number_detection_enabled:
             return self._predict_roi_numbers(frame_bgr, rois, target_number)
@@ -734,6 +1105,19 @@ class YoloDigitDetector:
         persons: list[PersonBox],
         target_number: int,
     ) -> list[NumberCandidate]:
+        if self.reader_backend == "public_reader_ensemble":
+            generic_reads = self.read_numbers_in_person_crops(
+                frame_bgr=frame_bgr,
+                persons=persons,
+            )
+            candidates = [
+                candidate
+                for candidate in generic_reads.values()
+                if candidate.number == target_number
+            ]
+            candidates.sort(key=lambda item: item.confidence, reverse=True)
+            return candidates
+
         if not persons:
             return []
 

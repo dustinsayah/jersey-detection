@@ -40,6 +40,8 @@ class DebugFrameData:
 
     # Color ratio per person (keyed by index into persons list)
     color_ratios: dict[int, float] = field(default_factory=dict)
+    matching_person_indices: set[int] = field(default_factory=set)
+    matched_person_numbers: dict[int, tuple[int, float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         h, w = self.image.shape[:2]
@@ -136,6 +138,25 @@ def _draw_rect(
         cv2.putText(img, label, (x1 + 2, y1 - 4), _FONT, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def _match_label(idx: int, person: PersonBox, data: DebugFrameData) -> str:
+    ratio = data.color_ratios.get(idx, -1.0)
+    ratio_str = f" cr={ratio:.0%}" if ratio >= 0 else ""
+    is_match = idx in data.matching_person_indices
+    if not is_match:
+        key = (int(person.x1), int(person.y1), int(person.x2), int(person.y2))
+        is_match = any(
+            key == (int(match.x1), int(match.y1), int(match.x2), int(match.y2))
+            for match in data.color_persons
+        )
+
+    if is_match and idx in data.matched_person_numbers:
+        number, confidence = data.matched_person_numbers[idx]
+        return f"MATCH #{number} conf={confidence:.2f}{ratio_str}"
+    if is_match:
+        return f"MATCH {person.confidence:.2f}{ratio_str}"
+    return f"rejected {person.confidence:.2f}{ratio_str}"
+
+
 def _annotate_frame(data: DebugFrameData) -> np.ndarray:
     frame = data.image.copy()
     h, w = frame.shape[:2]
@@ -169,15 +190,13 @@ def _annotate_frame(data: DebugFrameData) -> np.ndarray:
     # person boxes
     for idx, p in enumerate(data.persons):
         key = (int(p.x1), int(p.y1), int(p.x2), int(p.y2))
-        ratio = data.color_ratios.get(idx, -1.0)
-        ratio_str = f" cr={ratio:.0%}" if ratio >= 0 else ""
-        if key in color_match_set:
+        if idx in data.matching_person_indices or key in color_match_set:
             _draw_rect(
                 frame,
                 int(p.x1), int(p.y1), int(p.x2), int(p.y2),
                 _COLOR_COLOR_MATCH,
                 thickness=2,
-                label=f"MATCH {p.confidence:.2f}{ratio_str}",
+                label=_match_label(idx, p, data),
             )
         else:
             _draw_rect(
@@ -185,7 +204,7 @@ def _annotate_frame(data: DebugFrameData) -> np.ndarray:
                 int(p.x1), int(p.y1), int(p.x2), int(p.y2),
                 _COLOR_REJECTED,
                 thickness=1,
-                label=f"rejected {p.confidence:.2f}{ratio_str}",
+                label=_match_label(idx, p, data),
             )
 
     # colour-first ROIs

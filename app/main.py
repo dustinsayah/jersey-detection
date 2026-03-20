@@ -80,7 +80,7 @@ async def _lifespan(application: FastAPI):
         _verify_runtime_dependencies(settings)
         get_or_create_detector(settings)
         application.state.detector_ready = True
-        LOGGER.info("YOLO model warmed up at startup")
+        LOGGER.info("Detection stack warmed up at startup")
     except Exception as error:
         application.state.startup_error = str(error)
         LOGGER.exception("Model warm-up failed")

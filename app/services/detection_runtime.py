@@ -235,7 +235,7 @@ class PipelineSettings:
         default_factory=lambda: _env_float("CONF_THRESHOLD_EXPORT", 0.55)
     )
     conf_threshold_internal: float = field(
-        default_factory=lambda: _env_float("CONF_THRESHOLD_INTERNAL", 0.55)
+        default_factory=lambda: _env_float("CONF_THRESHOLD_INTERNAL", 0.35)
     )
     position_prior_weight: float = field(
         default_factory=lambda: _env_float("POSITION_PRIOR_WEIGHT", 0.10)
@@ -397,7 +397,12 @@ class PipelineSettings:
         if not (0.0 <= self.conf_threshold_export <= 1.0):
             raise ValueError("CONF_THRESHOLD_EXPORT must be in [0, 1].")
         if self.conf_threshold_export < self.conf_threshold_internal:
-            raise ValueError("CONF_THRESHOLD_EXPORT must be >= CONF_THRESHOLD_INTERNAL.")
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "CONF_THRESHOLD_EXPORT (%.2f) < CONF_THRESHOLD_INTERNAL (%.2f); auto-correcting.",
+                self.conf_threshold_export, self.conf_threshold_internal,
+            )
+            object.__setattr__(self, 'conf_threshold_internal', self.conf_threshold_export)
         if not (0.0 <= self.position_prior_weight <= 1.0):
             raise ValueError("POSITION_PRIOR_WEIGHT must be in [0, 1].")
         if self.roi_min_area < 0:

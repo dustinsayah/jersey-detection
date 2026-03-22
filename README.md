@@ -260,3 +260,4 @@ CORS_ALLOW_ORIGINS=https://your-app.com,https://www.your-app.com
 
 
 
+# v2 — fix CONF_THRESHOLD validation

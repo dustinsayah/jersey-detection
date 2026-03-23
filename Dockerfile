@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PUBLIC_READER_ALLOW_LEGACY_FALLBACK=true \
     FPS=2 \
     CONF_THRESHOLD_EXPORT=0.55 \
+    CONF_THRESHOLD_INTERNAL=0.3 \
     GUNICORN_TIMEOUT=1800 \
     PORT=8000
 
@@ -46,9 +47,10 @@ RUN python /app/scripts/bootstrap_public_reader.py
 
 COPY app /app/app
 COPY asgi.py /app/asgi.py
+COPY layers /app/layers
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/live || exit 1"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/live || exit 1"
 
 CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout ${GUNICORN_TIMEOUT:-1800} asgi:app"]

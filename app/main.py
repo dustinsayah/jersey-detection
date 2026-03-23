@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.detect import router as detect_router
+from app.routes.detect_unified import router as unified_router
 from app.routes.health import router as health_router
 
 LOGGER = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ def create_app() -> FastAPI:
 
     application.include_router(health_router)
     application.include_router(detect_router)
+    application.include_router(unified_router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_error_handler(

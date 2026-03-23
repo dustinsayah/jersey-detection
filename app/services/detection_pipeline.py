@@ -33,6 +33,28 @@ from app.services.detection_runtime import (
 from app.services.detection_visualizer import DebugFrameData, write_debug_video
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _env_float_safe(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_int_safe(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, TypeError):
+        return default
+
+
 SUPPORTED_SPORTS = {"basketball", "football", "lacrosse"}
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 NAMED_COLOR_OVERRIDES = {
@@ -75,6 +97,30 @@ COLOR_HSV_RANGES: dict[str, list[tuple[int, int, int, int, int, int]]] = {
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _enhance_frame_for_football(
+    frame_bgr: np.ndarray,
+    upscale_factor: int = 1,
+) -> np.ndarray:
+    """Apply CLAHE contrast enhancement for better jersey number visibility.
+    Optionally upscale the frame (for wide-angle football shots)."""
+    # CLAHE on the L channel of LAB colour space
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # Optional upscale for wide-angle shots
+    if upscale_factor > 1:
+        h, w = enhanced.shape[:2]
+        enhanced = cv2.resize(
+            enhanced,
+            (w * upscale_factor, h * upscale_factor),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+
+    return enhanced
 
 
 def _is_http_url(value: str) -> bool:
@@ -789,6 +835,32 @@ def detect_jersey_in_frames(
     )
 
     settings = settings or PipelineSettings()
+
+    # ── Sport-specific adjustments for football ─────────────────────
+    # Football game film is typically wide-angle, making players small.
+    # Lower thresholds and min sizes so detections aren't filtered out.
+    if sport.strip().lower() == "football":
+        football_export = _env_float_safe(
+            "FOOTBALL_CONF_THRESHOLD_EXPORT",
+            min(settings.conf_threshold_export, 0.35),
+        )
+        football_internal = _env_float_safe(
+            "FOOTBALL_CONF_THRESHOLD_INTERNAL",
+            min(settings.conf_threshold_internal, 0.20),
+        )
+        football_min_height = _env_int_safe("FOOTBALL_MIN_PERSON_CROP_HEIGHT", 40)
+        football_min_area = _env_int_safe("FOOTBALL_ROI_MIN_AREA", 150)
+        LOGGER.info(
+            "Football overrides: export_thresh=%.2f internal_thresh=%.2f "
+            "min_crop_height=%d min_area=%d",
+            football_export, football_internal,
+            football_min_height, football_min_area,
+        )
+        object.__setattr__(settings, "conf_threshold_export", football_export)
+        object.__setattr__(settings, "conf_threshold_internal", football_internal)
+        object.__setattr__(settings, "min_person_crop_height", football_min_height)
+        object.__setattr__(settings, "roi_min_area", football_min_area)
+
     settings.validate()
     started_at = time.perf_counter()
     detections: list[DetectedFrame] = []
@@ -901,6 +973,15 @@ def detect_jersey_in_frames(
                     continue
 
                 frame_images = [f.image for f in frames_to_process]
+
+                # Football enhancement: apply CLAHE + upscale for wide-angle shots
+                if sport.strip().lower() == "football":
+                    upscale = _env_int_safe("FOOTBALL_UPSCALE_FACTOR", 1)
+                    enhanced = []
+                    for img in frame_images:
+                        e = _enhance_frame_for_football(img, upscale_factor=upscale)
+                        enhanced.append(e)
+                    frame_images = enhanced
 
                 if use_detection_first:
                     # person seg -> colour filter -> number model

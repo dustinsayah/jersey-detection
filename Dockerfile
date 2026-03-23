@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
+    libsndfile1 \
     curl unzip git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,12 +32,20 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r /app/requirements.txt
+    && pip install --no-cache-dir -r /app/requirements.txt \
+    && (pip install --no-cache-dir tflite-runtime==2.14.0 || echo "tflite-runtime not available, YAMNet will be skipped")
 
 # bundle the person seg model so it doesn't download at runtime
 RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \
     && mkdir -p /app/app/model \
     && mv yolo26n-seg.pt /app/app/model/yolo26n-seg.pt
+
+# bundle YOLO pose model for pose estimation
+RUN python -c "from ultralytics import YOLO; m=YOLO('yolo11n-pose.pt'); import shutil; shutil.move('yolo11n-pose.pt', '/app/app/model/yolo11n-pose.pt')" || true
+
+# Pre-download YAMNet TFLite model for audio classification (non-fatal if fails)
+RUN python -c "import urllib.request; urllib.request.urlretrieve('https://tfhub.dev/google/lite-model/yamnet/tflite/1?lite-format=tflite', '/app/app/model/yamnet.tflite'); print('YAMNet downloaded')" \
+    || echo "YAMNet download skipped"
 
 # The jersey-number model is project-specific and must be provided separately
 # at runtime or baked into a derivative image at app/model/jersey_number_yolo11m.pt.
@@ -44,6 +53,12 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \
 # Bootstrap public reader: clone external repos + download public checkpoints
 COPY scripts /app/scripts
 RUN python /app/scripts/bootstrap_public_reader.py
+
+# Ensure model directory exists for Roboflow trained weights
+# football_digit_detector.pt, football_player_detector.pt,
+# basketball_jersey_ocr.pt, football_jersey_tracker.pt
+# must be committed to the repo at app/model/ after Colab training
+RUN mkdir -p /app/app/model
 
 COPY app /app/app
 COPY asgi.py /app/asgi.py

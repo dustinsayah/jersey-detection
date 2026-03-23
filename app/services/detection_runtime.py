@@ -377,6 +377,31 @@ class PipelineSettings:
         or "detection_first"
     )
 
+    # ── Analyze pipeline settings ───────────────────────────────────────
+    render_server_url: str = field(
+        default_factory=lambda: _env_optional_str("RENDER_SERVER_URL", "") or ""
+    )
+    anthropic_api_key: str = field(
+        default_factory=lambda: _env_optional_str("ANTHROPIC_API_KEY", "") or ""
+    )
+    enable_audio: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_AUDIO", True)
+    )
+    enable_tracking: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_TRACKING", True)
+    )
+    enable_pose: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_POSE", True)
+    )
+    pose_model_path: str = field(
+        default_factory=lambda: _env_optional_str("POSE_MODEL_PATH", "app/model/yolo11n-pose.pt")
+        or "app/model/yolo11n-pose.pt"
+    )
+    yamnet_model_path: str = field(
+        default_factory=lambda: _env_optional_str("YAMNET_MODEL_PATH", "/app/app/model/yamnet.tflite")
+        or "/app/app/model/yamnet.tflite"
+    )
+
     debug_video_path: str | None = field(
         default_factory=lambda: _env_optional_str("DEBUG_VIDEO_PATH")
     )

@@ -19,6 +19,10 @@ env/
 *.part
 !app/model/
 !app/model/jersey_number_yolo11m.pt
+!app/model/football_digit_detector.pt
+!app/model/football_player_detector.pt
+!app/model/basketball_jersey_ocr.pt
+!app/model/football_jersey_tracker.pt
 app/model/public/*
 !app/model/public/.gitkeep
 

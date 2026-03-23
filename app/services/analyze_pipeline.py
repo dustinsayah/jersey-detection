@@ -224,28 +224,37 @@ async def run_analyze_pipeline(
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
         # ── Step 7.5: Roboflow parallel detection layer ─────────────────
+        # Only use Roboflow for football/american_football — basketball model
+        # has low accuracy (mAP50: 0.10), so basketball falls through to
+        # Ali's ensemble + Claude Vision instead.
         roboflow_detections: list[dict] = []
-        try:
-            from app.services.roboflow_detector import roboflow_detector
+        if sport.lower() in ("football", "american_football"):
+            try:
+                from app.services.roboflow_detector import roboflow_detector
 
-            for t, frame in frames:
-                dets = roboflow_detector.detect_with_player_crops(
-                    frame,
-                    jersey_number=jersey_number,
-                    sport=sport,
-                    conf=0.2,
-                )
-                roboflow_detections.extend(
-                    {**d, "timestamp": t} for d in dets
-                )
+                for t, frame in frames:
+                    dets = roboflow_detector.detect_with_player_crops(
+                        frame,
+                        jersey_number=jersey_number,
+                        sport=sport,
+                        conf=0.2,
+                    )
+                    roboflow_detections.extend(
+                        {**d, "timestamp": t} for d in dets
+                    )
 
-            if roboflow_detections:
-                phases_used.append("roboflow_detection")
+                if roboflow_detections:
+                    phases_used.append("roboflow_detection")
+                LOGGER.info(
+                    "Pipeline: Roboflow layer found %d detections", len(roboflow_detections)
+                )
+            except Exception as exc:
+                LOGGER.warning("Pipeline: Roboflow layer failed (non-fatal): %s", exc)
+        else:
             LOGGER.info(
-                "Pipeline: Roboflow layer found %d detections", len(roboflow_detections)
+                "Pipeline: Roboflow layer skipped for sport=%s — using Ali's ensemble + Claude Vision",
+                sport,
             )
-        except Exception as exc:
-            LOGGER.warning("Pipeline: Roboflow layer failed (non-fatal): %s", exc)
 
         # ── Step 8: Build detection points and extract clips ─────────────
         detection_points: list[DetectionPoint] = []

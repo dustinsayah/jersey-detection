@@ -48,7 +48,11 @@ class RoboflowDetector:
             return
         self.football_digit_model = _load_model("football_digit_detector.pt")
         self.football_player_model = _load_model("football_player_detector.pt")
-        self.basketball_jersey_model = _load_model("basketball_jersey_ocr.pt")
+        # basketball_jersey_ocr skipped — low accuracy (mAP50: 0.10), pending retrain next Colab session
+        logger.warning(
+            "basketball_jersey_ocr skipped — low accuracy (mAP50: 0.10), pending retrain next Colab session"
+        )
+        self.basketball_jersey_model = None
         self.football_tracker_model = _load_model("football_jersey_tracker.pt")
         self._loaded = True
         loaded = sum(
@@ -56,12 +60,11 @@ class RoboflowDetector:
             for m in [
                 self.football_digit_model,
                 self.football_player_model,
-                self.basketball_jersey_model,
                 self.football_tracker_model,
             ]
             if m is not None
         )
-        logger.info("RoboflowDetector: %d/4 models loaded", loaded)
+        logger.info("RoboflowDetector: %d/3 models loaded (basketball skipped)", loaded)
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
         """2x upscale + CLAHE contrast enhancement for better digit reading."""
@@ -281,7 +284,7 @@ class RoboflowDetector:
         return {
             "football_digit_detector": "loaded" if self.football_digit_model else "missing",
             "football_player_detector": "loaded" if self.football_player_model else "missing",
-            "basketball_jersey_ocr": "loaded" if self.basketball_jersey_model else "missing",
+            "basketball_jersey_ocr": "skipped - pending retrain",
             "football_jersey_tracker": "loaded" if self.football_tracker_model else "missing",
         }
 

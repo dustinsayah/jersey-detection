@@ -54,21 +54,25 @@ async def download_youtube(
     Returns path to a local .mp4 file.
     Raises RuntimeError only if ALL 5 strategies fail.
     """
+    LOGGER.info("youtube_proxy called with URL: %s", url)
+    LOGGER.info("youtube_proxy: RENDER_SERVER_URL=%s", RENDER_SERVER_URL)
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_"))
     output_path = tmp_dir / "video.mp4"
     strategy_used = None
 
     # ── Strategy 1: Render server proxy (most reliable) ───────────────
+    # Render server expects {"youtubeUrl": "..."} and returns {"cloudinaryUrl": "...", "duration": N}
     if RENDER_SERVER_URL:
         try:
-            LOGGER.info("Strategy 1: render server proxy at %s", RENDER_SERVER_URL)
+            LOGGER.info("youtube_proxy: Strategy 1 — render server at %s", RENDER_SERVER_URL)
             async with httpx.AsyncClient(timeout=httpx.Timeout(90)) as client:
-                payload: dict = {"url": url}
+                payload: dict = {"youtubeUrl": url}
                 if start_time > 0:
                     payload["startTime"] = start_time
                 if end_time > 0:
                     payload["endTime"] = end_time
 
+                LOGGER.info("youtube_proxy: POST %s/download-youtube payload=%s", RENDER_SERVER_URL, payload)
                 resp = await client.post(
                     f"{RENDER_SERVER_URL}/download-youtube",
                     json=payload,
@@ -79,25 +83,35 @@ async def download_youtube(
                     if "video" in content_type or "octet-stream" in content_type:
                         output_path.write_bytes(resp.content)
                         LOGGER.info(
-                            "YouTube download succeeded via Strategy 1 (render server): %d bytes",
+                            "YouTube download succeeded via Strategy 1 (render server bytes): %d bytes",
                             len(resp.content),
                         )
                         return output_path
 
-                    # JSON response with download URL
+                    # JSON response — render server returns cloudinaryUrl
                     data = resp.json()
-                    download_url = data.get("downloadUrl") or data.get("url") or data.get("videoUrl")
+                    LOGGER.info("youtube_proxy: Strategy 1 response: %s", data)
+                    download_url = (
+                        data.get("cloudinaryUrl")
+                        or data.get("downloadUrl")
+                        or data.get("url")
+                        or data.get("videoUrl")
+                    )
                     if download_url:
-                        dl_resp = await client.get(download_url)
-                        if dl_resp.status_code == 200:
+                        LOGGER.info("youtube_proxy: downloading from %s", download_url[:80])
+                        dl_resp = await client.get(download_url, follow_redirects=True)
+                        if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
                             output_path.write_bytes(dl_resp.content)
                             LOGGER.info(
-                                "YouTube download succeeded via Strategy 1 (render server URL): %d bytes",
+                                "YouTube download succeeded via Strategy 1 (render→cloudinary): %d bytes",
                                 len(dl_resp.content),
                             )
                             return output_path
+                        LOGGER.warning("youtube_proxy: cloudinary download failed: %d, %d bytes",
+                                       dl_resp.status_code, len(dl_resp.content))
 
-                LOGGER.warning("Strategy 1 failed: render server returned %d", resp.status_code)
+                LOGGER.warning("Strategy 1 failed: render server returned %d: %s",
+                               resp.status_code, resp.text[:200])
         except Exception as exc:
             LOGGER.warning("Strategy 1 failed: %s — trying next", exc)
 
@@ -197,9 +211,9 @@ async def download_youtube(
     # ── Strategy 5: Render server /extract-frames (last resort) ───────
     if RENDER_SERVER_URL:
         try:
-            LOGGER.info("Strategy 5: render server /extract-frames (last resort)")
+            LOGGER.info("youtube_proxy: Strategy 5 — render server /extract-frames (last resort)")
             async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                payload = {"url": url}
+                payload = {"youtubeUrl": url}
                 if start_time > 0:
                     payload["startTime"] = start_time
                 if end_time > 0:
@@ -223,10 +237,15 @@ async def download_youtube(
 
                     # May return JSON with a video URL
                     data = resp.json()
-                    download_url = data.get("downloadUrl") or data.get("url") or data.get("videoUrl")
+                    download_url = (
+                        data.get("cloudinaryUrl")
+                        or data.get("downloadUrl")
+                        or data.get("url")
+                        or data.get("videoUrl")
+                    )
                     if download_url:
-                        dl_resp = await client.get(download_url)
-                        if dl_resp.status_code == 200:
+                        dl_resp = await client.get(download_url, follow_redirects=True)
+                        if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
                             if output_path.exists():
                                 output_path.unlink()
                             output_path.write_bytes(dl_resp.content)
@@ -252,6 +271,43 @@ async def test_youtube_download(
 ) -> dict:
     """Test YouTube download and report which strategy worked."""
     start = time.perf_counter()
+    strategy_results: list[dict] = []
+
+    # Test Strategy 1: Render server
+    s1_start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
+            payload = {"youtubeUrl": url}
+            resp = await client.post(f"{RENDER_SERVER_URL}/download-youtube", json=payload)
+            if resp.status_code == 200:
+                data = resp.json() if "json" in resp.headers.get("content-type", "") else {}
+                cloud_url = data.get("cloudinaryUrl", "")
+                if cloud_url:
+                    strategy_results.append({
+                        "strategy": 1, "name": "render_server",
+                        "status": "success", "cloudinaryUrl": cloud_url,
+                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                    })
+                else:
+                    strategy_results.append({
+                        "strategy": 1, "name": "render_server",
+                        "status": "no_url", "response": str(resp.text[:200]),
+                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                    })
+            else:
+                strategy_results.append({
+                    "strategy": 1, "name": "render_server",
+                    "status": f"http_{resp.status_code}",
+                    "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                })
+    except Exception as exc:
+        strategy_results.append({
+            "strategy": 1, "name": "render_server",
+            "status": "error", "error": str(exc)[:200],
+            "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+        })
+
+    # Full download test
     try:
         path = await download_youtube(
             url,
@@ -260,13 +316,14 @@ async def test_youtube_download(
         )
         elapsed = round(time.perf_counter() - start, 1)
         file_size = path.stat().st_size if path.exists() else 0
-        # Parse strategy from logs (read last log entry)
         return {
             "success": True,
             "file_size": file_size,
             "file_size_mb": round(file_size / 1024 / 1024, 2),
             "elapsed": elapsed,
             "file_path": str(path),
+            "render_server_url": RENDER_SERVER_URL,
+            "strategy_results": strategy_results,
         }
     except Exception as exc:
         elapsed = round(time.perf_counter() - start, 1)
@@ -274,6 +331,8 @@ async def test_youtube_download(
             "success": False,
             "error": str(exc),
             "elapsed": elapsed,
+            "render_server_url": RENDER_SERVER_URL,
+            "strategy_results": strategy_results,
         }
 
 

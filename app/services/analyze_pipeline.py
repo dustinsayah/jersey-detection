@@ -1,4 +1,37 @@
 # Analyze pipeline orchestrator — chains all detection layers
+#
+# DETECTION CALL CHAIN:
+# POST /analyze (app/routes/analyze.py)
+#   → run_analyze_pipeline() [this file]
+#     Step 1: Acquire video (YouTube download or direct URL download)
+#     Step 2: Ali's ensemble — _run_jersey_detection()
+#       → DetectionService.detect(DetectRequest)
+#         → detection_pipeline.py:detect_jersey_in_frames()
+#           → ffmpeg video decode → frame batching
+#           → jersey color mask → ROI extraction
+#           → YOLO person segmentation (yolo26n-seg.pt)
+#           → color matching on person torso
+#           → For each matched person:
+#             PublicCheckpointReaderEnsemble.read_crop()
+#               → Grad ViT-B (uncertainty_jnr_vitb.pth) — primary OCR
+#               → Koshkina legibility gate (koshkina_legibility_soccer.pth)
+#               → PARSeq fallback (koshkina_parseq_soccer.ckpt) — 4 crop variants
+#               → fuse_crop_read_results() — confidence fusion
+#           → temporal deduplication + export confidence filter
+#           → returns [{timestamp, confidence, bbox}]
+#     Step 3: Frame extraction (our frames for motion/audio/pose)
+#     Step 4: Motion scoring (optical flow)
+#     Step 5: Audio analysis (whistle + crowd energy)
+#     Step 6: Player tracking (BoT-SORT)
+#     Step 7: Pose estimation (YOLO11n-pose)
+#     Step 7.5: Roboflow parallel layer — roboflow_detector.py
+#       → football_player_detector finds player bboxes
+#       → football_digit_detector reads numbers from crops
+#       → football_jersey_tracker confirms across frames
+#       → returns [{timestamp, confidence, bbox, number, layer}]
+#     Step 8: Merge Ali + Roboflow detections, deduplicate, extract clips
+#     Step 9: Stat pipeline (ball_tracker → zone_detector → action_detector → game_stats)
+#     → Returns full AnalyzeResponse with clips, stats, debug
 
 from __future__ import annotations
 
@@ -125,9 +158,12 @@ async def run_analyze_pipeline(
         t0 = time.perf_counter()
         ali_status = "not_run"
         try:
+            # IMPORTANT: Always pass the original video_url to Ali's ensemble.
+            # Ali's detection_pipeline.py handles its own download internally.
+            # We only fall back to video_path if no URL was given.
             jersey_detections = _run_jersey_detection(
-                video_url=video_url if local_video_path is None else None,
-                video_path=str(local_video_path) if local_video_path else None,
+                video_url=video_url,
+                video_path=video_path if not video_url else None,
                 jersey_number=jersey_number,
                 jersey_color=jersey_color,
                 sport=sport,

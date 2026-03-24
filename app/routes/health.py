@@ -11,12 +11,28 @@ from fastapi.responses import JSONResponse
 router = APIRouter()
 
 
+def _model_file_status(path: str) -> str:
+    """Check if a model file exists."""
+    return "loaded" if Path(path).exists() else "missing"
+
+
 def _check_phases() -> dict:
     """Report which analysis phases are available."""
     phases = {}
+    model_dir = Path("/app/app/model") if Path("/app/app/model").exists() else Path("app/model")
+    public_dir = model_dir / "public"
+
+    # ── Ali's models ──
+    phases["ali_models"] = {
+        "uncertainty_jnr_vitb": _model_file_status(str(public_dir / "uncertainty_jnr_vitb.pth")),
+        "koshkina_legibility": _model_file_status(str(public_dir / "koshkina_legibility_soccer.pth")),
+        "koshkina_parseq": _model_file_status(str(public_dir / "koshkina_parseq_soccer.ckpt")),
+        "jersey_number_yolo11m": _model_file_status(str(model_dir / "jersey_number_yolo11m.pt")),
+        "yolo_person_seg": _model_file_status(str(model_dir / "yolo26n-seg.pt")),
+    }
 
     # Audio: check YAMNet model + tflite-runtime
-    yamnet_path = os.getenv("YAMNET_MODEL_PATH", "/app/app/model/yamnet.tflite")
+    yamnet_path = os.getenv("YAMNET_MODEL_PATH", str(model_dir / "yamnet.tflite"))
     phases["audio_yamnet"] = Path(yamnet_path).exists()
     try:
         import tflite_runtime  # noqa: F401
@@ -32,7 +48,7 @@ def _check_phases() -> dict:
         phases["audio_whistle_dsp"] = False
 
     # Pose: check YOLO pose model
-    pose_path = os.getenv("POSE_MODEL_PATH", "app/model/yolo11n-pose.pt")
+    pose_path = os.getenv("POSE_MODEL_PATH", str(model_dir / "yolo11n-pose.pt"))
     phases["pose_model"] = Path(pose_path).exists()
 
     # Motion: always available (OpenCV)
@@ -42,20 +58,43 @@ def _check_phases() -> dict:
     phases["player_tracking"] = True
 
     # YouTube proxy: check render server URL
-    phases["youtube_proxy"] = bool(os.getenv("RENDER_SERVER_URL", ""))
+    render_url = os.getenv("RENDER_SERVER_URL", "https://clipt-render-server-production.up.railway.app")
+    phases["youtube_proxy"] = bool(render_url)
+    phases["render_server_url"] = render_url
 
-    # Roboflow trained models
+    # ── Roboflow trained models ──
     try:
         from app.services.roboflow_detector import roboflow_detector
-
-        phases["roboflow_models"] = roboflow_detector.status()
-    except Exception:
-        phases["roboflow_models"] = {
-            "football_digit_detector": "import_error",
-            "football_player_detector": "import_error",
-            "basketball_jersey_ocr": "import_error",
-            "football_jersey_tracker": "import_error",
+        rf_status = roboflow_detector.status()
+        # Split into v1, v2, v3 sections
+        phases["roboflow_models_v1"] = {
+            k: v for k, v in rf_status.items()
+            if k in ("football_digit_detector", "football_player_detector",
+                     "basketball_jersey_ocr", "football_jersey_tracker")
         }
+        phases["roboflow_models_v2"] = {
+            k: v for k, v in rf_status.items()
+            if k not in phases["roboflow_models_v1"]
+            and k not in ("basketball_ball_detector", "football_ball_detector",
+                          "lacrosse_ball_detector", "basketball_action_detector",
+                          "basketball_court_zone")
+        }
+        phases["roboflow_models_v3"] = {
+            k: v for k, v in rf_status.items()
+            if k in ("basketball_ball_detector", "football_ball_detector",
+                     "lacrosse_ball_detector", "basketball_action_detector",
+                     "basketball_court_zone")
+        }
+    except Exception:
+        phases["roboflow_models_v1"] = {"error": "import_failed"}
+
+    # ── Stat pipeline status ──
+    phases["stat_pipeline"] = {
+        "ball_tracker": "ready - awaiting ball detector models",
+        "zone_detector": "ready - using geometry fallback",
+        "action_detector": "ready - awaiting action models",
+        "game_stats": "ready",
+    }
 
     # Memory usage
     try:

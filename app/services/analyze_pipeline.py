@@ -158,12 +158,22 @@ async def run_analyze_pipeline(
         t0 = time.perf_counter()
         ali_status = "not_run"
         try:
-            # IMPORTANT: Always pass the original video_url to Ali's ensemble.
-            # Ali's detection_pipeline.py handles its own download internally.
-            # We only fall back to video_path if no URL was given.
+            # If we already downloaded the video (YouTube or direct URL),
+            # pass the local file to Ali — avoids Ali re-downloading.
+            # If no local file, pass the original URL for Ali to handle.
+            if local_video_path and local_video_path.exists():
+                LOGGER.info("Pipeline: passing local file to Ali: %s (%d bytes)",
+                            local_video_path, local_video_path.stat().st_size)
+                ali_video_url = None
+                ali_video_path = str(local_video_path)
+            else:
+                LOGGER.info("Pipeline: passing URL to Ali: %s", (video_url or video_path or "")[:80])
+                ali_video_url = video_url
+                ali_video_path = video_path
+
             jersey_detections = _run_jersey_detection(
-                video_url=video_url,
-                video_path=video_path if not video_url else None,
+                video_url=ali_video_url,
+                video_path=ali_video_path,
                 jersey_number=jersey_number,
                 jersey_color=jersey_color,
                 sport=sport,

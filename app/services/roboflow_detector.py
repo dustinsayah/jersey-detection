@@ -53,6 +53,13 @@ class RoboflowDetector:
       - jersey_number_universal_v2.pt
       - lacrosse_detector_v1.pt
       - lacrosse_detector_v2.pt
+
+    Pending models (v3 — ball/action/zone):
+      - basketball_ball_detector.pt
+      - football_ball_detector.pt
+      - lacrosse_ball_detector.pt
+      - basketball_action_detector.pt
+      - basketball_court_zone.pt
     """
 
     def __init__(self):
@@ -72,6 +79,12 @@ class RoboflowDetector:
         self.jersey_number_universal_v2_model = None
         self.lacrosse_v1_model = None
         self.lacrosse_v2_model = None
+        # v3 models (ball/action/zone — pending training)
+        self.basketball_ball_detector_model = None
+        self.football_ball_detector_model = None
+        self.lacrosse_ball_detector_model = None
+        self.basketball_action_detector_model = None
+        self.basketball_court_zone_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
@@ -107,6 +120,21 @@ class RoboflowDetector:
             else:
                 logger.info("v2 model not yet trained: %s — pending next Colab session", filename)
 
+        # ── v3 models (ball/action/zone — load if present) ──
+        _v3_models = {
+            "basketball_ball_detector.pt": "basketball_ball_detector_model",
+            "football_ball_detector.pt": "football_ball_detector_model",
+            "lacrosse_ball_detector.pt": "lacrosse_ball_detector_model",
+            "basketball_action_detector.pt": "basketball_action_detector_model",
+            "basketball_court_zone.pt": "basketball_court_zone_model",
+        }
+        for filename, attr in _v3_models.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                setattr(self, attr, _load_model(filename))
+            else:
+                logger.info("v3 model not yet trained: %s — pending next Colab session", filename)
+
         self._loaded = True
         v1_loaded = sum(
             1
@@ -122,9 +150,14 @@ class RoboflowDetector:
             for attr in _v2_models.values()
             if getattr(self, attr) is not None
         )
+        v3_loaded = sum(
+            1
+            for attr in _v3_models.values()
+            if getattr(self, attr) is not None
+        )
         logger.info(
-            "RoboflowDetector: %d/3 v1 models loaded (basketball skipped), %d/9 v2 models loaded",
-            v1_loaded, v2_loaded,
+            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/5 v3 loaded",
+            v1_loaded, v2_loaded, v3_loaded,
         )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
@@ -364,6 +397,12 @@ class RoboflowDetector:
             "jersey_number_universal_v2": _v2_status("jersey_number_universal_v2_model"),
             "lacrosse_detector_v1": _v2_status("lacrosse_v1_model"),
             "lacrosse_detector_v2": _v2_status("lacrosse_v2_model"),
+            # v3 models (ball/action/zone)
+            "basketball_ball_detector": _v2_status("basketball_ball_detector_model"),
+            "football_ball_detector": _v2_status("football_ball_detector_model"),
+            "lacrosse_ball_detector": _v2_status("lacrosse_ball_detector_model"),
+            "basketball_action_detector": _v2_status("basketball_action_detector_model"),
+            "basketball_court_zone": _v2_status("basketball_court_zone_model"),
         }
 
 

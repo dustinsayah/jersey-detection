@@ -52,6 +52,20 @@ class PlayerTrack(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class DebugInfo(BaseModel):
+    ali_detections: int = 0
+    roboflow_detections: int = 0
+    combined_detections: int = 0
+    ali_working: bool = False
+    ali_status: str = "not_run"
+    youtube_strategy_used: str | None = None
+    total_elapsed_ms: int = 0
+    layers_that_contributed: list[str] = Field(default_factory=list)
+    layer_breakdown: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class AnalyzeResponse(BaseModel):
     clips: list[DetectedClip] = []
     layer_used: str = Field(default="full_pipeline", alias="layerUsed")
@@ -60,6 +74,10 @@ class AnalyzeResponse(BaseModel):
     frames_processed: int = Field(default=0, alias="framesProcessed")
     audio_events: list[AudioEvent] = Field(default_factory=list, alias="audioEvents")
     player_tracks: list[PlayerTrack] = Field(default_factory=list, alias="playerTracks")
+    game_stats: dict[str, Any] = Field(default_factory=dict, alias="gameStats")
+    per_clip_stats: list[dict] = Field(default_factory=list, alias="perClipStats")
+    actions_detected: list[dict] = Field(default_factory=list, alias="actionsDetected")
+    debug: DebugInfo = Field(default_factory=DebugInfo)
 
     model_config = ConfigDict(populate_by_name=True)
 

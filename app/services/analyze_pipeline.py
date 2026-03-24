@@ -63,11 +63,16 @@ async def run_analyze_pipeline(
     local_video_path: Path | None = None
     tmp_dir: Path | None = None
     frames_processed = 0
+    youtube_strategy_used: str | None = None
+
+    # Per-layer timing and debug info
+    layer_timings: dict[str, dict] = {}
 
     try:
         # ── Step 1: Acquire video ────────────────────────────────────────
         if video_url and is_youtube_url(video_url):
             LOGGER.info("Pipeline: downloading YouTube video")
+            t0 = time.perf_counter()
             try:
                 from app.services.detection_runtime import PipelineSettings
                 settings = PipelineSettings()
@@ -79,8 +84,12 @@ async def run_analyze_pipeline(
                     ffmpeg_binary=settings.ffmpeg_binary,
                 )
                 phases_used.append("youtube_download")
+                youtube_strategy_used = "download_success"
+                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
                 LOGGER.info("Pipeline: YouTube video downloaded to %s", local_video_path)
             except Exception as exc:
+                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
+                youtube_strategy_used = "all_failed"
                 LOGGER.error("Pipeline: YouTube download failed: %s", exc)
                 return _error_response(f"YouTube download failed: {exc}", time.perf_counter() - start_time)
         elif video_url:
@@ -111,8 +120,10 @@ async def run_analyze_pipeline(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
-        # ── Step 2: Run existing jersey detection ────────────────────────
+        # ── Step 2: Run existing jersey detection (Ali's ensemble) ─────
         jersey_detections: list[dict] = []
+        t0 = time.perf_counter()
+        ali_status = "not_run"
         try:
             jersey_detections = _run_jersey_detection(
                 video_url=video_url if local_video_path is None else None,
@@ -124,22 +135,41 @@ async def run_analyze_pipeline(
             )
             if jersey_detections:
                 phases_used.append("jersey_detection")
+                ali_status = "working"
+            else:
+                ali_status = "no_detections"
+            layer_timings["ali_jersey_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": ali_status,
+                "detections": len(jersey_detections),
+            }
             LOGGER.info("Pipeline: jersey detection found %d frames", len(jersey_detections))
         except Exception as exc:
+            ali_status = "error"
+            layer_timings["ali_jersey_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "error",
+                "error": str(exc),
+                "detections": 0,
+            }
             LOGGER.error("Pipeline: jersey detection failed: %s", exc)
 
         # ── Step 3: Extract frames for additional analysis ───────────────
         frames: list[tuple[float, np.ndarray]] = []
         if local_video_path and local_video_path.exists():
+            t0 = time.perf_counter()
             try:
                 frames = _extract_frames(local_video_path, fps=2, sport=sport)
                 frames_processed = len(frames)
+                layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
                 LOGGER.info("Pipeline: extracted %d frames", len(frames))
             except Exception as exc:
+                layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: frame extraction failed: %s", exc)
 
         # ── Step 4: Motion scoring ───────────────────────────────────────
         motion_scores: dict[float, float] = {}
+        t0 = time.perf_counter()
         try:
             if len(frames) >= 2:
                 for i in range(len(frames) - 1):
@@ -148,13 +178,16 @@ async def run_analyze_pipeline(
                     score = compute_motion_score(prev_frame, curr_frame)
                     motion_scores[t_next] = score.score
                 phases_used.append("motion_scoring")
+                layer_timings["motion_scoring"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "scores": len(motion_scores)}
                 LOGGER.info("Pipeline: computed %d motion scores", len(motion_scores))
         except Exception as exc:
+            layer_timings["motion_scoring"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
             LOGGER.warning("Pipeline: motion scoring failed: %s", exc)
 
         # ── Step 5: Audio analysis ───────────────────────────────────────
         audio_result = AudioAnalysisResult(has_audio=False)
         if enable_audio and local_video_path and local_video_path.exists():
+            t0 = time.perf_counter()
             try:
                 from app.services.audio_analyzer import analyze_audio
                 from app.services.detection_runtime import PipelineSettings
@@ -164,14 +197,22 @@ async def run_analyze_pipeline(
                     audio_result = analyze_audio(audio_path)
                     if audio_result.has_audio:
                         phases_used.append("audio_analysis")
+                    layer_timings["audio_analysis"] = {
+                        "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                        "status": "success" if audio_result.has_audio else "no_audio",
+                        "events": len(audio_result.events),
+                        "boundaries": len(audio_result.play_boundaries),
+                    }
                     LOGGER.info("Pipeline: audio analysis complete, %d events, %d boundaries",
                                 len(audio_result.events), len(audio_result.play_boundaries))
             except Exception as exc:
+                layer_timings["audio_analysis"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: audio analysis failed: %s", exc)
 
         # ── Step 6: Player tracking ──────────────────────────────────────
         tracking_result = None
         if enable_tracking and frames:
+            t0 = time.perf_counter()
             try:
                 from app.services.player_tracker import PlayerTracker
                 tracker = PlayerTracker(target_jersey=jersey_number)
@@ -196,14 +237,21 @@ async def run_analyze_pipeline(
                 tracking_result = tracker.get_result()
                 if tracking_result.tracks:
                     phases_used.append("player_tracking")
+                layer_timings["player_tracking"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if tracking_result.tracks else "no_tracks",
+                    "tracks": len(tracking_result.tracks) if tracking_result else 0,
+                }
                 LOGGER.info("Pipeline: tracking found %d tracks, target=%s",
                             len(tracking_result.tracks), tracking_result.target_track_id)
             except Exception as exc:
+                layer_timings["player_tracking"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: player tracking failed: %s", exc)
 
         # ── Step 7: Pose estimation ──────────────────────────────────────
         pose_results: dict[float, dict] = {}
         if enable_pose and frames:
+            t0 = time.perf_counter()
             try:
                 from app.services.pose_analyzer import PoseAnalyzer
                 analyzer = PoseAnalyzer()
@@ -219,8 +267,14 @@ async def run_analyze_pipeline(
                     }
                 if pose_results:
                     phases_used.append("pose_estimation")
+                layer_timings["pose_estimation"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if pose_results else "no_poses",
+                    "frames_analyzed": len(pose_results),
+                }
                 LOGGER.info("Pipeline: pose estimated for %d frames", len(pose_results))
             except Exception as exc:
+                layer_timings["pose_estimation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
         # ── Step 7.5: Roboflow parallel detection layer ─────────────────
@@ -228,6 +282,7 @@ async def run_analyze_pipeline(
         # Digit detection and player detection work regardless of sport.
         # Only basketball_jersey_ocr.pt is disabled (mAP50: 0.10).
         roboflow_detections: list[dict] = []
+        t0 = time.perf_counter()
         try:
             from app.services.roboflow_detector import roboflow_detector
 
@@ -245,11 +300,17 @@ async def run_analyze_pipeline(
 
             if roboflow_detections:
                 phases_used.append("roboflow_detection")
+            layer_timings["roboflow_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if roboflow_detections else "no_detections",
+                "detections": len(roboflow_detections),
+            }
             LOGGER.info(
                 "Pipeline: Roboflow layer found %d detections for sport=%s",
                 len(roboflow_detections), sport,
             )
         except Exception as exc:
+            layer_timings["roboflow_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
             LOGGER.warning("Pipeline: Roboflow layer failed (non-fatal): %s", exc)
 
         # ── Step 8: Build detection points and extract clips ─────────────
@@ -338,6 +399,37 @@ async def run_analyze_pipeline(
                 if duration > FOOTBALL_MAX_CLIP:
                     clip.end_time = clip.start_time + FOOTBALL_MAX_CLIP
 
+        # ── Step 9: Stat generation pipeline ───────────────────────────
+        stat_result: dict = {"game_stats": {}, "per_clip_stats": [], "actions_detected": []}
+        t0 = time.perf_counter()
+        try:
+            from app.services.stat_pipeline import run_stat_pipeline
+            clips_as_dicts = [
+                {"startTime": c.start_time, "endTime": c.end_time, "grade": c.grade}
+                for c in clips
+            ]
+            stat_result = run_stat_pipeline(
+                frames=frames,
+                sport=sport,
+                jersey_number=jersey_number,
+                position=position,
+                pose_results=pose_results if pose_results else None,
+                motion_scores=motion_scores if motion_scores else None,
+                audio_result=audio_result if audio_result.has_audio else None,
+                clips=clips_as_dicts,
+            )
+            if stat_result.get("actions_detected"):
+                phases_used.append("stat_generation")
+            layer_timings["stat_generation"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success",
+                "actions_found": len(stat_result.get("actions_detected", [])),
+            }
+            LOGGER.info("Pipeline: stat generation found %d actions", len(stat_result.get("actions_detected", [])))
+        except Exception as exc:
+            layer_timings["stat_generation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
+            LOGGER.warning("Pipeline: stat generation failed (non-fatal): %s", exc)
+
         elapsed = time.perf_counter() - start_time
 
         # Build response
@@ -380,6 +472,24 @@ async def run_analyze_pipeline(
                 "signals": clip.signals,
             })
 
+        # ── Build debug field ──────────────────────────────────────────
+        ali_working = ali_status == "working"
+        layers_that_contributed = [
+            layer for layer in phases_used
+            if layer not in ("youtube_download", "frame_extraction")
+        ]
+        debug = {
+            "ali_detections": len(jersey_detections),
+            "roboflow_detections": len(roboflow_detections),
+            "combined_detections": len(detection_points),
+            "ali_working": ali_working,
+            "ali_status": ali_status,
+            "youtube_strategy_used": youtube_strategy_used,
+            "total_elapsed_ms": round(elapsed * 1000),
+            "layers_that_contributed": layers_that_contributed,
+            "layer_breakdown": layer_timings,
+        }
+
         return {
             "clips": clips_out,
             "layerUsed": layer_used,
@@ -388,6 +498,10 @@ async def run_analyze_pipeline(
             "framesProcessed": frames_processed,
             "audioEvents": audio_events_out,
             "playerTracks": player_tracks_out,
+            "gameStats": stat_result.get("game_stats", {}),
+            "perClipStats": stat_result.get("per_clip_stats", []),
+            "actionsDetected": stat_result.get("actions_detected", []),
+            "debug": debug,
         }
 
     finally:
@@ -549,5 +663,19 @@ def _error_response(message: str, elapsed: float) -> dict:
         "framesProcessed": 0,
         "audioEvents": [],
         "playerTracks": [],
+        "gameStats": {},
+        "perClipStats": [],
+        "actionsDetected": [],
+        "debug": {
+            "ali_detections": 0,
+            "roboflow_detections": 0,
+            "combined_detections": 0,
+            "ali_working": False,
+            "ali_status": "not_run",
+            "youtube_strategy_used": None,
+            "total_elapsed_ms": round(elapsed * 1000),
+            "layers_that_contributed": [],
+            "layer_breakdown": {},
+        },
         "error": message,
     }

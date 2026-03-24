@@ -53,7 +53,7 @@ ultralytics-thop==2.0.18
 urllib3==2.6.3
 uvicorn==0.41.0
 webcolors==25.10.0
-yt-dlp==2026.2.21
+yt-dlp>=2024.12.1
 httpx>=0.28.0
 supervision>=0.25.0
 soundfile>=0.12.1

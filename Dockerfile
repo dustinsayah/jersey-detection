@@ -54,6 +54,9 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://tfhub.
 COPY scripts /app/scripts
 RUN python /app/scripts/bootstrap_public_reader.py
 
+# Keep yt-dlp updated at build time
+RUN pip install --upgrade yt-dlp
+
 # Ensure model directory exists for Roboflow trained weights
 # football_digit_detector.pt, football_player_detector.pt,
 # basketball_jersey_ocr.pt, football_jersey_tracker.pt

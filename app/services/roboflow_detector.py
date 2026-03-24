@@ -1,6 +1,8 @@
-# Roboflow-trained model detector — loads 4 custom YOLOv8n models
+# Roboflow-trained model detector — loads custom YOLOv8n models
 # trained from Roboflow Universe datasets for jersey/player detection.
 # Models are loaded locally (no API calls during inference).
+# ALL models run for ALL sports — digit detection and player detection
+# work regardless of sport label.
 
 from __future__ import annotations
 
@@ -33,29 +35,80 @@ def _load_model(filename: str):
 
 
 class RoboflowDetector:
-    """Loads and runs 4 Roboflow-trained YOLO models for jersey detection."""
+    """Loads and runs Roboflow-trained YOLO models for jersey detection.
+
+    Current models (v1 — trained Mar 2026):
+      - football_digit_detector.pt — digit-level jersey number OCR
+      - football_player_detector.pt — player bounding boxes
+      - football_jersey_tracker.pt — jersey tracking across frames
+      - basketball_jersey_ocr.pt — SKIPPED (mAP50: 0.10, pending retrain)
+
+    Pending models (v2 — next Colab session):
+      - basketball_jersey_number_v2.pt
+      - basketball_jersey_number_v3.pt
+      - basketball_player_detector.pt
+      - football_positions_detector.pt
+      - football_presnap_detector.pt
+      - jersey_number_universal_v1.pt
+      - jersey_number_universal_v2.pt
+      - lacrosse_detector_v1.pt
+      - lacrosse_detector_v2.pt
+    """
 
     def __init__(self):
         self._loaded = False
+        # v1 models
         self.football_digit_model = None
         self.football_player_model = None
         self.basketball_jersey_model = None
         self.football_tracker_model = None
+        # v2 models (pending training)
+        self.basketball_jersey_number_v2_model = None
+        self.basketball_jersey_number_v3_model = None
+        self.basketball_player_detector_model = None
+        self.football_positions_model = None
+        self.football_presnap_model = None
+        self.jersey_number_universal_v1_model = None
+        self.jersey_number_universal_v2_model = None
+        self.lacrosse_v1_model = None
+        self.lacrosse_v2_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
         if self._loaded:
             return
+
+        # ── v1 models (currently deployed) ──
         self.football_digit_model = _load_model("football_digit_detector.pt")
         self.football_player_model = _load_model("football_player_detector.pt")
-        # basketball_jersey_ocr skipped — low accuracy (mAP50: 0.10), pending retrain next Colab session
+        # basketball_jersey_ocr.pt — DISABLED: mAP50 0.10, useless
         logger.warning(
             "basketball_jersey_ocr skipped — low accuracy (mAP50: 0.10), pending retrain next Colab session"
         )
         self.basketball_jersey_model = None
         self.football_tracker_model = _load_model("football_jersey_tracker.pt")
+
+        # ── v2 models (load if present, warn if not yet trained) ──
+        _v2_models = {
+            "basketball_jersey_number_v2.pt": "basketball_jersey_number_v2_model",
+            "basketball_jersey_number_v3.pt": "basketball_jersey_number_v3_model",
+            "basketball_player_detector.pt": "basketball_player_detector_model",
+            "football_positions_detector.pt": "football_positions_model",
+            "football_presnap_detector.pt": "football_presnap_model",
+            "jersey_number_universal_v1.pt": "jersey_number_universal_v1_model",
+            "jersey_number_universal_v2.pt": "jersey_number_universal_v2_model",
+            "lacrosse_detector_v1.pt": "lacrosse_v1_model",
+            "lacrosse_detector_v2.pt": "lacrosse_v2_model",
+        }
+        for filename, attr in _v2_models.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                setattr(self, attr, _load_model(filename))
+            else:
+                logger.info("v2 model not yet trained: %s — pending next Colab session", filename)
+
         self._loaded = True
-        loaded = sum(
+        v1_loaded = sum(
             1
             for m in [
                 self.football_digit_model,
@@ -64,7 +117,15 @@ class RoboflowDetector:
             ]
             if m is not None
         )
-        logger.info("RoboflowDetector: %d/3 models loaded (basketball skipped)", loaded)
+        v2_loaded = sum(
+            1
+            for attr in _v2_models.values()
+            if getattr(self, attr) is not None
+        )
+        logger.info(
+            "RoboflowDetector: %d/3 v1 models loaded (basketball skipped), %d/9 v2 models loaded",
+            v1_loaded, v2_loaded,
+        )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
         """2x upscale + CLAHE contrast enhancement for better digit reading."""
@@ -107,7 +168,7 @@ class RoboflowDetector:
     def detect_football_digits(
         self, frame: np.ndarray, jersey_number: int, conf: float = 0.25
     ) -> list[dict]:
-        """Run football digit detector on a frame."""
+        """Run digit detector on a frame. Works for ANY sport — digits are digits."""
         self.load()
         if self.football_digit_model is None:
             return []
@@ -127,18 +188,18 @@ class RoboflowDetector:
                             "confidence": float(box.conf),
                             "bbox": box.xyxy[0].tolist(),
                             "number_detected": num,
-                            "layer": "roboflow_football_digit",
+                            "layer": "roboflow_digit",
                         }
                     )
             return dets
         except Exception as e:
-            logger.error("football digit detect error: %s", e)
+            logger.error("digit detect error: %s", e)
             return []
 
     def detect_football_players(
         self, frame: np.ndarray, conf: float = 0.3
     ) -> list[dict]:
-        """Detect all players in frame (bounding boxes)."""
+        """Detect all players in frame (bounding boxes). Works for ANY sport."""
         self.load()
         if self.football_player_model is None:
             return []
@@ -153,12 +214,12 @@ class RoboflowDetector:
                             "bbox": box.xyxy[0].tolist(),
                             "confidence": float(box.conf),
                             "class": name,
-                            "layer": "roboflow_football_player",
+                            "layer": "roboflow_player",
                         }
                     )
             return players
         except Exception as e:
-            logger.error("football player detect error: %s", e)
+            logger.error("player detect error: %s", e)
             return []
 
     def detect_basketball_jerseys(
@@ -192,7 +253,7 @@ class RoboflowDetector:
     def detect_football_tracker(
         self, frame: np.ndarray, jersey_number: int, conf: float = 0.25
     ) -> list[dict]:
-        """Run football jersey tracker model on a frame."""
+        """Run jersey tracker model on a frame. Works for ANY sport."""
         self.load()
         if self.football_tracker_model is None:
             return []
@@ -211,12 +272,12 @@ class RoboflowDetector:
                             "confidence": float(box.conf),
                             "bbox": box.xyxy[0].tolist(),
                             "number_detected": num,
-                            "layer": "roboflow_football_tracker",
+                            "layer": "roboflow_tracker",
                         }
                     )
             return dets
         except Exception as e:
-            logger.error("football tracker detect error: %s", e)
+            logger.error("tracker detect error: %s", e)
             return []
 
     def detect_with_player_crops(
@@ -228,25 +289,25 @@ class RoboflowDetector:
     ) -> list[dict]:
         """Two-pass detection: find players, crop each, run digit detector on crop.
 
-        Much more accurate than running digit detection on full frame.
+        Runs ALL available models for ALL sports — no sport gating.
+        The digit detector reads numbers regardless of sport label.
+        The player detector finds players regardless of sport label.
         """
         self.load()
         all_detections: list[dict] = []
 
-        # Pass 1: get player bounding boxes
+        # Pass 1: get player bounding boxes (works for any sport)
         players = self.detect_football_players(frame, conf=0.25)
 
         if not players:
-            # No player boxes — run digit detection on full frame
-            if sport.lower() in ("football", "american_football"):
-                dets = self.detect_football_digits(frame, jersey_number, conf)
-                # Also try tracker model
-                dets.extend(self.detect_football_tracker(frame, jersey_number, conf))
-                return dets
-            else:
-                return self.detect_basketball_jerseys(frame, jersey_number, conf)
+            # No player boxes — run all digit detectors on full frame
+            dets = self.detect_football_digits(frame, jersey_number, conf)
+            dets.extend(self.detect_football_tracker(frame, jersey_number, conf))
+            # Also try basketball model if available (currently disabled)
+            dets.extend(self.detect_basketball_jerseys(frame, jersey_number, conf))
+            return dets
 
-        # Pass 2: crop each player and run digit detection on the crop
+        # Pass 2: crop each player and run ALL digit detectors on the crop
         for player in players:
             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
             # Add padding around player crop
@@ -259,11 +320,10 @@ class RoboflowDetector:
             if crop.size == 0:
                 continue
 
-            if sport.lower() in ("football", "american_football"):
-                dets = self.detect_football_digits(crop, jersey_number, conf=0.2)
-                dets.extend(self.detect_football_tracker(crop, jersey_number, conf=0.2))
-            else:
-                dets = self.detect_basketball_jerseys(crop, jersey_number, conf=0.2)
+            # Run ALL digit detectors on every crop — no sport gating
+            dets = self.detect_football_digits(crop, jersey_number, conf=0.2)
+            dets.extend(self.detect_football_tracker(crop, jersey_number, conf=0.2))
+            dets.extend(self.detect_basketball_jerseys(crop, jersey_number, conf=0.2))
 
             # Adjust bbox coordinates back to full frame space
             for det in dets:
@@ -279,13 +339,31 @@ class RoboflowDetector:
         return all_detections
 
     def status(self) -> dict:
-        """Report which models are loaded vs missing."""
+        """Report which models are loaded vs missing vs pending."""
         self.load()
+
+        def _v2_status(attr: str) -> str:
+            model = getattr(self, attr, None)
+            if model is not None:
+                return "loaded"
+            return "pending - not yet trained"
+
         return {
+            # v1 models
             "football_digit_detector": "loaded" if self.football_digit_model else "missing",
             "football_player_detector": "loaded" if self.football_player_model else "missing",
-            "basketball_jersey_ocr": "skipped - pending retrain",
+            "basketball_jersey_ocr": "skipped - pending retrain (mAP50: 0.10)",
             "football_jersey_tracker": "loaded" if self.football_tracker_model else "missing",
+            # v2 models
+            "basketball_jersey_number_v2": _v2_status("basketball_jersey_number_v2_model"),
+            "basketball_jersey_number_v3": _v2_status("basketball_jersey_number_v3_model"),
+            "basketball_player_detector": _v2_status("basketball_player_detector_model"),
+            "football_positions_detector": _v2_status("football_positions_model"),
+            "football_presnap_detector": _v2_status("football_presnap_model"),
+            "jersey_number_universal_v1": _v2_status("jersey_number_universal_v1_model"),
+            "jersey_number_universal_v2": _v2_status("jersey_number_universal_v2_model"),
+            "lacrosse_detector_v1": _v2_status("lacrosse_v1_model"),
+            "lacrosse_detector_v2": _v2_status("lacrosse_v2_model"),
         }
 
 

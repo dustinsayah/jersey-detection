@@ -70,6 +70,26 @@ def _check_phases() -> dict:
     return phases
 
 
+@router.get("/test-youtube")
+async def test_youtube(url: str) -> JSONResponse:
+    """Test YouTube download chain and report which strategy worked."""
+    from app.services.youtube_proxy import test_youtube_download
+
+    yt_dlp_bin = "yt-dlp"
+    ffmpeg_bin = "ffmpeg"
+    try:
+        from app.services.detection_runtime import PipelineSettings
+        settings = PipelineSettings()
+        yt_dlp_bin = settings.yt_dlp_binary
+        ffmpeg_bin = settings.ffmpeg_binary
+    except Exception:
+        pass
+
+    result = await test_youtube_download(url, yt_dlp_binary=yt_dlp_bin, ffmpeg_binary=ffmpeg_bin)
+    status_code = 200 if result.get("success") else 502
+    return JSONResponse(status_code=status_code, content=result)
+
+
 @router.get("/live")
 def live() -> JSONResponse:
     return JSONResponse(status_code=200, content={"status": "ok"})

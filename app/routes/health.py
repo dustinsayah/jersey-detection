@@ -63,32 +63,55 @@ def _check_phases() -> dict:
     phases["render_server_url"] = render_url
 
     # ── Roboflow trained models ──
+    _v1_keys = {
+        "football_digit_detector", "football_player_detector",
+        "basketball_jersey_ocr", "football_jersey_tracker",
+    }
+    _v2_baz_keys = {
+        "basketball_ball_detector", "football_ball_detector",
+        "lacrosse_ball_detector", "basketball_action_detector",
+        "basketball_court_zones",
+    }
+    _v3_ocr_keys = {
+        "jersey_ocr_v3_primary", "jersey_ocr_v3_secondary", "jersey_ocr_v3_ensemble",
+        "basketball_ocr_v3", "football_ocr_v3", "lacrosse_ocr_v3",
+        "player_isolator_v3", "jersey_color_classifier_v3", "number_region_detector_v3",
+        "motion_blur_specialist_v3", "wide_angle_specialist_v3",
+        "dark_jersey_specialist_v3", "partial_visibility_specialist_v3",
+    }
     try:
         from app.services.roboflow_detector import roboflow_detector
         rf_status = roboflow_detector.status()
-        # Split into v1, v2, v3 sections
         phases["roboflow_models_v1"] = {
-            k: v for k, v in rf_status.items()
-            if k in ("football_digit_detector", "football_player_detector",
-                     "basketball_jersey_ocr", "football_jersey_tracker")
+            k: v for k, v in rf_status.items() if k in _v1_keys
         }
         phases["roboflow_models_v2"] = {
             k: v for k, v in rf_status.items()
-            if k not in phases["roboflow_models_v1"]
-            and k not in ("basketball_ball_detector", "football_ball_detector",
-                          "lacrosse_ball_detector", "basketball_action_detector",
-                          "basketball_court_zones", "football_field_zones",
-                          "basketball_player_detector_v2")
+            if k not in _v1_keys and k not in _v2_baz_keys and k not in _v3_ocr_keys
         }
-        phases["roboflow_models_v3"] = {
-            k: v for k, v in rf_status.items()
-            if k in ("basketball_ball_detector", "football_ball_detector",
-                     "lacrosse_ball_detector", "basketball_action_detector",
-                     "basketball_court_zones", "football_field_zones",
-                     "basketball_player_detector_v2")
+        phases["roboflow_models_v2_ball_action_zone"] = {
+            k: v for k, v in rf_status.items() if k in _v2_baz_keys
         }
+        phases["roboflow_models_v3_ocr"] = {
+            k: v for k, v in rf_status.items() if k in _v3_ocr_keys
+        }
+        v3_loaded = sum(1 for k in _v3_ocr_keys if rf_status.get(k) == "loaded")
+        phases["roboflow_v3_ocr_summary"] = f"{v3_loaded}/13 loaded"
     except Exception:
         phases["roboflow_models_v1"] = {"error": "import_failed"}
+
+    # ── Temporal consensus status ──
+    try:
+        from app.services.temporal_consensus import TemporalConsensus
+        tc = TemporalConsensus()
+        phases["temporal_consensus"] = {
+            "status": "active",
+            "min_confirmations": tc.min_confirmations,
+            "time_window": tc.time_window,
+            "confidence_threshold": tc.confidence_threshold,
+        }
+    except Exception:
+        phases["temporal_consensus"] = {"status": "unavailable"}
 
     # ── Stat pipeline status ──
     phases["stat_pipeline"] = {

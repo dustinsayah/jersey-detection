@@ -1,8 +1,12 @@
-# Roboflow-trained model detector — loads custom YOLOv8n models
+# Roboflow-trained model detector — loads custom YOLO models
 # trained from Roboflow Universe datasets for jersey/player detection.
 # Models are loaded locally (no API calls during inference).
 # ALL models run for ALL sports — digit detection and player detection
 # work regardless of sport label.
+#
+# v1/v2 models: YOLOv8n (fast, lower accuracy)
+# v3 OCR models: YOLOv8m (slower, much better for small text OCR)
+# v3 trains via notebooks/train_models_v3.ipynb
 
 from __future__ import annotations
 
@@ -54,12 +58,31 @@ class RoboflowDetector:
       - lacrosse_detector_v1.pt
       - lacrosse_detector_v2.pt
 
-    v3 models (ball/action/zone — Colab train_models_v2.ipynb Chunk 4):
+    v2 ball/action/zone (Colab train_models_v2.ipynb Chunk 4):
       - basketball_ball_detector.pt
       - football_ball_detector.pt
       - lacrosse_ball_detector.pt
       - basketball_action_detector.pt
       - basketball_court_zones.pt
+
+    v3 OCR models (Colab train_models_v3.ipynb — YOLOv8m, Ali replacement):
+      Chunk 1 — Multi-sport jersey OCR:
+        - jersey_ocr_v3_primary.pt
+        - jersey_ocr_v3_secondary.pt
+        - jersey_ocr_v3_ensemble.pt
+      Chunk 2 — Sport-specific OCR:
+        - basketball_ocr_v3.pt
+        - football_ocr_v3.pt
+        - lacrosse_ocr_v3.pt
+      Chunk 3 — Player isolation + color:
+        - player_isolator_v3.pt
+        - jersey_color_classifier_v3.pt
+        - number_region_detector_v3.pt
+      Chunk 4 — Augmentation specialists:
+        - motion_blur_specialist_v3.pt
+        - wide_angle_specialist_v3.pt
+        - dark_jersey_specialist_v3.pt
+        - partial_visibility_specialist_v3.pt
     """
 
     def __init__(self):
@@ -79,12 +102,26 @@ class RoboflowDetector:
         self.jersey_number_universal_v2_model = None
         self.lacrosse_v1_model = None
         self.lacrosse_v2_model = None
-        # v3 models (ball/action/zone)
+        # v2 ball/action/zone models
         self.basketball_ball_detector_model = None
         self.football_ball_detector_model = None
         self.lacrosse_ball_detector_model = None
         self.basketball_action_detector_model = None
         self.basketball_court_zones_model = None
+        # v3 OCR models (YOLOv8m — Ali replacement)
+        self.jersey_ocr_v3_primary_model = None
+        self.jersey_ocr_v3_secondary_model = None
+        self.jersey_ocr_v3_ensemble_model = None
+        self.basketball_ocr_v3_model = None
+        self.football_ocr_v3_model = None
+        self.lacrosse_ocr_v3_model = None
+        self.player_isolator_v3_model = None
+        self.jersey_color_classifier_v3_model = None
+        self.number_region_detector_v3_model = None
+        self.motion_blur_specialist_v3_model = None
+        self.wide_angle_specialist_v3_model = None
+        self.dark_jersey_specialist_v3_model = None
+        self.partial_visibility_specialist_v3_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
@@ -120,20 +157,43 @@ class RoboflowDetector:
             else:
                 logger.info("v2 model not yet trained: %s — pending next Colab session", filename)
 
-        # ── v3 models (ball/action/zone — load if present) ──
-        _v3_models = {
+        # ── v2 ball/action/zone models (load if present) ──
+        _v2_baz_models = {
             "basketball_ball_detector.pt": "basketball_ball_detector_model",
             "football_ball_detector.pt": "football_ball_detector_model",
             "lacrosse_ball_detector.pt": "lacrosse_ball_detector_model",
             "basketball_action_detector.pt": "basketball_action_detector_model",
             "basketball_court_zones.pt": "basketball_court_zones_model",
         }
-        for filename, attr in _v3_models.items():
+        for filename, attr in _v2_baz_models.items():
             path = os.path.join(MODEL_DIR, filename)
             if os.path.exists(path):
                 setattr(self, attr, _load_model(filename))
             else:
-                logger.info("v3 model not yet trained: %s — pending next Colab session", filename)
+                logger.info("v2 ball/action/zone model not yet trained: %s", filename)
+
+        # ── v3 OCR models (YOLOv8m — Ali replacement, load if present) ──
+        _v3_ocr_models = {
+            "jersey_ocr_v3_primary.pt": "jersey_ocr_v3_primary_model",
+            "jersey_ocr_v3_secondary.pt": "jersey_ocr_v3_secondary_model",
+            "jersey_ocr_v3_ensemble.pt": "jersey_ocr_v3_ensemble_model",
+            "basketball_ocr_v3.pt": "basketball_ocr_v3_model",
+            "football_ocr_v3.pt": "football_ocr_v3_model",
+            "lacrosse_ocr_v3.pt": "lacrosse_ocr_v3_model",
+            "player_isolator_v3.pt": "player_isolator_v3_model",
+            "jersey_color_classifier_v3.pt": "jersey_color_classifier_v3_model",
+            "number_region_detector_v3.pt": "number_region_detector_v3_model",
+            "motion_blur_specialist_v3.pt": "motion_blur_specialist_v3_model",
+            "wide_angle_specialist_v3.pt": "wide_angle_specialist_v3_model",
+            "dark_jersey_specialist_v3.pt": "dark_jersey_specialist_v3_model",
+            "partial_visibility_specialist_v3.pt": "partial_visibility_specialist_v3_model",
+        }
+        for filename, attr in _v3_ocr_models.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                setattr(self, attr, _load_model(filename))
+            else:
+                logger.info("v3 OCR model pending: %s — train via train_models_v3.ipynb", filename)
 
         self._loaded = True
         v1_loaded = sum(
@@ -150,14 +210,19 @@ class RoboflowDetector:
             for attr in _v2_models.values()
             if getattr(self, attr) is not None
         )
-        v3_loaded = sum(
+        v2_baz_loaded = sum(
             1
-            for attr in _v3_models.values()
+            for attr in _v2_baz_models.values()
+            if getattr(self, attr) is not None
+        )
+        v3_ocr_loaded = sum(
+            1
+            for attr in _v3_ocr_models.values()
             if getattr(self, attr) is not None
         )
         logger.info(
-            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/5 v3 loaded",
-            v1_loaded, v2_loaded, v3_loaded,
+            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/13 v3-ocr loaded",
+            v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded,
         )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
@@ -313,6 +378,129 @@ class RoboflowDetector:
             logger.error("tracker detect error: %s", e)
             return []
 
+    def _run_v3_ocr_on_crop(
+        self,
+        crop: np.ndarray,
+        jersey_number: int,
+        sport: str,
+        conf: float = 0.2,
+    ) -> list[dict]:
+        """Run v3 OCR models on a player crop. Returns matched detections."""
+        dets: list[dict] = []
+
+        # v3 OCR pipeline priority:
+        # 1. number_region_detector finds exact number region
+        # 2. jersey_ocr_v3_primary reads the number
+        # 3. Sport-specific OCR model also runs
+        # 4. Specialist models (dark jersey, motion blur, etc.)
+
+        ocr_crop = crop
+        # Step 1: number_region_detector narrows to number area
+        if self.number_region_detector_v3_model is not None:
+            try:
+                nr_results = self.number_region_detector_v3_model(
+                    crop, conf=0.3, verbose=False
+                )[0]
+                if nr_results.boxes and len(nr_results.boxes) > 0:
+                    best = max(nr_results.boxes, key=lambda b: float(b.conf))
+                    nx1, ny1, nx2, ny2 = [int(c) for c in best.xyxy[0].tolist()]
+                    nr_crop = crop[
+                        max(0, ny1) : min(crop.shape[0], ny2),
+                        max(0, nx1) : min(crop.shape[1], nx2),
+                    ]
+                    if nr_crop.size > 0:
+                        ocr_crop = nr_crop
+            except Exception as e:
+                logger.debug("number_region_detector_v3 error: %s", e)
+
+        enhanced = self._preprocess(ocr_crop)
+
+        # Step 2: primary v3 OCR
+        for model, layer_name in [
+            (self.jersey_ocr_v3_primary_model, "v3_ocr_primary"),
+            (self.jersey_ocr_v3_secondary_model, "v3_ocr_secondary"),
+            (self.jersey_ocr_v3_ensemble_model, "v3_ocr_ensemble"),
+        ]:
+            if model is None:
+                continue
+            try:
+                results = model(enhanced, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = model.names[int(box.cls)]
+                    num = self._parse_number(name)
+                    if num == jersey_number or self._check_adjacent_digits(
+                        jersey_number, results.boxes, model
+                    ):
+                        dets.append({
+                            "confidence": float(box.conf),
+                            "bbox": box.xyxy[0].tolist(),
+                            "number_detected": num,
+                            "layer": layer_name,
+                        })
+            except Exception as e:
+                logger.debug("%s error: %s", layer_name, e)
+
+        # Step 3: sport-specific OCR
+        sport_model = None
+        sport_layer = "v3_sport_ocr"
+        sl = sport.lower()
+        if sl == "basketball" and self.basketball_ocr_v3_model:
+            sport_model = self.basketball_ocr_v3_model
+            sport_layer = "v3_basketball_ocr"
+        elif sl in ("football", "american_football") and self.football_ocr_v3_model:
+            sport_model = self.football_ocr_v3_model
+            sport_layer = "v3_football_ocr"
+        elif sl == "lacrosse" and self.lacrosse_ocr_v3_model:
+            sport_model = self.lacrosse_ocr_v3_model
+            sport_layer = "v3_lacrosse_ocr"
+
+        if sport_model is not None:
+            try:
+                results = sport_model(enhanced, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = sport_model.names[int(box.cls)]
+                    num = self._parse_number(name)
+                    if num == jersey_number or self._check_adjacent_digits(
+                        jersey_number, results.boxes, sport_model
+                    ):
+                        dets.append({
+                            "confidence": float(box.conf),
+                            "bbox": box.xyxy[0].tolist(),
+                            "number_detected": num,
+                            "layer": sport_layer,
+                        })
+            except Exception as e:
+                logger.debug("%s error: %s", sport_layer, e)
+
+        # Step 4: specialist models
+        specialists = [
+            (self.dark_jersey_specialist_v3_model, "v3_dark_jersey"),
+            (self.motion_blur_specialist_v3_model, "v3_motion_blur"),
+            (self.wide_angle_specialist_v3_model, "v3_wide_angle"),
+            (self.partial_visibility_specialist_v3_model, "v3_partial"),
+        ]
+        for spec_model, spec_layer in specialists:
+            if spec_model is None:
+                continue
+            try:
+                results = spec_model(enhanced, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = spec_model.names[int(box.cls)]
+                    num = self._parse_number(name)
+                    if num == jersey_number or self._check_adjacent_digits(
+                        jersey_number, results.boxes, spec_model
+                    ):
+                        dets.append({
+                            "confidence": float(box.conf),
+                            "bbox": box.xyxy[0].tolist(),
+                            "number_detected": num,
+                            "layer": spec_layer,
+                        })
+            except Exception as e:
+                logger.debug("%s error: %s", spec_layer, e)
+
+        return dets
+
     def detect_with_player_crops(
         self,
         frame: np.ndarray,
@@ -320,30 +508,53 @@ class RoboflowDetector:
         sport: str,
         conf: float = 0.25,
     ) -> list[dict]:
-        """Two-pass detection: find players, crop each, run digit detector on crop.
+        """Multi-pass detection: find players, crop each, run OCR on crop.
+
+        v3 pipeline (when models available):
+        1. player_isolator_v3 or football_player_detector finds player bbox
+        2. jersey_color_classifier_v3 confirms color (if available)
+        3. number_region_detector_v3 finds exact number region
+        4. jersey_ocr_v3_primary reads the number
+        5. Sport-specific OCR + specialist models also run
+        6. Falls back to v1/v2 detectors if v3 not available
 
         Runs ALL available models for ALL sports — no sport gating.
-        The digit detector reads numbers regardless of sport label.
-        The player detector finds players regardless of sport label.
         """
         self.load()
         all_detections: list[dict] = []
 
-        # Pass 1: get player bounding boxes (works for any sport)
-        players = self.detect_football_players(frame, conf=0.25)
+        # Pass 1: get player bounding boxes
+        # Try v3 player_isolator first, fall back to v1 player detector
+        players = []
+        if self.player_isolator_v3_model is not None:
+            try:
+                results = self.player_isolator_v3_model(frame, conf=0.25, verbose=False)[0]
+                for box in results.boxes:
+                    name = self.player_isolator_v3_model.names[int(box.cls)]
+                    if "player" in name.lower() or "person" in name.lower():
+                        players.append({
+                            "bbox": box.xyxy[0].tolist(),
+                            "confidence": float(box.conf),
+                            "class": name,
+                            "layer": "v3_player_isolator",
+                        })
+            except Exception as e:
+                logger.debug("player_isolator_v3 error: %s", e)
 
         if not players:
-            # No player boxes — run all digit detectors on full frame
-            dets = self.detect_football_digits(frame, jersey_number, conf)
+            players = self.detect_football_players(frame, conf=0.25)
+
+        if not players:
+            # No player boxes — run all detectors on full frame
+            dets = self._run_v3_ocr_on_crop(frame, jersey_number, sport, conf)
+            dets.extend(self.detect_football_digits(frame, jersey_number, conf))
             dets.extend(self.detect_football_tracker(frame, jersey_number, conf))
-            # Also try basketball model if available (currently disabled)
             dets.extend(self.detect_basketball_jerseys(frame, jersey_number, conf))
             return dets
 
-        # Pass 2: crop each player and run ALL digit detectors on the crop
+        # Pass 2: crop each player and run OCR
         for player in players:
             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
-            # Add padding around player crop
             pad = 10
             x1 = max(0, x1 - pad)
             y1 = max(0, y1 - pad)
@@ -353,8 +564,10 @@ class RoboflowDetector:
             if crop.size == 0:
                 continue
 
-            # Run ALL digit detectors on every crop — no sport gating
-            dets = self.detect_football_digits(crop, jersey_number, conf=0.2)
+            # Run v3 OCR pipeline on crop
+            dets = self._run_v3_ocr_on_crop(crop, jersey_number, sport, conf=0.2)
+            # Also run v1/v2 detectors for coverage
+            dets.extend(self.detect_football_digits(crop, jersey_number, conf=0.2))
             dets.extend(self.detect_football_tracker(crop, jersey_number, conf=0.2))
             dets.extend(self.detect_basketball_jerseys(crop, jersey_number, conf=0.2))
 
@@ -375,7 +588,7 @@ class RoboflowDetector:
         """Report which models are loaded vs missing vs pending."""
         self.load()
 
-        def _v2_status(attr: str) -> str:
+        def _model_status(attr: str) -> str:
             model = getattr(self, attr, None)
             if model is not None:
                 return "loaded"
@@ -388,21 +601,35 @@ class RoboflowDetector:
             "basketball_jersey_ocr": "skipped - pending retrain (mAP50: 0.10)",
             "football_jersey_tracker": "loaded" if self.football_tracker_model else "missing",
             # v2 models
-            "basketball_jersey_number_v2": _v2_status("basketball_jersey_number_v2_model"),
-            "basketball_jersey_number_v3": _v2_status("basketball_jersey_number_v3_model"),
-            "basketball_player_detector_v2": _v2_status("basketball_player_detector_v2_model"),
-            "football_positions_detector": _v2_status("football_positions_model"),
-            "football_presnap_detector": _v2_status("football_presnap_model"),
-            "jersey_number_universal_v1": _v2_status("jersey_number_universal_v1_model"),
-            "jersey_number_universal_v2": _v2_status("jersey_number_universal_v2_model"),
-            "lacrosse_detector_v1": _v2_status("lacrosse_v1_model"),
-            "lacrosse_detector_v2": _v2_status("lacrosse_v2_model"),
-            # v3 models (ball/action/zone)
-            "basketball_ball_detector": _v2_status("basketball_ball_detector_model"),
-            "football_ball_detector": _v2_status("football_ball_detector_model"),
-            "lacrosse_ball_detector": _v2_status("lacrosse_ball_detector_model"),
-            "basketball_action_detector": _v2_status("basketball_action_detector_model"),
-            "basketball_court_zones": _v2_status("basketball_court_zones_model"),
+            "basketball_jersey_number_v2": _model_status("basketball_jersey_number_v2_model"),
+            "basketball_jersey_number_v3": _model_status("basketball_jersey_number_v3_model"),
+            "basketball_player_detector_v2": _model_status("basketball_player_detector_v2_model"),
+            "football_positions_detector": _model_status("football_positions_model"),
+            "football_presnap_detector": _model_status("football_presnap_model"),
+            "jersey_number_universal_v1": _model_status("jersey_number_universal_v1_model"),
+            "jersey_number_universal_v2": _model_status("jersey_number_universal_v2_model"),
+            "lacrosse_detector_v1": _model_status("lacrosse_v1_model"),
+            "lacrosse_detector_v2": _model_status("lacrosse_v2_model"),
+            # v2 ball/action/zone models
+            "basketball_ball_detector": _model_status("basketball_ball_detector_model"),
+            "football_ball_detector": _model_status("football_ball_detector_model"),
+            "lacrosse_ball_detector": _model_status("lacrosse_ball_detector_model"),
+            "basketball_action_detector": _model_status("basketball_action_detector_model"),
+            "basketball_court_zones": _model_status("basketball_court_zones_model"),
+            # v3 OCR models (YOLOv8m — Ali replacement, train via train_models_v3.ipynb)
+            "jersey_ocr_v3_primary": _model_status("jersey_ocr_v3_primary_model"),
+            "jersey_ocr_v3_secondary": _model_status("jersey_ocr_v3_secondary_model"),
+            "jersey_ocr_v3_ensemble": _model_status("jersey_ocr_v3_ensemble_model"),
+            "basketball_ocr_v3": _model_status("basketball_ocr_v3_model"),
+            "football_ocr_v3": _model_status("football_ocr_v3_model"),
+            "lacrosse_ocr_v3": _model_status("lacrosse_ocr_v3_model"),
+            "player_isolator_v3": _model_status("player_isolator_v3_model"),
+            "jersey_color_classifier_v3": _model_status("jersey_color_classifier_v3_model"),
+            "number_region_detector_v3": _model_status("number_region_detector_v3_model"),
+            "motion_blur_specialist_v3": _model_status("motion_blur_specialist_v3_model"),
+            "wide_angle_specialist_v3": _model_status("wide_angle_specialist_v3_model"),
+            "dark_jersey_specialist_v3": _model_status("dark_jersey_specialist_v3_model"),
+            "partial_visibility_specialist_v3": _model_status("partial_visibility_specialist_v3_model"),
         }
 
 

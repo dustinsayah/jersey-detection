@@ -405,6 +405,58 @@ async def run_analyze_pipeline(
                     tracking_id=tracking_result.target_track_id if tracking_result else None,
                 ))
 
+        # ── Temporal consensus filtering ─────────────────────────────
+        # Merge all raw detections with number_detected + layer tags,
+        # then filter through temporal consensus before building
+        # DetectionPoints. This eliminates false positive numbers.
+        tc_stats = {"raw_detections": 0, "confirmed_detections": 0,
+                    "filtered_out": 0, "cross_layer_confirmed": 0}
+        try:
+            from app.services.temporal_consensus import temporal_consensus
+
+            all_raw_dets: list[dict] = []
+            for det in jersey_detections:
+                all_raw_dets.append({
+                    "timestamp": det.get("timestamp", 0),
+                    "confidence": det.get("confidence", 0),
+                    "number_detected": jersey_number,
+                    "layer": "ali",
+                })
+            for det in roboflow_detections:
+                all_raw_dets.append({
+                    "timestamp": det.get("timestamp", 0),
+                    "confidence": det.get("confidence", 0),
+                    "number_detected": det.get("number_detected", jersey_number),
+                    "layer": det.get("layer", "roboflow"),
+                })
+
+            if all_raw_dets:
+                confirmed_dets = temporal_consensus.filter_detections(
+                    all_raw_dets, jersey_number
+                )
+                confirmed_dets = temporal_consensus.cross_layer_boost(
+                    confirmed_dets
+                )
+                tc_stats = {
+                    "raw_detections": len(all_raw_dets),
+                    "confirmed_detections": len(confirmed_dets),
+                    "filtered_out": len(all_raw_dets) - len(confirmed_dets),
+                    "cross_layer_confirmed": sum(
+                        1 for d in confirmed_dets
+                        if d.get("cross_layer_confirmed")
+                    ),
+                }
+                LOGGER.info(
+                    "Pipeline: temporal consensus — %d raw → %d confirmed "
+                    "(%d filtered, %d cross-layer)",
+                    tc_stats["raw_detections"],
+                    tc_stats["confirmed_detections"],
+                    tc_stats["filtered_out"],
+                    tc_stats["cross_layer_confirmed"],
+                )
+        except Exception as exc:
+            LOGGER.warning("Pipeline: temporal consensus failed (non-fatal): %s", exc)
+
         # Log detection source breakdown
         ali_count = len(jersey_detections)
         rf_count = len(roboflow_detections)
@@ -536,6 +588,7 @@ async def run_analyze_pipeline(
             "total_elapsed_ms": round(elapsed * 1000),
             "layers_that_contributed": layers_that_contributed,
             "layer_breakdown": layer_timings,
+            "temporal_consensus": tc_stats,
         }
 
         return {
@@ -728,6 +781,12 @@ def _error_response(message: str, elapsed: float) -> dict:
             "total_elapsed_ms": round(elapsed * 1000),
             "layers_that_contributed": [],
             "layer_breakdown": {},
+            "temporal_consensus": {
+                "raw_detections": 0,
+                "confirmed_detections": 0,
+                "filtered_out": 0,
+                "cross_layer_confirmed": 0,
+            },
         },
         "error": message,
     }

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 from app.services.detection_runtime import DetectedFrame
+
+logger = logging.getLogger(__name__)
 
 
 def _clamp01(value: float) -> float:
@@ -67,3 +70,114 @@ def apply_temporal_consensus(
         )
 
     return accepted, rejected
+
+
+# ── Dict-based temporal consensus for analyze_pipeline.py ──────────────
+# The above function uses Ali's DetectedFrame dataclass.
+# The class below works with raw dicts from the analyze pipeline
+# (merged Ali + Roboflow detections) before they become DetectionPoints.
+
+
+class TemporalConsensus:
+    """Filter detections by requiring temporal agreement across frames.
+
+    A detection is confirmed only when the same jersey number appears at
+    least ``min_confirmations`` times within ``time_window`` seconds.
+    This replicates Ali's key accuracy advantage: requiring temporal
+    consistency eliminates false positives dramatically.
+    """
+
+    def __init__(
+        self,
+        min_confirmations: int = 3,
+        time_window: float = 2.0,
+        confidence_threshold: float = 0.5,
+    ):
+        self.min_confirmations = min_confirmations
+        self.time_window = time_window
+        self.confidence_threshold = confidence_threshold
+
+    def filter_detections(
+        self, detections: list[dict], jersey_number: int
+    ) -> list[dict]:
+        """Keep only detections confirmed by temporal consensus.
+
+        Input:  [{timestamp, confidence, number_detected, layer, bbox, ...}]
+        Output: filtered list with consensus_score, consensus_confirmations,
+                and consensus_layers added to each surviving detection.
+        """
+        if not detections:
+            return []
+
+        sorted_dets = sorted(detections, key=lambda x: x.get("timestamp", 0))
+
+        confirmed: list[dict] = []
+        for det in sorted_dets:
+            ts = det.get("timestamp", 0)
+
+            # Find all detections within time_window that match target number
+            window_dets = [
+                d
+                for d in sorted_dets
+                if abs(d.get("timestamp", 0) - ts) <= self.time_window
+                and d.get("number_detected") == jersey_number
+            ]
+
+            confirmations = len(window_dets)
+
+            if confirmations >= self.min_confirmations:
+                avg_conf = (
+                    sum(d.get("confidence", 0) for d in window_dets)
+                    / confirmations
+                )
+                # Boost confidence based on number of confirmations
+                consensus_boost = min(0.2, confirmations * 0.03)
+                consensus_score = min(1.0, avg_conf + consensus_boost)
+
+                det["consensus_confirmations"] = confirmations
+                det["consensus_score"] = round(consensus_score, 4)
+                det["consensus_layers"] = list(
+                    {d.get("layer", "unknown") for d in window_dets}
+                )
+                confirmed.append(det)
+
+        # Deduplicate — keep highest consensus_score within 0.5s windows
+        deduped: list[dict] = []
+        for det in confirmed:
+            if not deduped:
+                deduped.append(det)
+                continue
+            prev_ts = deduped[-1].get("timestamp", 0)
+            cur_ts = det.get("timestamp", 0)
+            if cur_ts - prev_ts > 0.5:
+                deduped.append(det)
+            elif det.get("consensus_score", 0) > deduped[-1].get(
+                "consensus_score", 0
+            ):
+                deduped[-1] = det
+
+        return deduped
+
+    def cross_layer_boost(self, detections: list[dict]) -> list[dict]:
+        """Boost confidence when multiple different layers agree.
+
+        Ali + Roboflow both detecting the same number at the same time
+        is a very strong signal. Each additional unique layer adds a
+        +0.1 confidence boost.
+        """
+        for det in detections:
+            layers = det.get("consensus_layers", [])
+            unique_layers = len(set(layers))
+            if unique_layers >= 2:
+                det["cross_layer_confirmed"] = True
+                det["consensus_score"] = min(
+                    1.0,
+                    det.get("consensus_score", 0.5) + (unique_layers * 0.1),
+                )
+            else:
+                det["cross_layer_confirmed"] = False
+        return detections
+
+
+# Singleton instance for analyze pipeline
+temporal_consensus = TemporalConsensus()

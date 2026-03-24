@@ -149,20 +149,24 @@ def _normalize_youtube_url(url: str) -> str:
 
 
 def _download_direct_video(video_url: str, destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(
-        video_url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0 Safari/537.36"
-            )
-        },
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        with destination.open("wb") as sink:
-            shutil.copyfileobj(response, sink)
-    return destination
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        request = urllib.request.Request(
+            video_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with destination.open("wb") as sink:
+                shutil.copyfileobj(response, sink)
+        return destination
+    except Exception as e:
+        logger.error("_download_direct_video failed: %s — %s", video_url, e)
+        raise ValueError(f"Could not download video: {e}")
 
 
 def _download_youtube_video(

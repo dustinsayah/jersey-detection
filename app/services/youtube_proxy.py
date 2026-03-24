@@ -40,6 +40,38 @@ def extract_video_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _trim_video(
+    input_path: Path,
+    start: float,
+    end: float,
+    ffmpeg_binary: str = "ffmpeg",
+) -> Path:
+    """Trim a downloaded video to the requested time range using ffmpeg -c copy."""
+    trimmed_path = input_path.parent / "trimmed.mp4"
+    try:
+        cmd = [
+            ffmpeg_binary, "-y",
+            "-i", str(input_path),
+            "-ss", str(start),
+            "-to", str(end),
+            "-c", "copy",
+            str(trimmed_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and trimmed_path.exists() and trimmed_path.stat().st_size > 1000:
+            original_mb = round(input_path.stat().st_size / 1024 / 1024, 1)
+            trimmed_mb = round(trimmed_path.stat().st_size / 1024 / 1024, 1)
+            LOGGER.info("Trimmed to %ss-%ss: %sMB → %sMB", start, end, original_mb, trimmed_mb)
+            # Replace original with trimmed
+            input_path.unlink()
+            trimmed_path.rename(input_path)
+            return input_path
+        LOGGER.warning("ffmpeg trim failed (returncode=%d), using untrimmed: %s", result.returncode, result.stderr[:200])
+    except Exception as exc:
+        LOGGER.warning("ffmpeg trim failed, using untrimmed: %s", exc)
+    return input_path
+
+
 async def download_youtube(
     url: str,
     *,
@@ -55,7 +87,8 @@ async def download_youtube(
     Raises RuntimeError only if ALL 5 strategies fail.
     """
     LOGGER.info("youtube_proxy called with URL: %s", url)
-    LOGGER.info("youtube_proxy: RENDER_SERVER_URL=%s", RENDER_SERVER_URL)
+    LOGGER.info("youtube_proxy: RENDER_SERVER_URL=%s, time_range=%s-%s", RENDER_SERVER_URL, start_time, end_time)
+    dl_start = time.perf_counter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_"))
     output_path = tmp_dir / "video.mp4"
     strategy_used = None
@@ -82,10 +115,11 @@ async def download_youtube(
                     content_type = resp.headers.get("content-type", "")
                     if "video" in content_type or "octet-stream" in content_type:
                         output_path.write_bytes(resp.content)
-                        LOGGER.info(
-                            "YouTube download succeeded via Strategy 1 (render server bytes): %d bytes",
-                            len(resp.content),
-                        )
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        file_mb = round(len(resp.content) / 1024 / 1024, 1)
+                        LOGGER.info("Downloaded: %sMB in %ss via Strategy 1 (render server bytes)", file_mb, elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
                         return output_path
 
                     # JSON response — render server returns cloudinaryUrl
@@ -102,10 +136,11 @@ async def download_youtube(
                         dl_resp = await client.get(download_url, follow_redirects=True)
                         if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
                             output_path.write_bytes(dl_resp.content)
-                            LOGGER.info(
-                                "YouTube download succeeded via Strategy 1 (render→cloudinary): %d bytes",
-                                len(dl_resp.content),
-                            )
+                            elapsed = round(time.perf_counter() - dl_start, 1)
+                            file_mb = round(len(dl_resp.content) / 1024 / 1024, 1)
+                            LOGGER.info("Downloaded: %sMB in %ss via Strategy 1 (render→cloudinary)", file_mb, elapsed)
+                            if start_time > 0 or end_time > 0:
+                                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
                             return output_path
                         LOGGER.warning("youtube_proxy: cloudinary download failed: %d, %d bytes",
                                        dl_resp.status_code, len(dl_resp.content))
@@ -135,10 +170,11 @@ async def download_youtube(
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
-            LOGGER.info(
-                "YouTube download succeeded via Strategy 2 (yt-dlp browser spoof): %d bytes",
-                output_path.stat().st_size,
-            )
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+            LOGGER.info("Downloaded: %sMB in %ss via Strategy 2 (yt-dlp browser spoof)", file_mb, elapsed)
+            if start_time > 0 or end_time > 0:
+                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             return output_path
         LOGGER.warning("Strategy 2 failed: %s — trying next", result.stderr[:300])
     except Exception as exc:
@@ -168,10 +204,11 @@ async def download_youtube(
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
         if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
-            LOGGER.info(
-                "YouTube download succeeded via Strategy 3 (yt-dlp android): %d bytes",
-                output_path.stat().st_size,
-            )
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+            LOGGER.info("Downloaded: %sMB in %ss via Strategy 3 (yt-dlp android)", file_mb, elapsed)
+            if start_time > 0 or end_time > 0:
+                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             return output_path
         LOGGER.warning("Strategy 3 failed: %s — trying next", result.stderr[:300])
     except Exception as exc:
@@ -199,10 +236,11 @@ async def download_youtube(
                         if output_path.exists():
                             output_path.unlink()
                         output_path.write_bytes(dl_resp.content)
-                        LOGGER.info(
-                            "YouTube download succeeded via Strategy 4 (Cobalt): %d bytes",
-                            len(dl_resp.content),
-                        )
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        file_mb = round(len(dl_resp.content) / 1024 / 1024, 1)
+                        LOGGER.info("Downloaded: %sMB in %ss via Strategy 4 (Cobalt)", file_mb, elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
                         return output_path
             LOGGER.warning("Strategy 4 failed: Cobalt returned %d — trying next", cobalt_resp.status_code)
     except Exception as exc:
@@ -229,10 +267,11 @@ async def download_youtube(
                         if output_path.exists():
                             output_path.unlink()
                         output_path.write_bytes(resp.content)
-                        LOGGER.info(
-                            "YouTube download succeeded via Strategy 5 (extract-frames): %d bytes",
-                            len(resp.content),
-                        )
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        file_mb = round(len(resp.content) / 1024 / 1024, 1)
+                        LOGGER.info("Downloaded: %sMB in %ss via Strategy 5 (extract-frames)", file_mb, elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
                         return output_path
 
                     # May return JSON with a video URL
@@ -249,10 +288,11 @@ async def download_youtube(
                             if output_path.exists():
                                 output_path.unlink()
                             output_path.write_bytes(dl_resp.content)
-                            LOGGER.info(
-                                "YouTube download succeeded via Strategy 5 (extract-frames URL): %d bytes",
-                                len(dl_resp.content),
-                            )
+                            elapsed = round(time.perf_counter() - dl_start, 1)
+                            file_mb = round(len(dl_resp.content) / 1024 / 1024, 1)
+                            LOGGER.info("Downloaded: %sMB in %ss via Strategy 5 (extract-frames URL)", file_mb, elapsed)
+                            if start_time > 0 or end_time > 0:
+                                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
                             return output_path
 
                 LOGGER.warning("Strategy 5 failed: render server returned %d", resp.status_code)

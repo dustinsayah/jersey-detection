@@ -26,25 +26,41 @@ class ZoneResult:
     method: str = "geometry_estimate"
 
 
+_ZONE_MODELS = {
+    "basketball": "basketball_court_zones.pt",
+    "football": "football_field_zones.pt",
+}
+
+
 class ZoneDetector:
     """Detect court/field zone from frame content or player position."""
 
     def __init__(self):
-        self._model = None
-        self._model_loaded = False
+        self._models: dict = {}
 
-    def _try_load_model(self):
-        if self._model_loaded:
-            return
-        self._model_loaded = True
-        path = os.path.join(MODEL_DIR, "zone_detector.pt")
-        if os.path.exists(path):
-            try:
-                from ultralytics import YOLO
-                self._model = YOLO(path)
-                logger.info("zone_detector: model loaded")
-            except Exception as e:
-                logger.warning("zone_detector: model load failed: %s", e)
+    def _try_load_model(self, sport: str):
+        sport_lower = sport.lower()
+        if sport_lower in self._models:
+            return self._models[sport_lower]
+        filename = _ZONE_MODELS.get(sport_lower)
+        if not filename:
+            logger.info("zone_detector: no zone model defined for sport=%s", sport_lower)
+            self._models[sport_lower] = None
+            return None
+        path = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(path):
+            logger.warning("zone_detector: model not found %s — using geometry fallback", path)
+            self._models[sport_lower] = None
+            return None
+        try:
+            from ultralytics import YOLO
+            self._models[sport_lower] = YOLO(path)
+            logger.info("zone_detector: loaded %s", filename)
+            return self._models[sport_lower]
+        except Exception as e:
+            logger.warning("zone_detector: model load failed: %s", e)
+            self._models[sport_lower] = None
+            return None
 
     def detect_zone(
         self,
@@ -53,15 +69,15 @@ class ZoneDetector:
         player_bbox: list[float] | None = None,
     ) -> ZoneResult:
         """Detect zone using model or geometry fallback."""
-        self._try_load_model()
+        model = self._try_load_model(sport)
 
         # Try model first
-        if self._model is not None:
+        if model is not None:
             try:
-                results = self._model(frame, conf=0.3, verbose=False)[0]
+                results = model(frame, conf=0.3, verbose=False)[0]
                 if results.boxes and len(results.boxes) > 0:
                     best = max(results.boxes, key=lambda b: float(b.conf))
-                    zone_name = self._model.names[int(best.cls)]
+                    zone_name = model.names[int(best.cls)]
                     return ZoneResult(
                         zone=zone_name,
                         zone_confidence=round(float(best.conf), 3),

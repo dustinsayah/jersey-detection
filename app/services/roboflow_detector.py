@@ -59,7 +59,9 @@ class RoboflowDetector:
       - football_ball_detector.pt
       - lacrosse_ball_detector.pt
       - basketball_action_detector.pt
-      - basketball_court_zone.pt
+      - basketball_court_zones.pt
+      - football_field_zones.pt
+      - basketball_player_detector_v2.pt
     """
 
     def __init__(self):
@@ -84,7 +86,9 @@ class RoboflowDetector:
         self.football_ball_detector_model = None
         self.lacrosse_ball_detector_model = None
         self.basketball_action_detector_model = None
-        self.basketball_court_zone_model = None
+        self.basketball_court_zones_model = None
+        self.football_field_zones_model = None
+        self.basketball_player_detector_v2_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
@@ -126,7 +130,9 @@ class RoboflowDetector:
             "football_ball_detector.pt": "football_ball_detector_model",
             "lacrosse_ball_detector.pt": "lacrosse_ball_detector_model",
             "basketball_action_detector.pt": "basketball_action_detector_model",
-            "basketball_court_zone.pt": "basketball_court_zone_model",
+            "basketball_court_zones.pt": "basketball_court_zones_model",
+            "football_field_zones.pt": "football_field_zones_model",
+            "basketball_player_detector_v2.pt": "basketball_player_detector_v2_model",
         }
         for filename, attr in _v3_models.items():
             path = os.path.join(MODEL_DIR, filename)
@@ -156,7 +162,7 @@ class RoboflowDetector:
             if getattr(self, attr) is not None
         )
         logger.info(
-            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/5 v3 loaded",
+            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/7 v3 loaded",
             v1_loaded, v2_loaded, v3_loaded,
         )
 
@@ -402,7 +408,9 @@ class RoboflowDetector:
             "football_ball_detector": _v2_status("football_ball_detector_model"),
             "lacrosse_ball_detector": _v2_status("lacrosse_ball_detector_model"),
             "basketball_action_detector": _v2_status("basketball_action_detector_model"),
-            "basketball_court_zone": _v2_status("basketball_court_zone_model"),
+            "basketball_court_zones": _v2_status("basketball_court_zones_model"),
+            "football_field_zones": _v2_status("football_field_zones_model"),
+            "basketball_player_detector_v2": _v2_status("basketball_player_detector_v2_model"),
         }
 
 

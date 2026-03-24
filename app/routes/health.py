@@ -77,13 +77,15 @@ def _check_phases() -> dict:
             if k not in phases["roboflow_models_v1"]
             and k not in ("basketball_ball_detector", "football_ball_detector",
                           "lacrosse_ball_detector", "basketball_action_detector",
-                          "basketball_court_zone")
+                          "basketball_court_zones", "football_field_zones",
+                          "basketball_player_detector_v2")
         }
         phases["roboflow_models_v3"] = {
             k: v for k, v in rf_status.items()
             if k in ("basketball_ball_detector", "football_ball_detector",
                      "lacrosse_ball_detector", "basketball_action_detector",
-                     "basketball_court_zone")
+                     "basketball_court_zones", "football_field_zones",
+                     "basketball_player_detector_v2")
         }
     except Exception:
         phases["roboflow_models_v1"] = {"error": "import_failed"}

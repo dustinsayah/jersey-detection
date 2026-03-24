@@ -188,6 +188,8 @@ async def run_analyze_pipeline(
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000),
                 "status": ali_status,
                 "detections": len(jersey_detections),
+                "input_type": "local_file" if ali_video_path else "url",
+                "input": (ali_video_path or ali_video_url or "")[:100],
             }
             LOGGER.info("Pipeline: jersey detection found %d frames", len(jersey_detections))
         except Exception as exc:
@@ -195,7 +197,7 @@ async def run_analyze_pipeline(
             layer_timings["ali_jersey_detection"] = {
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000),
                 "status": "error",
-                "error": str(exc),
+                "error": str(exc)[:200],
                 "detections": 0,
             }
             LOGGER.error("Pipeline: jersey detection failed: %s", exc)
@@ -591,9 +593,13 @@ def _run_jersey_detection(
         if position:
             req_data["position"] = position
 
+        LOGGER.info("Ali request: %s", {k: (str(v)[:80] if isinstance(v, str) else v) for k, v in req_data.items()})
+
         request = DetectRequest(**req_data)
         service = DetectionService()
         detections = service.detect(request)
+
+        LOGGER.info("Ali returned %d raw detections", len(detections))
 
         # Convert DetectionFrame objects to dicts
         results = []

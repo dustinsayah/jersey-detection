@@ -28,7 +28,7 @@ class ZoneResult:
 
 _ZONE_MODELS = {
     "basketball": "basketball_court_zones.pt",
-    "football": "football_field_zones.pt",
+    # Football uses geometry fallback — no trained zone model yet
 }
 
 

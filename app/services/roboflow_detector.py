@@ -43,10 +43,10 @@ class RoboflowDetector:
       - football_jersey_tracker.pt — jersey tracking across frames
       - basketball_jersey_ocr.pt — SKIPPED (mAP50: 0.10, pending retrain)
 
-    Pending models (v2 — next Colab session):
+    v2 models (Colab train_models_v2.ipynb):
       - basketball_jersey_number_v2.pt
       - basketball_jersey_number_v3.pt
-      - basketball_player_detector.pt
+      - basketball_player_detector_v2.pt
       - football_positions_detector.pt
       - football_presnap_detector.pt
       - jersey_number_universal_v1.pt
@@ -54,14 +54,12 @@ class RoboflowDetector:
       - lacrosse_detector_v1.pt
       - lacrosse_detector_v2.pt
 
-    Pending models (v3 — ball/action/zone):
+    v3 models (ball/action/zone — Colab train_models_v2.ipynb Chunk 4):
       - basketball_ball_detector.pt
       - football_ball_detector.pt
       - lacrosse_ball_detector.pt
       - basketball_action_detector.pt
       - basketball_court_zones.pt
-      - football_field_zones.pt
-      - basketball_player_detector_v2.pt
     """
 
     def __init__(self):
@@ -71,24 +69,22 @@ class RoboflowDetector:
         self.football_player_model = None
         self.basketball_jersey_model = None
         self.football_tracker_model = None
-        # v2 models (pending training)
+        # v2 models
         self.basketball_jersey_number_v2_model = None
         self.basketball_jersey_number_v3_model = None
-        self.basketball_player_detector_model = None
+        self.basketball_player_detector_v2_model = None
         self.football_positions_model = None
         self.football_presnap_model = None
         self.jersey_number_universal_v1_model = None
         self.jersey_number_universal_v2_model = None
         self.lacrosse_v1_model = None
         self.lacrosse_v2_model = None
-        # v3 models (ball/action/zone — pending training)
+        # v3 models (ball/action/zone)
         self.basketball_ball_detector_model = None
         self.football_ball_detector_model = None
         self.lacrosse_ball_detector_model = None
         self.basketball_action_detector_model = None
         self.basketball_court_zones_model = None
-        self.football_field_zones_model = None
-        self.basketball_player_detector_v2_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
@@ -109,7 +105,7 @@ class RoboflowDetector:
         _v2_models = {
             "basketball_jersey_number_v2.pt": "basketball_jersey_number_v2_model",
             "basketball_jersey_number_v3.pt": "basketball_jersey_number_v3_model",
-            "basketball_player_detector.pt": "basketball_player_detector_model",
+            "basketball_player_detector_v2.pt": "basketball_player_detector_v2_model",
             "football_positions_detector.pt": "football_positions_model",
             "football_presnap_detector.pt": "football_presnap_model",
             "jersey_number_universal_v1.pt": "jersey_number_universal_v1_model",
@@ -131,8 +127,6 @@ class RoboflowDetector:
             "lacrosse_ball_detector.pt": "lacrosse_ball_detector_model",
             "basketball_action_detector.pt": "basketball_action_detector_model",
             "basketball_court_zones.pt": "basketball_court_zones_model",
-            "football_field_zones.pt": "football_field_zones_model",
-            "basketball_player_detector_v2.pt": "basketball_player_detector_v2_model",
         }
         for filename, attr in _v3_models.items():
             path = os.path.join(MODEL_DIR, filename)
@@ -162,7 +156,7 @@ class RoboflowDetector:
             if getattr(self, attr) is not None
         )
         logger.info(
-            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/7 v3 loaded",
+            "RoboflowDetector: %d/3 v1 loaded (basketball skipped), %d/9 v2 loaded, %d/5 v3 loaded",
             v1_loaded, v2_loaded, v3_loaded,
         )
 
@@ -396,7 +390,7 @@ class RoboflowDetector:
             # v2 models
             "basketball_jersey_number_v2": _v2_status("basketball_jersey_number_v2_model"),
             "basketball_jersey_number_v3": _v2_status("basketball_jersey_number_v3_model"),
-            "basketball_player_detector": _v2_status("basketball_player_detector_model"),
+            "basketball_player_detector_v2": _v2_status("basketball_player_detector_v2_model"),
             "football_positions_detector": _v2_status("football_positions_model"),
             "football_presnap_detector": _v2_status("football_presnap_model"),
             "jersey_number_universal_v1": _v2_status("jersey_number_universal_v1_model"),
@@ -409,8 +403,6 @@ class RoboflowDetector:
             "lacrosse_ball_detector": _v2_status("lacrosse_ball_detector_model"),
             "basketball_action_detector": _v2_status("basketball_action_detector_model"),
             "basketball_court_zones": _v2_status("basketball_court_zones_model"),
-            "football_field_zones": _v2_status("football_field_zones_model"),
-            "basketball_player_detector_v2": _v2_status("basketball_player_detector_v2_model"),
         }
 
 

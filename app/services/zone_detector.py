@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
-BASKETBALL_ZONES = ["paint", "midrange", "three_point", "backcourt", "transition"]
+BASKETBALL_ZONES = ["paint", "midrange", "three_point", "center_circle", "backcourt", "transition"]
 FOOTBALL_ZONES = ["own_endzone", "own_territory", "midfield", "opponent_territory", "redzone", "opponent_endzone"]
 LACROSSE_ZONES = ["defensive", "midfield", "attack", "crease"]
 
@@ -29,6 +29,22 @@ class ZoneResult:
 _ZONE_MODELS = {
     "basketball": "basketball_court_zones.pt",
     # Football uses geometry fallback — no trained zone model yet
+}
+
+# Map model class names → standard zone names
+_ZONE_NAME_MAP = {
+    "paint": "paint",
+    "key": "paint",
+    "lane": "paint",
+    "three_point": "three_point",
+    "3_point": "three_point",
+    "3pt": "three_point",
+    "center_circle": "center_circle",
+    "center": "center_circle",
+    "mid_court": "center_circle",
+    "backcourt": "backcourt",
+    "midrange": "midrange",
+    "mid_range": "midrange",
 }
 
 
@@ -77,7 +93,9 @@ class ZoneDetector:
                 results = model(frame, conf=0.3, verbose=False)[0]
                 if results.boxes and len(results.boxes) > 0:
                     best = max(results.boxes, key=lambda b: float(b.conf))
-                    zone_name = model.names[int(best.cls)]
+                    raw_name = model.names[int(best.cls)].lower().replace("-", "_").replace(" ", "_")
+                    # Normalize model class names to standard zone names
+                    zone_name = _ZONE_NAME_MAP.get(raw_name, raw_name)
                     return ZoneResult(
                         zone=zone_name,
                         zone_confidence=round(float(best.conf), 3),

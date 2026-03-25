@@ -21,6 +21,11 @@ _BALL_MODELS = {
     "lacrosse": "lacrosse_ball_detector.pt",
 }
 
+# Supplementary models that also detect balls (used as fallback)
+_BALL_FALLBACK_MODELS = {
+    "basketball": "basketball_action_detector.pt",
+}
+
 
 @dataclass
 class BallFrame:
@@ -35,6 +40,7 @@ class BallTracker:
 
     def __init__(self):
         self._models: dict = {}
+        self._fallback_models: dict = {}
         self._prev_positions: list[list[float]] = []
 
     def _load_model(self, sport: str):
@@ -61,6 +67,28 @@ class BallTracker:
             self._models[sport] = None
             return None
 
+    def _load_fallback(self, sport: str):
+        sport_lower = sport.lower()
+        if sport_lower in self._fallback_models:
+            return self._fallback_models[sport_lower]
+        filename = _BALL_FALLBACK_MODELS.get(sport_lower)
+        if not filename:
+            self._fallback_models[sport_lower] = None
+            return None
+        path = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(path):
+            self._fallback_models[sport_lower] = None
+            return None
+        try:
+            from ultralytics import YOLO
+            model = YOLO(path)
+            logger.info("ball_tracker: loaded fallback %s", filename)
+            self._fallback_models[sport_lower] = model
+            return model
+        except Exception:
+            self._fallback_models[sport_lower] = None
+            return None
+
     def _estimate_trajectory(self, current_pos: list[float], frame_width: int) -> str:
         """Estimate ball trajectory from recent positions."""
         if len(self._prev_positions) < 2:
@@ -74,39 +102,58 @@ class BallTracker:
         else:
             return "toward_basket" if dx > 0 else "away_from_basket"
 
+    def _find_ball_in_results(self, results, model) -> tuple[float, list[float]]:
+        """Extract best ball detection from YOLO results."""
+        best_conf = 0.0
+        best_pos = [0.0, 0.0]
+        for box in results.boxes:
+            name = model.names[int(box.cls)].lower()
+            if "ball" in name or "basketball" in name or "football" in name or "lacrosse" in name:
+                c = float(box.conf)
+                if c > best_conf:
+                    best_conf = c
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    best_pos = [(x1 + x2) / 2, (y1 + y2) / 2]
+        return best_conf, best_pos
+
     def track_frame(
         self, frame: np.ndarray, sport: str, conf: float = 0.3
     ) -> BallFrame:
-        """Detect ball in a single frame."""
+        """Detect ball in a single frame using primary + fallback models."""
+        best_conf = 0.0
+        best_pos = [0.0, 0.0]
+
+        # Try primary ball model
         model = self._load_model(sport)
-        if model is None:
-            return BallFrame()
-        try:
-            results = model(frame, conf=conf, verbose=False)[0]
-            best_conf = 0.0
-            best_pos = [0.0, 0.0]
-            for box in results.boxes:
-                name = model.names[int(box.cls)].lower()
-                if "ball" in name or "basketball" in name or "football" in name:
-                    c = float(box.conf)
-                    if c > best_conf:
-                        best_conf = c
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        best_pos = [(x1 + x2) / 2, (y1 + y2) / 2]
-            if best_conf > 0:
-                h, w = frame.shape[:2]
-                trajectory = self._estimate_trajectory(best_pos, w)
-                self._prev_positions.append(best_pos)
-                if len(self._prev_positions) > 10:
-                    self._prev_positions = self._prev_positions[-10:]
-                return BallFrame(
-                    ball_visible=True,
-                    ball_position=best_pos,
-                    ball_trajectory=trajectory,
-                    ball_confidence=round(best_conf, 3),
-                )
-        except Exception as e:
-            logger.error("ball_tracker: detection error: %s", e)
+        if model is not None:
+            try:
+                results = model(frame, conf=conf, verbose=False)[0]
+                best_conf, best_pos = self._find_ball_in_results(results, model)
+            except Exception as e:
+                logger.error("ball_tracker: primary detection error: %s", e)
+
+        # Try fallback model if primary found nothing
+        if best_conf == 0:
+            fallback = self._load_fallback(sport)
+            if fallback is not None:
+                try:
+                    results = fallback(frame, conf=conf, verbose=False)[0]
+                    best_conf, best_pos = self._find_ball_in_results(results, fallback)
+                except Exception as e:
+                    logger.debug("ball_tracker: fallback detection error: %s", e)
+
+        if best_conf > 0:
+            h, w = frame.shape[:2]
+            trajectory = self._estimate_trajectory(best_pos, w)
+            self._prev_positions.append(best_pos)
+            if len(self._prev_positions) > 10:
+                self._prev_positions = self._prev_positions[-10:]
+            return BallFrame(
+                ball_visible=True,
+                ball_position=best_pos,
+                ball_trajectory=trajectory,
+                ball_confidence=round(best_conf, 3),
+            )
         return BallFrame()
 
     def reset(self):

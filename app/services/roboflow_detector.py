@@ -501,6 +501,80 @@ class RoboflowDetector:
 
         return dets
 
+    def _run_universal_ocr(
+        self, crop: np.ndarray, jersey_number: int, conf: float = 0.2
+    ) -> list[dict]:
+        """Run jersey_number_universal models on a crop (v2, highest accuracy)."""
+        dets: list[dict] = []
+        for model, layer_name in [
+            (self.jersey_number_universal_v1_model, "v2_universal_v1"),
+            (self.jersey_number_universal_v2_model, "v2_universal_v2"),
+        ]:
+            if model is None:
+                continue
+            try:
+                enhanced = self._preprocess(crop)
+                results = model(enhanced, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = model.names[int(box.cls)]
+                    num = self._parse_number(name)
+                    if num == jersey_number or self._check_adjacent_digits(
+                        jersey_number, results.boxes, model
+                    ):
+                        dets.append({
+                            "confidence": float(box.conf),
+                            "bbox": box.xyxy[0].tolist(),
+                            "number_detected": num,
+                            "layer": layer_name,
+                        })
+            except Exception as e:
+                logger.debug("%s error: %s", layer_name, e)
+        return dets
+
+    def _run_sport_specific_v2(
+        self, crop: np.ndarray, jersey_number: int, sport: str, conf: float = 0.2
+    ) -> list[dict]:
+        """Run sport-specific v2 models on a crop."""
+        dets: list[dict] = []
+        sl = sport.lower()
+
+        models_to_run: list[tuple] = []
+        if sl == "basketball":
+            models_to_run = [
+                (self.basketball_jersey_number_v2_model, "v2_basketball_jersey"),
+            ]
+        elif sl in ("football", "american_football"):
+            models_to_run = [
+                (self.football_positions_model, "v2_football_positions"),
+                (self.football_presnap_model, "v2_football_presnap"),
+            ]
+        elif sl == "lacrosse":
+            models_to_run = [
+                (self.lacrosse_v1_model, "v2_lacrosse"),
+            ]
+
+        enhanced = self._preprocess(crop)
+        for model, layer_name in models_to_run:
+            if model is None:
+                continue
+            try:
+                results = model(enhanced, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = model.names[int(box.cls)]
+                    num = self._parse_number(name)
+                    if num == jersey_number or self._check_adjacent_digits(
+                        jersey_number, results.boxes, model
+                    ):
+                        dets.append({
+                            "confidence": float(box.conf),
+                            "bbox": box.xyxy[0].tolist(),
+                            "number_detected": num,
+                            "layer": layer_name,
+                        })
+            except Exception as e:
+                logger.debug("%s error: %s", layer_name, e)
+        return dets
+
     def detect_with_player_crops(
         self,
         frame: np.ndarray,
@@ -510,13 +584,12 @@ class RoboflowDetector:
     ) -> list[dict]:
         """Multi-pass detection: find players, crop each, run OCR on crop.
 
-        v3 pipeline (when models available):
-        1. player_isolator_v3 or football_player_detector finds player bbox
-        2. jersey_color_classifier_v3 confirms color (if available)
-        3. number_region_detector_v3 finds exact number region
-        4. jersey_ocr_v3_primary reads the number
-        5. Sport-specific OCR + specialist models also run
-        6. Falls back to v1/v2 detectors if v3 not available
+        Detection priority order:
+        1. player_isolator_v3 → football_player_detector (universal player finder)
+        2. jersey_number_universal_v1 (0.995 mAP50 — best universal reader)
+        3. Sport-specific v2 models (basketball/football/lacrosse)
+        4. v3 OCR pipeline (when models available)
+        5. v1 fallback detectors (digit, tracker)
 
         Runs ALL available models for ALL sports — no sport gating.
         """
@@ -546,13 +619,14 @@ class RoboflowDetector:
 
         if not players:
             # No player boxes — run all detectors on full frame
-            dets = self._run_v3_ocr_on_crop(frame, jersey_number, sport, conf)
+            dets = self._run_universal_ocr(frame, jersey_number, conf)
+            dets.extend(self._run_sport_specific_v2(frame, jersey_number, sport, conf))
+            dets.extend(self._run_v3_ocr_on_crop(frame, jersey_number, sport, conf))
             dets.extend(self.detect_football_digits(frame, jersey_number, conf))
             dets.extend(self.detect_football_tracker(frame, jersey_number, conf))
-            dets.extend(self.detect_basketball_jerseys(frame, jersey_number, conf))
             return dets
 
-        # Pass 2: crop each player and run OCR
+        # Pass 2: crop each player and run full OCR chain
         for player in players:
             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
             pad = 10
@@ -564,12 +638,15 @@ class RoboflowDetector:
             if crop.size == 0:
                 continue
 
-            # Run v3 OCR pipeline on crop
-            dets = self._run_v3_ocr_on_crop(crop, jersey_number, sport, conf=0.2)
-            # Also run v1/v2 detectors for coverage
+            # Priority 1: universal v2 (best accuracy — 0.995 mAP50)
+            dets = self._run_universal_ocr(crop, jersey_number, conf=0.2)
+            # Priority 2: sport-specific v2 models
+            dets.extend(self._run_sport_specific_v2(crop, jersey_number, sport, conf=0.2))
+            # Priority 3: v3 OCR pipeline
+            dets.extend(self._run_v3_ocr_on_crop(crop, jersey_number, sport, conf=0.2))
+            # Priority 4: v1 fallback detectors
             dets.extend(self.detect_football_digits(crop, jersey_number, conf=0.2))
             dets.extend(self.detect_football_tracker(crop, jersey_number, conf=0.2))
-            dets.extend(self.detect_basketball_jerseys(crop, jersey_number, conf=0.2))
 
             # Adjust bbox coordinates back to full frame space
             for det in dets:

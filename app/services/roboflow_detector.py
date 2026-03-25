@@ -69,7 +69,6 @@ class RoboflowDetector:
       Chunk 1 — Multi-sport jersey OCR:
         - jersey_ocr_v3_primary.pt
         - jersey_ocr_v3_secondary.pt
-        - jersey_ocr_v3_ensemble.pt
       Chunk 2 — Sport-specific OCR:
         - basketball_ocr_v3.pt
         - football_ocr_v3.pt
@@ -111,7 +110,6 @@ class RoboflowDetector:
         # v3 OCR models (YOLOv8m — Ali replacement)
         self.jersey_ocr_v3_primary_model = None
         self.jersey_ocr_v3_secondary_model = None
-        self.jersey_ocr_v3_ensemble_model = None
         self.basketball_ocr_v3_model = None
         self.football_ocr_v3_model = None
         self.lacrosse_ocr_v3_model = None
@@ -176,7 +174,6 @@ class RoboflowDetector:
         _v3_ocr_models = {
             "jersey_ocr_v3_primary.pt": "jersey_ocr_v3_primary_model",
             "jersey_ocr_v3_secondary.pt": "jersey_ocr_v3_secondary_model",
-            "jersey_ocr_v3_ensemble.pt": "jersey_ocr_v3_ensemble_model",
             "basketball_ocr_v3.pt": "basketball_ocr_v3_model",
             "football_ocr_v3.pt": "football_ocr_v3_model",
             "lacrosse_ocr_v3.pt": "lacrosse_ocr_v3_model",
@@ -221,7 +218,7 @@ class RoboflowDetector:
             if getattr(self, attr) is not None
         )
         logger.info(
-            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/13 v3-ocr loaded",
+            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/12 v3-ocr loaded",
             v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded,
         )
 
@@ -419,7 +416,6 @@ class RoboflowDetector:
         for model, layer_name in [
             (self.jersey_ocr_v3_primary_model, "v3_ocr_primary"),
             (self.jersey_ocr_v3_secondary_model, "v3_ocr_secondary"),
-            (self.jersey_ocr_v3_ensemble_model, "v3_ocr_ensemble"),
         ]:
             if model is None:
                 continue
@@ -696,7 +692,6 @@ class RoboflowDetector:
             # v3 OCR models (YOLOv8m — Ali replacement, train via train_models_v3.ipynb)
             "jersey_ocr_v3_primary": _model_status("jersey_ocr_v3_primary_model"),
             "jersey_ocr_v3_secondary": _model_status("jersey_ocr_v3_secondary_model"),
-            "jersey_ocr_v3_ensemble": _model_status("jersey_ocr_v3_ensemble_model"),
             "basketball_ocr_v3": _model_status("basketball_ocr_v3_model"),
             "football_ocr_v3": _model_status("football_ocr_v3_model"),
             "lacrosse_ocr_v3": _model_status("lacrosse_ocr_v3_model"),

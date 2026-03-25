@@ -73,7 +73,7 @@ def _check_phases() -> dict:
         "basketball_court_zones",
     }
     _v3_ocr_keys = {
-        "jersey_ocr_v3_primary", "jersey_ocr_v3_secondary", "jersey_ocr_v3_ensemble",
+        "jersey_ocr_v3_primary", "jersey_ocr_v3_secondary",
         "basketball_ocr_v3", "football_ocr_v3", "lacrosse_ocr_v3",
         "player_isolator_v3", "jersey_color_classifier_v3", "number_region_detector_v3",
         "motion_blur_specialist_v3", "wide_angle_specialist_v3",
@@ -96,7 +96,7 @@ def _check_phases() -> dict:
             k: v for k, v in rf_status.items() if k in _v3_ocr_keys
         }
         v3_loaded = sum(1 for k in _v3_ocr_keys if rf_status.get(k) == "loaded")
-        phases["roboflow_v3_ocr_summary"] = f"{v3_loaded}/13 loaded"
+        phases["roboflow_v3_ocr_summary"] = f"{v3_loaded}/12 loaded"
     except Exception:
         phases["roboflow_models_v1"] = {"error": "import_failed"}
 

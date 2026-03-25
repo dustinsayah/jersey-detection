@@ -4,34 +4,17 @@
 # POST /analyze (app/routes/analyze.py)
 #   → run_analyze_pipeline() [this file]
 #     Step 1: Acquire video (YouTube download or direct URL download)
-#     Step 2: Ali's ensemble — _run_jersey_detection()
-#       → DetectionService.detect(DetectRequest)
-#         → detection_pipeline.py:detect_jersey_in_frames()
-#           → ffmpeg video decode → frame batching
-#           → jersey color mask → ROI extraction
-#           → YOLO person segmentation (yolo26n-seg.pt)
-#           → color matching on person torso
-#           → For each matched person:
-#             PublicCheckpointReaderEnsemble.read_crop()
-#               → Grad ViT-B (uncertainty_jnr_vitb.pth) — primary OCR
-#               → Koshkina legibility gate (koshkina_legibility_soccer.pth)
-#               → PARSeq fallback (koshkina_parseq_soccer.ckpt) — 4 crop variants
-#               → fuse_crop_read_results() — confidence fusion
-#           → temporal deduplication + export confidence filter
-#           → returns [{timestamp, confidence, bbox}]
-#     Step 3: Frame extraction (our frames for motion/audio/pose)
+#     Step 2: Ali's ensemble — highest priority
+#     Step 3: Frame extraction
 #     Step 4: Motion scoring (optical flow)
 #     Step 5: Audio analysis (whistle + crowd energy)
 #     Step 6: Player tracking (BoT-SORT)
 #     Step 7: Pose estimation (YOLO11n-pose)
-#     Step 7.5: Roboflow parallel layer — roboflow_detector.py
-#       → football_player_detector finds player bboxes
-#       → football_digit_detector reads numbers from crops
-#       → football_jersey_tracker confirms across frames
-#       → returns [{timestamp, confidence, bbox, number, layer}]
-#     Step 8: Merge Ali + Roboflow detections, deduplicate, extract clips
-#     Step 9: Stat pipeline (ball_tracker → zone_detector → action_detector → game_stats)
-#     → Returns full AnalyzeResponse with clips, stats, debug
+#     Step 7.5a: Universal v2 OCR (jersey_number_universal_v1, mAP50 0.995)
+#     Step 7.5b: v3 OCR pipeline (12 models — Ali replacement layer)
+#     Step 7.5c: v2 sport-specific models (basketball/football/lacrosse)
+#     Step 8: Cross-layer validation + merge + temporal consensus
+#     Step 9: Stat pipeline
 
 from __future__ import annotations
 
@@ -325,122 +308,205 @@ async def run_analyze_pipeline(
                 layer_timings["pose_estimation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
-        # ── Step 7.5: Roboflow parallel detection layer ─────────────────
-        # Roboflow runs for ALL sports in parallel with Ali's ensemble.
-        # Digit detection and player detection work regardless of sport.
-        # Only basketball_jersey_ocr.pt is disabled (mAP50: 0.10).
-        roboflow_detections: list[dict] = []
+        # ── Step 7.5a: Universal v2 OCR (best single model) ──────────
+        universal_v2_detections: list[dict] = []
         t0 = time.perf_counter()
         try:
             from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
 
-            LOGGER.info("Pipeline: Roboflow layer running for sport=%s", sport)
-            for t, frame in frames:
-                dets = roboflow_detector.detect_with_player_crops(
-                    frame,
-                    jersey_number=jersey_number,
-                    sport=sport,
-                    conf=0.2,
-                )
-                roboflow_detections.extend(
-                    {**d, "timestamp": t} for d in dets
-                )
-
-            if roboflow_detections:
-                phases_used.append("roboflow_detection")
-            layer_timings["roboflow_detection"] = {
+            if roboflow_detector.jersey_number_universal_v1_model is not None:
+                LOGGER.info("Pipeline: Universal v2 layer running")
+                for t, frame in frames:
+                    dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=0.2)
+                    universal_v2_detections.extend({**d, "timestamp": t} for d in dets)
+                if universal_v2_detections:
+                    phases_used.append("universal_v2_ocr")
+            layer_timings["universal_v2_ocr"] = {
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if roboflow_detections else "no_detections",
-                "detections": len(roboflow_detections),
+                "status": "success" if universal_v2_detections else "no_detections",
+                "detections": len(universal_v2_detections),
             }
-            LOGGER.info(
-                "Pipeline: Roboflow layer found %d detections for sport=%s",
-                len(roboflow_detections), sport,
-            )
+            LOGGER.info("Pipeline: Universal v2 found %d detections", len(universal_v2_detections))
         except Exception as exc:
-            layer_timings["roboflow_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
-            LOGGER.warning("Pipeline: Roboflow layer failed (non-fatal): %s", exc)
+            layer_timings["universal_v2_ocr"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: Universal v2 layer failed (non-fatal): %s", exc)
 
-        # ── Step 8: Build detection points and extract clips ─────────────
+        # ── Step 7.5b: v3 OCR pipeline (Ali replacement layer) ───────
+        v3_ocr_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            LOGGER.info("Pipeline: v3 OCR layer running for sport=%s", sport)
+            for t, frame in frames:
+                # Full v3 pipeline: player_isolator → color → number_region → OCR
+                dets = roboflow_detector.detect_with_player_crops(
+                    frame, jersey_number=jersey_number, sport=sport, conf=0.2,
+                )
+                # Only keep v3 layer detections (exclude v1/v2 that detect_with_player_crops also runs)
+                v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
+                v3_ocr_detections.extend({**d, "timestamp": t} for d in v3_only)
+            if v3_ocr_detections:
+                phases_used.append("v3_ocr_detection")
+            layer_timings["v3_ocr_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v3_ocr_detections else "no_detections",
+                "detections": len(v3_ocr_detections),
+            }
+            LOGGER.info("Pipeline: v3 OCR found %d detections", len(v3_ocr_detections))
+        except Exception as exc:
+            layer_timings["v3_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v3 OCR layer failed (non-fatal): %s", exc)
+
+        # ── Step 7.5c: v2 sport-specific models ──────────────────────
+        v2_sport_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            LOGGER.info("Pipeline: v2 sport-specific layer running for sport=%s", sport)
+            for t, frame in frames:
+                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=0.2)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+
+            # Also run v1 fallback detectors
+            for t, frame in frames:
+                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=0.2)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=0.2)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+
+            if v2_sport_detections:
+                phases_used.append("v2_sport_detection")
+            layer_timings["v2_sport_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v2_sport_detections else "no_detections",
+                "detections": len(v2_sport_detections),
+            }
+            LOGGER.info("Pipeline: v2 sport-specific found %d detections", len(v2_sport_detections))
+        except Exception as exc:
+            layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v2 sport-specific layer failed (non-fatal): %s", exc)
+
+        # ── Step 8: Cross-layer validation + merge ────────────────────
         detection_points: list[DetectionPoint] = []
+        cross_layer_agreements: list[dict] = []
 
-        # From Ali's jersey detections
+        # Collect ALL detections by timestamp (within 0.5s buckets)
+        all_layer_dets: list[dict] = []
         for det in jersey_detections:
-            ts = det.get("timestamp", 0)
+            all_layer_dets.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": jersey_number,
+                "layer": "ali_ensemble",
+            })
+        for det in universal_v2_detections:
+            all_layer_dets.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v2_universal_v1"),
+            })
+        for det in v3_ocr_detections:
+            all_layer_dets.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v3_ocr"),
+            })
+        for det in v2_sport_detections:
+            all_layer_dets.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v2_sport"),
+            })
+
+        # Group by timestamp bucket (0.5s window)
+        from collections import defaultdict
+        ts_buckets: dict[float, list[dict]] = defaultdict(list)
+        for det in all_layer_dets:
+            ts = det["timestamp"]
+            # Find existing bucket within 0.5s
+            bucket_key = None
+            for existing_ts in ts_buckets:
+                if abs(existing_ts - ts) < 0.5:
+                    bucket_key = existing_ts
+                    break
+            if bucket_key is None:
+                bucket_key = ts
+            ts_buckets[bucket_key].append(det)
+
+        # Cross-validate each bucket
+        for bucket_ts, bucket_dets in sorted(ts_buckets.items()):
+            layers_present = set(d["layer"] for d in bucket_dets)
+            best_conf = max(d["confidence"] for d in bucket_dets)
+            number_detected = jersey_number
+
+            # Cross-layer confidence boosts
+            bonus = 0.0
+            high_confidence = False
+            needs_confirmation = True
+
+            if "ali_ensemble" in layers_present and len(layers_present) >= 2:
+                # Ali + any other layer agrees
+                bonus += 0.2
+                needs_confirmation = False
+
+            if any("v3_ocr_primary" in l for l in layers_present) and \
+               any("v2_universal" in l for l in layers_present):
+                # v3 primary + v2 universal agree
+                bonus += 0.15
+                needs_confirmation = False
+
+            if len(layers_present) >= 3:
+                high_confidence = True
+                needs_confirmation = False
+
+            final_conf = min(1.0, best_conf + bonus)
+
+            if len(layers_present) >= 2:
+                cross_layer_agreements.append({
+                    "timestamp": round(bucket_ts, 1),
+                    "number_detected": number_detected,
+                    "layers_agreed": sorted(layers_present),
+                    "final_confidence": round(final_conf, 3),
+                    "high_confidence": high_confidence,
+                })
+
             detection_points.append(DetectionPoint(
-                timestamp=ts,
-                confidence=det.get("confidence", 0),
+                timestamp=bucket_ts,
+                confidence=final_conf,
                 jersey_visible=True,
                 jersey_number=jersey_number,
-                motion_score=motion_scores.get(ts, _nearest_value(motion_scores, ts)),
-                pose_action=pose_results.get(ts, _nearest_pose(pose_results, ts)).get("action", "standing") if pose_results else "standing",
-                crowd_energy=_get_crowd_energy(audio_result, ts),
+                motion_score=motion_scores.get(bucket_ts, _nearest_value(motion_scores, bucket_ts)),
+                pose_action=pose_results.get(bucket_ts, _nearest_pose(pose_results, bucket_ts)).get("action", "standing") if pose_results else "standing",
+                crowd_energy=_get_crowd_energy(audio_result, bucket_ts),
                 tracking_id=tracking_result.target_track_id if tracking_result else None,
             ))
 
-        # From Roboflow detections (merge, deduplicate by timestamp proximity)
-        for det in roboflow_detections:
-            ts = det.get("timestamp", 0)
-            # Skip if Ali already found something within 0.5s
-            already_covered = any(
-                abs(dp.timestamp - ts) < 0.5 for dp in detection_points
-            )
-            if already_covered:
-                # Boost confidence of existing point if Roboflow agrees
-                for dp in detection_points:
-                    if abs(dp.timestamp - ts) < 0.5:
-                        rf_conf = det.get("confidence", 0)
-                        # Agreement bonus: boost by 20% of Roboflow confidence
-                        dp.confidence = min(1.0, dp.confidence + rf_conf * 0.2)
-                        break
-            else:
-                detection_points.append(DetectionPoint(
-                    timestamp=ts,
-                    confidence=det.get("confidence", 0) * 0.85,  # Slight discount for RF-only
-                    jersey_visible=True,
-                    jersey_number=jersey_number,
-                    motion_score=motion_scores.get(ts, _nearest_value(motion_scores, ts)),
-                    pose_action=pose_results.get(ts, _nearest_pose(pose_results, ts)).get("action", "standing") if pose_results else "standing",
-                    crowd_energy=_get_crowd_energy(audio_result, ts),
-                    tracking_id=tracking_result.target_track_id if tracking_result else None,
-                ))
-
         # ── Temporal consensus filtering ─────────────────────────────
-        # Merge all raw detections with number_detected + layer tags,
-        # then filter through temporal consensus before building
-        # DetectionPoints. This eliminates false positive numbers.
+        # Filter through temporal consensus to eliminate false positives.
         tc_stats = {"raw_detections": 0, "confirmed_detections": 0,
                     "filtered_out": 0, "cross_layer_confirmed": 0}
         try:
             from app.services.temporal_consensus import temporal_consensus
 
-            all_raw_dets: list[dict] = []
-            for det in jersey_detections:
-                all_raw_dets.append({
-                    "timestamp": det.get("timestamp", 0),
-                    "confidence": det.get("confidence", 0),
-                    "number_detected": jersey_number,
-                    "layer": "ali",
-                })
-            for det in roboflow_detections:
-                all_raw_dets.append({
-                    "timestamp": det.get("timestamp", 0),
-                    "confidence": det.get("confidence", 0),
-                    "number_detected": det.get("number_detected", jersey_number),
-                    "layer": det.get("layer", "roboflow"),
-                })
-
-            if all_raw_dets:
+            if all_layer_dets:
                 confirmed_dets = temporal_consensus.filter_detections(
-                    all_raw_dets, jersey_number
+                    all_layer_dets, jersey_number
                 )
                 confirmed_dets = temporal_consensus.cross_layer_boost(
                     confirmed_dets
                 )
                 tc_stats = {
-                    "raw_detections": len(all_raw_dets),
+                    "raw_detections": len(all_layer_dets),
                     "confirmed_detections": len(confirmed_dets),
-                    "filtered_out": len(all_raw_dets) - len(confirmed_dets),
+                    "filtered_out": len(all_layer_dets) - len(confirmed_dets),
                     "cross_layer_confirmed": sum(
                         1 for d in confirmed_dets
                         if d.get("cross_layer_confirmed")
@@ -459,13 +525,15 @@ async def run_analyze_pipeline(
 
         # Log detection source breakdown
         ali_count = len(jersey_detections)
-        rf_count = len(roboflow_detections)
+        univ_count = len(universal_v2_detections)
+        v3_count = len(v3_ocr_detections)
+        v2_sport_count = len(v2_sport_detections)
         LOGGER.info(
-            "Pipeline: detection merge — Ali=%d, Roboflow=%d, Combined=%d",
-            ali_count, rf_count, len(detection_points),
+            "Layer results — Ali: %d, Universal_v1: %d, V3_primary: %d, V2_sport: %d, After_consensus: %d",
+            ali_count, univ_count, v3_count, v2_sport_count, len(detection_points),
         )
-        if ali_count == 0 and rf_count > 0:
-            LOGGER.info("Pipeline: Ali found 0 — Roboflow saved detection!")
+        if ali_count == 0 and (univ_count + v3_count + v2_sport_count) > 0:
+            LOGGER.info("Pipeline: Ali found 0 — other layers saved detection!")
 
         # If jersey detection found nothing but we have frames, generate detection points from motion/audio
         if not detection_points and frames:
@@ -580,7 +648,9 @@ async def run_analyze_pipeline(
         ]
         debug = {
             "ali_detections": len(jersey_detections),
-            "roboflow_detections": len(roboflow_detections),
+            "universal_v2_detections": len(universal_v2_detections),
+            "v3_ocr_detections": len(v3_ocr_detections),
+            "v2_sport_detections": len(v2_sport_detections),
             "combined_detections": len(detection_points),
             "ali_working": ali_working,
             "ali_status": ali_status,
@@ -589,6 +659,7 @@ async def run_analyze_pipeline(
             "layers_that_contributed": layers_that_contributed,
             "layer_breakdown": layer_timings,
             "temporal_consensus": tc_stats,
+            "cross_layer_agreements": cross_layer_agreements,
         }
 
         return {
@@ -773,7 +844,9 @@ def _error_response(message: str, elapsed: float) -> dict:
         "actionsDetected": [],
         "debug": {
             "ali_detections": 0,
-            "roboflow_detections": 0,
+            "universal_v2_detections": 0,
+            "v3_ocr_detections": 0,
+            "v2_sport_detections": 0,
             "combined_detections": 0,
             "ali_working": False,
             "ali_status": "not_run",
@@ -787,6 +860,7 @@ def _error_response(message: str, elapsed: float) -> dict:
                 "filtered_out": 0,
                 "cross_layer_confirmed": 0,
             },
+            "cross_layer_agreements": [],
         },
         "error": message,
     }

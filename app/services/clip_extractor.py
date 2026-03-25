@@ -1,4 +1,10 @@
 # Clip boundary detection — merge all signals into ranked clips
+#
+# v4 scoring tiers (with outcome detection):
+#   Elite (>=90): confirmed outcome — made shot, TD, goal
+#   Strong (70-89): highlight play without confirmed outcome
+#   Decent (50-69): player involved but unclear outcome
+#   Cut (<50): player not involved or dead ball
 
 from __future__ import annotations
 
@@ -9,6 +15,22 @@ from app.services.audio_types import AudioAnalysisResult, PlayBoundary
 from app.services.play_classifier import ClassificationResult, classify_play
 
 LOGGER = logging.getLogger(__name__)
+
+# v4 outcome actions that auto-boost clip grade to Elite
+_ELITE_OUTCOMES = {"made_shot", "touchdown", "goal"}
+# v4 outcome actions that boost clip score by fixed amount
+_OUTCOME_SCORE_BOOSTS = {
+    "made_shot": 25,        # basketball_made_shot_v4 + basketball_hoop_detector_v4
+    "touchdown": 30,        # football_touchdown_detector_v4
+    "goal": 30,             # lacrosse_goal_detector_v4
+    "completion": 15,       # football_completion_detector_v4
+    "sack": 15,             # football_sack_detector_v4
+    "rebound": 10,          # basketball_rebound_v4
+    "ground_ball": 10,      # lacrosse_ground_ball_v4
+    "drive": 10,            # basketball_dribble_drive_v4
+    "qb_scramble": 15,      # football_qb_scramble_v4
+    "crowd_energy": 10,     # crowd_energy_detector_v4 (all sports)
+}
 
 # Clip boundary expansion (seconds)
 EXPAND_BEFORE = 2.0
@@ -33,6 +55,7 @@ class DetectionPoint:
     pose_action: str = "standing"
     crowd_energy: float = 0.0
     tracking_id: int | None = None
+    v4_outcome: str = ""  # v4 outcome detector result (made_shot, touchdown, goal, etc.)
 
 
 @dataclass
@@ -180,14 +203,41 @@ def extract_clips(
             motion_spike=motion_spike,
         )
 
+        # ── v4: Apply outcome detection boosts ─────────────────────────
+        v4_outcomes = [d.v4_outcome for d in cluster if d.v4_outcome]
+        outcome_score = classification.score
+        outcome_grade = classification.grade
+
+        if v4_outcomes:
+            # Count unique outcomes in this cluster
+            unique_outcomes = set(v4_outcomes)
+            for outcome in unique_outcomes:
+                boost = _OUTCOME_SCORE_BOOSTS.get(outcome, 0)
+                outcome_score = min(100, outcome_score + boost)
+            # Elite override: confirmed scoring plays
+            if unique_outcomes & _ELITE_OUTCOMES:
+                outcome_grade = "Elite"
+                outcome_score = max(outcome_score, 90)
+
+        # Re-grade based on v4-boosted score
+        if outcome_grade != "Elite":
+            if outcome_score >= 90:
+                outcome_grade = "Elite"
+            elif outcome_score >= 70:
+                outcome_grade = "Strong"
+            elif outcome_score >= 50:
+                outcome_grade = "Decent"
+            else:
+                outcome_grade = "Cut"
+
         clips.append(ExtractedClip(
             start_time=round(start_time, 1),
             end_time=round(end_time, 1),
             confidence=round(avg_jersey_conf, 3),
-            score=classification.score,
+            score=outcome_score,
             play_type=classification.play_type,
             play_label=classification.play_label,
-            grade=classification.grade,
+            grade=outcome_grade,
             jersey_visible=bool(jersey_confs),
             jersey_number_seen=jersey_number_seen,
             tracking_id=tracking_id,

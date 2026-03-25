@@ -79,6 +79,19 @@ def _check_phases() -> dict:
         "motion_blur_specialist_v3", "wide_angle_specialist_v3",
         "dark_jersey_specialist_v3", "partial_visibility_specialist_v3",
     }
+    _v4_outcome_keys = {
+        "basketball_hoop_detector_v4", "basketball_made_shot_v4",
+        "basketball_scoring_zone_v4", "basketball_dribble_drive_v4",
+        "basketball_rebound_v4", "football_completion_detector_v4",
+        "football_touchdown_detector_v4", "football_sack_detector_v4",
+        "football_reception_yac_v4", "football_qb_scramble_v4",
+        "lacrosse_goal_detector_v4", "lacrosse_shot_quality_v4",
+        "lacrosse_ground_ball_v4", "crowd_energy_detector_v4",
+        "night_game_specialist_v4", "indoor_court_specialist_v4",
+        "crowd_obstruction_specialist_v4", "helmet_glare_specialist_v4",
+        "low_resolution_specialist_v4", "multi_player_cluster_v4",
+    }
+    _all_versioned_keys = _v1_keys | _v2_baz_keys | _v3_ocr_keys | _v4_outcome_keys
     try:
         from app.services.roboflow_detector import roboflow_detector
         rf_status = roboflow_detector.status()
@@ -87,7 +100,7 @@ def _check_phases() -> dict:
         }
         phases["roboflow_models_v2"] = {
             k: v for k, v in rf_status.items()
-            if k not in _v1_keys and k not in _v2_baz_keys and k not in _v3_ocr_keys
+            if k not in _all_versioned_keys
         }
         phases["roboflow_models_v2_ball_action_zone"] = {
             k: v for k, v in rf_status.items() if k in _v2_baz_keys
@@ -97,6 +110,11 @@ def _check_phases() -> dict:
         }
         v3_loaded = sum(1 for k in _v3_ocr_keys if rf_status.get(k) == "loaded")
         phases["roboflow_v3_ocr_summary"] = f"{v3_loaded}/12 loaded"
+        phases["roboflow_models_v4"] = {
+            k: v for k, v in rf_status.items() if k in _v4_outcome_keys
+        }
+        v4_loaded = sum(1 for k in _v4_outcome_keys if rf_status.get(k) == "loaded")
+        phases["roboflow_v4_outcome_summary"] = f"{v4_loaded}/20 loaded"
     except Exception:
         phases["roboflow_models_v1"] = {"error": "import_failed"}
 

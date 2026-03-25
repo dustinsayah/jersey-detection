@@ -7,6 +7,8 @@
 # v1/v2 models: YOLOv8n (fast, lower accuracy)
 # v3 OCR models: YOLOv8m (slower, much better for small text OCR)
 # v3 trains via notebooks/train_models_v3.ipynb
+# v4 outcome models: YOLOv8m (play outcome detection + niche specialists)
+# v4 trains via notebooks/train_models_v4.ipynb
 
 from __future__ import annotations
 
@@ -82,6 +84,33 @@ class RoboflowDetector:
         - wide_angle_specialist_v3.pt
         - dark_jersey_specialist_v3.pt
         - partial_visibility_specialist_v3.pt
+
+    v4 outcome models (Colab train_models_v4.ipynb — YOLOv8m, play outcome detection):
+      Section A — Basketball Outcome:
+        - basketball_hoop_detector_v4.pt
+        - basketball_made_shot_v4.pt
+        - basketball_scoring_zone_v4.pt
+        - basketball_dribble_drive_v4.pt
+        - basketball_rebound_v4.pt
+      Section B — Football Outcome:
+        - football_completion_detector_v4.pt
+        - football_touchdown_detector_v4.pt
+        - football_sack_detector_v4.pt
+        - football_reception_yac_v4.pt
+        - football_qb_scramble_v4.pt
+      Section C — Lacrosse Outcome:
+        - lacrosse_goal_detector_v4.pt
+        - lacrosse_shot_quality_v4.pt
+        - lacrosse_ground_ball_v4.pt
+      Section D — Cross-Sport:
+        - crowd_energy_detector_v4.pt
+      Section E — Niche Specialists:
+        - night_game_specialist_v4.pt
+        - indoor_court_specialist_v4.pt
+        - crowd_obstruction_specialist_v4.pt
+        - helmet_glare_specialist_v4.pt
+        - low_resolution_specialist_v4.pt
+        - multi_player_cluster_v4.pt
     """
 
     def __init__(self):
@@ -120,6 +149,27 @@ class RoboflowDetector:
         self.wide_angle_specialist_v3_model = None
         self.dark_jersey_specialist_v3_model = None
         self.partial_visibility_specialist_v3_model = None
+        # v4 outcome models (YOLOv8m — play outcome detection)
+        self.basketball_hoop_detector_v4_model = None
+        self.basketball_made_shot_v4_model = None
+        self.basketball_scoring_zone_v4_model = None
+        self.basketball_dribble_drive_v4_model = None
+        self.basketball_rebound_v4_model = None
+        self.football_completion_detector_v4_model = None
+        self.football_touchdown_detector_v4_model = None
+        self.football_sack_detector_v4_model = None
+        self.football_reception_yac_v4_model = None
+        self.football_qb_scramble_v4_model = None
+        self.lacrosse_goal_detector_v4_model = None
+        self.lacrosse_shot_quality_v4_model = None
+        self.lacrosse_ground_ball_v4_model = None
+        self.crowd_energy_detector_v4_model = None
+        self.night_game_specialist_v4_model = None
+        self.indoor_court_specialist_v4_model = None
+        self.crowd_obstruction_specialist_v4_model = None
+        self.helmet_glare_specialist_v4_model = None
+        self.low_resolution_specialist_v4_model = None
+        self.multi_player_cluster_v4_model = None
 
     def load(self):
         """Lazy-load all models on first use."""
@@ -192,6 +242,36 @@ class RoboflowDetector:
             else:
                 logger.info("v3 OCR model pending: %s — train via train_models_v3.ipynb", filename)
 
+        # ── v4 outcome models (YOLOv8m — play outcome detection, load if present) ──
+        _v4_outcome_models = {
+            "basketball_hoop_detector_v4.pt": "basketball_hoop_detector_v4_model",
+            "basketball_made_shot_v4.pt": "basketball_made_shot_v4_model",
+            "basketball_scoring_zone_v4.pt": "basketball_scoring_zone_v4_model",
+            "basketball_dribble_drive_v4.pt": "basketball_dribble_drive_v4_model",
+            "basketball_rebound_v4.pt": "basketball_rebound_v4_model",
+            "football_completion_detector_v4.pt": "football_completion_detector_v4_model",
+            "football_touchdown_detector_v4.pt": "football_touchdown_detector_v4_model",
+            "football_sack_detector_v4.pt": "football_sack_detector_v4_model",
+            "football_reception_yac_v4.pt": "football_reception_yac_v4_model",
+            "football_qb_scramble_v4.pt": "football_qb_scramble_v4_model",
+            "lacrosse_goal_detector_v4.pt": "lacrosse_goal_detector_v4_model",
+            "lacrosse_shot_quality_v4.pt": "lacrosse_shot_quality_v4_model",
+            "lacrosse_ground_ball_v4.pt": "lacrosse_ground_ball_v4_model",
+            "crowd_energy_detector_v4.pt": "crowd_energy_detector_v4_model",
+            "night_game_specialist_v4.pt": "night_game_specialist_v4_model",
+            "indoor_court_specialist_v4.pt": "indoor_court_specialist_v4_model",
+            "crowd_obstruction_specialist_v4.pt": "crowd_obstruction_specialist_v4_model",
+            "helmet_glare_specialist_v4.pt": "helmet_glare_specialist_v4_model",
+            "low_resolution_specialist_v4.pt": "low_resolution_specialist_v4_model",
+            "multi_player_cluster_v4.pt": "multi_player_cluster_v4_model",
+        }
+        for filename, attr in _v4_outcome_models.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                setattr(self, attr, _load_model(filename))
+            else:
+                logger.info("v4 outcome model pending: %s — train via train_models_v4.ipynb", filename)
+
         self._loaded = True
         v1_loaded = sum(
             1
@@ -217,9 +297,14 @@ class RoboflowDetector:
             for attr in _v3_ocr_models.values()
             if getattr(self, attr) is not None
         )
+        v4_outcome_loaded = sum(
+            1
+            for attr in _v4_outcome_models.values()
+            if getattr(self, attr) is not None
+        )
         logger.info(
-            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/12 v3-ocr loaded",
-            v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded,
+            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/12 v3-ocr, %d/20 v4-outcome loaded",
+            v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded, v4_outcome_loaded,
         )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
@@ -702,6 +787,27 @@ class RoboflowDetector:
             "wide_angle_specialist_v3": _model_status("wide_angle_specialist_v3_model"),
             "dark_jersey_specialist_v3": _model_status("dark_jersey_specialist_v3_model"),
             "partial_visibility_specialist_v3": _model_status("partial_visibility_specialist_v3_model"),
+            # v4 outcome models (YOLOv8m — play outcome detection, train via train_models_v4.ipynb)
+            "basketball_hoop_detector_v4": _model_status("basketball_hoop_detector_v4_model"),
+            "basketball_made_shot_v4": _model_status("basketball_made_shot_v4_model"),
+            "basketball_scoring_zone_v4": _model_status("basketball_scoring_zone_v4_model"),
+            "basketball_dribble_drive_v4": _model_status("basketball_dribble_drive_v4_model"),
+            "basketball_rebound_v4": _model_status("basketball_rebound_v4_model"),
+            "football_completion_detector_v4": _model_status("football_completion_detector_v4_model"),
+            "football_touchdown_detector_v4": _model_status("football_touchdown_detector_v4_model"),
+            "football_sack_detector_v4": _model_status("football_sack_detector_v4_model"),
+            "football_reception_yac_v4": _model_status("football_reception_yac_v4_model"),
+            "football_qb_scramble_v4": _model_status("football_qb_scramble_v4_model"),
+            "lacrosse_goal_detector_v4": _model_status("lacrosse_goal_detector_v4_model"),
+            "lacrosse_shot_quality_v4": _model_status("lacrosse_shot_quality_v4_model"),
+            "lacrosse_ground_ball_v4": _model_status("lacrosse_ground_ball_v4_model"),
+            "crowd_energy_detector_v4": _model_status("crowd_energy_detector_v4_model"),
+            "night_game_specialist_v4": _model_status("night_game_specialist_v4_model"),
+            "indoor_court_specialist_v4": _model_status("indoor_court_specialist_v4_model"),
+            "crowd_obstruction_specialist_v4": _model_status("crowd_obstruction_specialist_v4_model"),
+            "helmet_glare_specialist_v4": _model_status("helmet_glare_specialist_v4_model"),
+            "low_resolution_specialist_v4": _model_status("low_resolution_specialist_v4_model"),
+            "multi_player_cluster_v4": _model_status("multi_player_cluster_v4_model"),
         }
 
 

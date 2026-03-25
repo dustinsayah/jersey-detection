@@ -1,5 +1,10 @@
 # Game stats aggregator — builds box-score-style stats from detected actions
 # Returns game_stats (aggregate) + per_clip_stats (per clip breakdown)
+#
+# v4 integration: outcome detector models confirm successful plays.
+# basketball_made_shot_v4 → shots_made, basketball_hoop_detector_v4 → confirm scoring
+# football_touchdown_v4 → touchdowns, football_completion_v4 → completions
+# lacrosse_goal_v4 → goals
 
 from __future__ import annotations
 
@@ -59,19 +64,28 @@ def generate_basketball_stats(
     for a in actions:
         at = a.get("action_type", "")
         zone = a.get("zone", "unknown")
+        # v4: outcome detectors can confirm plays via v4_outcome field
+        v4_outcome = a.get("v4_outcome", "")
         if zone in stats["zone_breakdown"]:
             stats["zone_breakdown"][zone] += 1
 
         if at == "shot_attempt":
             stats["shot_attempts"] += 1
-            # Estimate ~45% make rate
-            if a.get("confidence", 0) > 0.6:
+            # v4: if basketball_made_shot_v4 confirmed → definite make
+            if v4_outcome == "made_shot":
+                stats["shots_made"] += 1
+                stats["points_estimated"] += 2
+            elif a.get("confidence", 0) > 0.6:
                 stats["shots_made"] += 1
                 stats["points_estimated"] += 2
         elif at == "three_point_attempt":
             stats["three_point_attempts"] += 1
             stats["shot_attempts"] += 1
-            if a.get("confidence", 0) > 0.65:
+            if v4_outcome == "made_shot":
+                stats["three_pointers_made"] += 1
+                stats["shots_made"] += 1
+                stats["points_estimated"] += 3
+            elif a.get("confidence", 0) > 0.65:
                 stats["three_pointers_made"] += 1
                 stats["shots_made"] += 1
                 stats["points_estimated"] += 3
@@ -137,6 +151,8 @@ def generate_football_stats(
     for a in actions:
         at = a.get("action_type", "")
         zone = a.get("zone", "unknown")
+        # v4: outcome detectors confirm plays
+        v4_outcome = a.get("v4_outcome", "")
         stats["total_plays"] += 1
 
         if zone in stats["zone_breakdown"]:
@@ -146,13 +162,16 @@ def generate_football_stats(
 
         if at == "pass_play":
             stats["pass_attempts"] += 1
+            # v4: football_completion_detector_v4 confirms completion
+            if v4_outcome == "completion":
+                stats["completions"] += 1
         elif at == "completion":
             stats["completions"] += 1
-        elif at == "touchdown":
+        elif at == "touchdown" or v4_outcome == "touchdown":
             stats["touchdowns"] += 1
         elif at == "run_play":
             stats["run_plays"] += 1
-        elif at == "sack":
+        elif at == "sack" or v4_outcome == "sack":
             stats["sacks_taken"] += 1
         elif at == "interception":
             stats["interceptions"] += 1
@@ -197,15 +216,21 @@ def generate_lacrosse_stats(
     for a in actions:
         at = a.get("action_type", "")
         zone = a.get("zone", "unknown")
+        # v4: outcome detectors confirm plays
+        v4_outcome = a.get("v4_outcome", "")
         if zone in stats["zone_breakdown"]:
             stats["zone_breakdown"][zone] += 1
 
         if at == "shot":
             stats["shot_attempts"] += 1
-        elif at == "goal":
+            # v4: lacrosse_goal_detector_v4 confirms goal
+            if v4_outcome == "goal":
+                stats["goals"] += 1
+        elif at == "goal" or v4_outcome == "goal":
             stats["goals"] += 1
-            stats["shot_attempts"] += 1
-        elif at == "ground_ball":
+            if at == "goal":
+                stats["shot_attempts"] += 1
+        elif at == "ground_ball" or v4_outcome == "ground_ball":
             stats["ground_balls"] += 1
         elif at == "clear":
             stats["clears"] += 1

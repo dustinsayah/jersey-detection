@@ -23,6 +23,16 @@ env/
 !app/model/football_player_detector.pt
 !app/model/basketball_jersey_ocr.pt
 !app/model/football_jersey_tracker.pt
+!app/model/basketball_jersey_number_v2.pt
+!app/model/football_positions_detector.pt
+!app/model/football_presnap_detector.pt
+!app/model/jersey_number_universal_v1.pt
+!app/model/jersey_number_universal_v2.pt
+!app/model/lacrosse_detector_v1.pt
+!app/model/football_ball_detector.pt
+!app/model/lacrosse_ball_detector.pt
+!app/model/basketball_court_zones.pt
+!app/model/basketball_action_detector.pt
 app/model/public/*
 !app/model/public/.gitkeep
 

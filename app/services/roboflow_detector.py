@@ -742,6 +742,74 @@ class RoboflowDetector:
 
         return all_detections
 
+    def detect_with_v3_primary(
+        self,
+        frame: np.ndarray,
+        jersey_number: int,
+        sport: str,
+        conf: float = 0.2,
+    ) -> list[dict]:
+        """Run jersey_ocr_v3_primary on player crop regions.
+
+        Fallback chain for when the full v3 pipeline (player_isolator,
+        color_classifier, number_region_detector) is not yet trained.
+        Uses football_player_detector (v2) to find player bboxes first,
+        then runs v3 primary OCR on each crop.
+        """
+        self.load()
+        if self.jersey_ocr_v3_primary_model is None:
+            return []
+
+        results: list[dict] = []
+
+        # Step 1: find player bboxes using v2 player detector
+        players = self.detect_football_players(frame, conf=0.25)
+        if not players:
+            # No player boxes — run on full frame as single "crop"
+            players = [{"bbox": [0, 0, frame.shape[1], frame.shape[0]]}]
+
+        # Step 2: crop each player and run v3 primary OCR
+        for player in players:
+            x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
+            pad = 20
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(frame.shape[1], x2 + pad)
+            y2 = min(frame.shape[0], y2 + pad)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            # Upscale small crops 2x for better OCR
+            h, w = crop.shape[:2]
+            if w < 200 or h < 200:
+                upscaled = cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            else:
+                upscaled = crop
+
+            enhanced = self._preprocess(upscaled)
+
+            try:
+                ocr_results = self.jersey_ocr_v3_primary_model(
+                    enhanced, conf=conf, verbose=False
+                )[0]
+                for box in ocr_results.boxes:
+                    class_name = self.jersey_ocr_v3_primary_model.names[int(box.cls)]
+                    detected_num = self._parse_number(class_name)
+                    if detected_num == jersey_number:
+                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                        results.append({
+                            "confidence": float(box.conf),
+                            "bbox": [bx1 + x1, by1 + y1, bx2 + x1, by2 + y1],
+                            "number_detected": detected_num,
+                            "layer": "v3_ocr_primary_standalone",
+                        })
+            except Exception as e:
+                logger.debug("v3 primary standalone error: %s", e)
+                continue
+
+        return results
+
     def status(self) -> dict:
         """Report which models are loaded vs missing vs pending."""
         self.load()

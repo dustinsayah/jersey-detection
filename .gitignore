@@ -33,6 +33,7 @@ env/
 !app/model/lacrosse_ball_detector.pt
 !app/model/basketball_court_zones.pt
 !app/model/basketball_action_detector.pt
+!app/model/jersey_ocr_v3_primary.pt
 app/model/public/*
 !app/model/public/.gitkeep
 

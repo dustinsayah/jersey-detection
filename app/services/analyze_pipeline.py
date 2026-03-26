@@ -47,6 +47,11 @@ FOOTBALL_CONF_THRESHOLD = 0.15  # Lower than default 0.35
 FOOTBALL_MIN_CLIP = 3.0
 FOOTBALL_MAX_CLIP = 12.0
 
+# Frame sampling: how many FPS to extract for Roboflow layers.
+# Default 10 = every 3rd frame at 30fps (600 frames for 60s clip).
+# Configurable via ANALYZE_FPS env var.
+ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "10"))
+
 
 async def run_analyze_pipeline(
     *,
@@ -190,7 +195,7 @@ async def run_analyze_pipeline(
         if local_video_path and local_video_path.exists():
             t0 = time.perf_counter()
             try:
-                frames = _extract_frames(local_video_path, fps=2, sport=sport)
+                frames = _extract_frames(local_video_path, fps=ANALYZE_FPS, sport=sport)
                 frames_processed = len(frames)
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
                 LOGGER.info("Pipeline: extracted %d frames", len(frames))
@@ -391,40 +396,102 @@ async def run_analyze_pipeline(
             layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v2 sport-specific layer failed (non-fatal): %s", exc)
 
+        # ── Step 7.5d: v3 primary OCR standalone (fallback chain) ──────
+        v3_primary_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            if roboflow_detector.jersey_ocr_v3_primary_model is not None:
+                LOGGER.info("Pipeline: v3 primary standalone layer running")
+                for t, frame in frames:
+                    dets = roboflow_detector.detect_with_v3_primary(
+                        frame, jersey_number=jersey_number, sport=sport, conf=0.2,
+                    )
+                    v3_primary_detections.extend({**d, "timestamp": t} for d in dets)
+                if v3_primary_detections:
+                    phases_used.append("v3_primary_standalone")
+            layer_timings["v3_primary_standalone"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v3_primary_detections else "no_detections",
+                "detections": len(v3_primary_detections),
+            }
+            LOGGER.info("Pipeline: v3 primary standalone found %d detections", len(v3_primary_detections))
+        except Exception as exc:
+            layer_timings["v3_primary_standalone"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v3 primary standalone layer failed (non-fatal): %s", exc)
+
         # ── Step 8: Cross-layer validation + merge ────────────────────
         detection_points: list[DetectionPoint] = []
         cross_layer_agreements: list[dict] = []
 
         # Collect ALL detections by timestamp (within 0.5s buckets)
-        all_layer_dets: list[dict] = []
+        all_layer_dets_raw: list[dict] = []
         for det in jersey_detections:
-            all_layer_dets.append({
+            all_layer_dets_raw.append({
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": jersey_number,
                 "layer": "ali_ensemble",
             })
         for det in universal_v2_detections:
-            all_layer_dets.append({
+            all_layer_dets_raw.append({
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v2_universal_v1"),
             })
         for det in v3_ocr_detections:
-            all_layer_dets.append({
+            all_layer_dets_raw.append({
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v3_ocr"),
             })
         for det in v2_sport_detections:
-            all_layer_dets.append({
+            all_layer_dets_raw.append({
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v2_sport"),
             })
+        for det in v3_primary_detections:
+            all_layer_dets_raw.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v3_ocr_primary_standalone"),
+            })
+
+        # ── Diagnostic: log ALL numbers detected before filtering ─────
+        all_numbers_seen = set(
+            d.get("number_detected", "unknown") for d in all_layer_dets_raw
+        )
+        LOGGER.info(
+            "Numbers detected across all layers (before filter): %s  "
+            "(target jersey_number=%d)",
+            all_numbers_seen, jersey_number,
+        )
+        if all_numbers_seen and jersey_number not in all_numbers_seen:
+            LOGGER.warning(
+                "Pipeline: target jersey #%d NOT FOUND in any layer. "
+                "Detected numbers: %s",
+                jersey_number, all_numbers_seen,
+            )
+
+        # ── Filter: keep only detections for the requested jersey_number ──
+        all_layer_dets = [
+            d for d in all_layer_dets_raw
+            if d.get("number_detected") == jersey_number
+        ]
+        wrong_number_count = len(all_layer_dets_raw) - len(all_layer_dets)
+        if wrong_number_count > 0:
+            LOGGER.info(
+                "Pipeline: filtered out %d detections for wrong jersey numbers "
+                "(kept %d for #%d)",
+                wrong_number_count, len(all_layer_dets), jersey_number,
+            )
 
         # Group by timestamp bucket (0.5s window)
         from collections import defaultdict
@@ -445,34 +512,29 @@ async def run_analyze_pipeline(
         for bucket_ts, bucket_dets in sorted(ts_buckets.items()):
             layers_present = set(d["layer"] for d in bucket_dets)
             best_conf = max(d["confidence"] for d in bucket_dets)
-            number_detected = jersey_number
 
             # Cross-layer confidence boosts
             bonus = 0.0
             high_confidence = False
-            needs_confirmation = True
 
             if "ali_ensemble" in layers_present and len(layers_present) >= 2:
                 # Ali + any other layer agrees
                 bonus += 0.2
-                needs_confirmation = False
 
             if any("v3_ocr_primary" in l for l in layers_present) and \
                any("v2_universal" in l for l in layers_present):
                 # v3 primary + v2 universal agree
                 bonus += 0.15
-                needs_confirmation = False
 
             if len(layers_present) >= 3:
                 high_confidence = True
-                needs_confirmation = False
 
             final_conf = min(1.0, best_conf + bonus)
 
             if len(layers_present) >= 2:
                 cross_layer_agreements.append({
                     "timestamp": round(bucket_ts, 1),
-                    "number_detected": number_detected,
+                    "number_detected": jersey_number,
                     "layers_agreed": sorted(layers_present),
                     "final_confidence": round(final_conf, 3),
                     "high_confidence": high_confidence,
@@ -490,7 +552,8 @@ async def run_analyze_pipeline(
             ))
 
         # ── Temporal consensus filtering ─────────────────────────────
-        # Filter through temporal consensus to eliminate false positives.
+        # Apply temporal consensus to filter detection_points down to
+        # only temporally-confirmed detections.
         tc_stats = {"raw_detections": 0, "confirmed_detections": 0,
                     "filtered_out": 0, "cross_layer_confirmed": 0}
         try:
@@ -520,6 +583,35 @@ async def run_analyze_pipeline(
                     tc_stats["filtered_out"],
                     tc_stats["cross_layer_confirmed"],
                 )
+
+                # Use confirmed timestamps to filter detection_points
+                if confirmed_dets:
+                    confirmed_timestamps = set()
+                    for cd in confirmed_dets:
+                        confirmed_timestamps.add(cd.get("timestamp", 0))
+                    pre_filter_count = len(detection_points)
+                    detection_points = [
+                        dp for dp in detection_points
+                        if any(
+                            abs(dp.timestamp - cts) < 0.5
+                            for cts in confirmed_timestamps
+                        )
+                    ]
+                    if len(detection_points) < pre_filter_count:
+                        LOGGER.info(
+                            "Pipeline: temporal consensus reduced detection_points "
+                            "%d → %d",
+                            pre_filter_count, len(detection_points),
+                        )
+                elif detection_points:
+                    # Consensus found 0 confirmed — drop all detection points
+                    LOGGER.warning(
+                        "Pipeline: temporal consensus confirmed 0 of %d "
+                        "detection_points — clearing all (likely false positives)",
+                        len(detection_points),
+                    )
+                    detection_points = []
+
         except Exception as exc:
             LOGGER.warning("Pipeline: temporal consensus failed (non-fatal): %s", exc)
 
@@ -528,20 +620,21 @@ async def run_analyze_pipeline(
         univ_count = len(universal_v2_detections)
         v3_count = len(v3_ocr_detections)
         v2_sport_count = len(v2_sport_detections)
+        v3_primary_count = len(v3_primary_detections)
         LOGGER.info(
-            "Layer results — Ali: %d, Universal_v1: %d, V3_primary: %d, V2_sport: %d, After_consensus: %d",
-            ali_count, univ_count, v3_count, v2_sport_count, len(detection_points),
+            "Layer results — Ali: %d, Universal_v1: %d, V3_ocr: %d, "
+            "V2_sport: %d, V3_primary: %d, After_filter: %d",
+            ali_count, univ_count, v3_count, v2_sport_count,
+            v3_primary_count, len(detection_points),
         )
-        if ali_count == 0 and (univ_count + v3_count + v2_sport_count) > 0:
+        if ali_count == 0 and (univ_count + v3_count + v2_sport_count + v3_primary_count) > 0:
             LOGGER.info("Pipeline: Ali found 0 — other layers saved detection!")
-        total_raw = ali_count + univ_count + v3_count + v2_sport_count
+        total_raw = ali_count + univ_count + v3_count + v2_sport_count + v3_primary_count
         if total_raw > 0 and len(detection_points) == 0:
             LOGGER.warning(
-                "Pipeline: %d raw detections across all layers → 0 detection_points. "
-                "Temporal consensus may be too aggressive (min_confirmations=%d, time_window=%.1fs).",
+                "Pipeline: %d raw detections across all layers → 0 detection_points "
+                "after jersey number filter + temporal consensus.",
                 total_raw,
-                tc_stats.get("raw_detections", 0),
-                2.0,
             )
 
         # If jersey detection found nothing but we have frames, generate detection points from motion/audio
@@ -660,7 +753,13 @@ async def run_analyze_pipeline(
             "universal_v2_detections": len(universal_v2_detections),
             "v3_ocr_detections": len(v3_ocr_detections),
             "v2_sport_detections": len(v2_sport_detections),
+            "v3_primary_detections": len(v3_primary_detections),
             "combined_detections": len(detection_points),
+            "numbers_detected": sorted(str(n) for n in all_numbers_seen),
+            "target_jersey_number": jersey_number,
+            "wrong_number_filtered": wrong_number_count,
+            "analyze_fps": ANALYZE_FPS,
+            "frames_extracted": len(frames),
             "ali_working": ali_working,
             "ali_status": ali_status,
             "youtube_strategy_used": youtube_strategy_used,

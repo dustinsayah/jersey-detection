@@ -7,6 +7,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+from app.schemas.detect import normalize_position
+
 SUPPORTED_SPORTS = {"basketball", "football", "lacrosse"}
 
 
@@ -128,6 +130,11 @@ class AnalyzeRequest(BaseModel):
         if normalized not in SUPPORTED_SPORTS:
             return "basketball"
         return normalized
+
+    @field_validator("position", mode="before")
+    @classmethod
+    def _validate_position(cls, value: Any) -> str | None:
+        return normalize_position(value)
 
     @model_validator(mode="after")
     def _validate_video_source(self) -> "AnalyzeRequest":

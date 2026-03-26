@@ -17,6 +17,44 @@ from pydantic import (
 
 SUPPORTED_SPORTS = {"basketball", "football", "lacrosse"}
 
+# Common position misspellings → canonical form
+_POSITION_ALIASES = {
+    "gaurd": "guard",
+    "gard": "guard",
+    "foward": "forward",
+    "quaterback": "quarterback",
+    "quarter back": "quarterback",
+    "qb": "quarterback",
+    "wide reciever": "wide receiver",
+    "wr": "wide receiver",
+    "rb": "running back",
+    "te": "tight end",
+    "lb": "linebacker",
+    "cb": "cornerback",
+    "corner back": "cornerback",
+    "saftey": "safety",
+    "safty": "safety",
+    "center": "center",
+    "goalie": "goalie",
+    "goaltender": "goalie",
+    "midfielder": "midfielder",
+    "middie": "midfielder",
+    "attackman": "attack",
+    "defenseman": "defense",
+    "d-man": "defense",
+}
+
+
+def normalize_position(raw: str | None) -> str | None:
+    """Normalize a position string: strip, lowercase, fix misspellings, take first if slash-separated."""
+    if not raw or not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = raw.strip().lower()
+    # Handle slash-separated: "guard/forward" → "guard"
+    if "/" in cleaned:
+        cleaned = cleaned.split("/")[0].strip()
+    return _POSITION_ALIASES.get(cleaned, cleaned) or None
+
 
 class BBox(BaseModel):
     x1: int
@@ -89,11 +127,7 @@ class DetectRequest(BaseModel):
     @field_validator("position", mode="before")
     @classmethod
     def _validate_position(cls, value: Any) -> str | None:
-        if value is None:
-            return None
-        if not isinstance(value, str) or not value.strip():
-            return None
-        return value.strip()
+        return normalize_position(value)
 
     @field_validator("video_bytes_b64", mode="before")
     @classmethod

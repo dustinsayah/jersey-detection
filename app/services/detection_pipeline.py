@@ -165,7 +165,7 @@ def _download_direct_video(video_url: str, destination: Path) -> Path:
                 shutil.copyfileobj(response, sink)
         return destination
     except Exception as e:
-        logger.error("_download_direct_video failed: %s — %s", video_url, e)
+        LOGGER.error("_download_direct_video failed: %s — %s", video_url, e)
         raise ValueError(f"Could not download video: {e}")
 
 

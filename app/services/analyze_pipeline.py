@@ -534,6 +534,15 @@ async def run_analyze_pipeline(
         )
         if ali_count == 0 and (univ_count + v3_count + v2_sport_count) > 0:
             LOGGER.info("Pipeline: Ali found 0 — other layers saved detection!")
+        total_raw = ali_count + univ_count + v3_count + v2_sport_count
+        if total_raw > 0 and len(detection_points) == 0:
+            LOGGER.warning(
+                "Pipeline: %d raw detections across all layers → 0 detection_points. "
+                "Temporal consensus may be too aggressive (min_confirmations=%d, time_window=%.1fs).",
+                total_raw,
+                tc_stats.get("raw_detections", 0),
+                2.0,
+            )
 
         # If jersey detection found nothing but we have frames, generate detection points from motion/audio
         if not detection_points and frames:
@@ -725,24 +734,42 @@ def _run_jersey_detection(
 
         LOGGER.info("Ali returned %d raw detections", len(detections))
 
-        # Convert DetectionFrame objects to dicts
+        # detect_jersey_in_frames returns list[dict] via DetectedFrame.to_dict()
+        # Each dict: {"timestamp": float, "confidence": float, "bbox": {"x1": ..., ...}}
         results = []
         for det in detections:
-            d = {
-                "timestamp": det.timestamp,
-                "confidence": det.confidence,
-            }
-            if hasattr(det, "bbox") and det.bbox:
-                d["x1"] = det.bbox.x1
-                d["y1"] = det.bbox.y1
-                d["x2"] = det.bbox.x2
-                d["y2"] = det.bbox.y2
+            if isinstance(det, dict):
+                d = {
+                    "timestamp": det.get("timestamp", 0),
+                    "confidence": det.get("confidence", 0),
+                }
+                bbox = det.get("bbox")
+                if bbox and isinstance(bbox, dict):
+                    d["x1"] = bbox.get("x1", 0)
+                    d["y1"] = bbox.get("y1", 0)
+                    d["x2"] = bbox.get("x2", 0)
+                    d["y2"] = bbox.get("y2", 0)
+            else:
+                # Fallback: if an object is returned (e.g. DetectionFrame)
+                d = {
+                    "timestamp": getattr(det, "timestamp", 0),
+                    "confidence": getattr(det, "confidence", 0),
+                }
+                if hasattr(det, "bbox") and det.bbox:
+                    d["x1"] = getattr(det.bbox, "x1", 0)
+                    d["y1"] = getattr(det.bbox, "y1", 0)
+                    d["x2"] = getattr(det.bbox, "x2", 0)
+                    d["y2"] = getattr(det.bbox, "y2", 0)
             results.append(d)
 
         return results
 
     except Exception as exc:
-        LOGGER.error("Jersey detection failed: %s", exc)
+        LOGGER.error(
+            "Jersey detection failed: %s (type=%s). Check if detect_jersey_in_frames "
+            "return shape changed (expected list[dict]).",
+            exc, type(exc).__name__,
+        )
         return []
 
 

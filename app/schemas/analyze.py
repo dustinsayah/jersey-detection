@@ -103,6 +103,8 @@ class AnalyzeRequest(BaseModel):
     enable_tracking: bool = Field(default=True, alias="enableTracking")
     enable_pose: bool = Field(default=True, alias="enablePose")
 
+    quality_mode: str = Field(default="auto", alias="qualityMode")
+
     @field_validator("jersey_number", mode="before")
     @classmethod
     def _validate_jersey_number(cls, value: Any) -> int:
@@ -129,6 +131,16 @@ class AnalyzeRequest(BaseModel):
         normalized = value.strip().lower()
         if normalized not in SUPPORTED_SPORTS:
             return "basketball"
+        return normalized
+
+    @field_validator("quality_mode", mode="before")
+    @classmethod
+    def _validate_quality_mode(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return "auto"
+        normalized = value.strip().lower()
+        if normalized not in {"auto", "standard", "aggressive"}:
+            return "auto"
         return normalized
 
     @field_validator("position", mode="before")

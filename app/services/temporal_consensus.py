@@ -98,16 +98,36 @@ class TemporalConsensus:
         self.confidence_threshold = confidence_threshold
 
     def filter_detections(
-        self, detections: list[dict], jersey_number: int
+        self, detections: list[dict], jersey_number: int, *, adaptive: bool = True
     ) -> list[dict]:
         """Keep only detections confirmed by temporal consensus.
 
         Input:  [{timestamp, confidence, number_detected, layer, bbox, ...}]
         Output: filtered list with consensus_score, consensus_confirmations,
                 and consensus_layers added to each surviving detection.
+
+        When ``adaptive=True`` (default), min_confirmations is lowered
+        automatically when overall detection count is sparse:
+          < 9 detections  → min_confirmations = 1
+          < 18 detections → min_confirmations = 2
+          18+             → use configured default (3)
         """
         if not detections:
             return []
+
+        # Adaptive threshold for poor-quality video with few detections
+        effective_min = self.min_confirmations
+        if adaptive:
+            total = len(detections)
+            if total < 9:
+                effective_min = 1
+            elif total < 18:
+                effective_min = 2
+            if effective_min != self.min_confirmations:
+                logger.info(
+                    "temporal_consensus: adaptive min_confirmations %d → %d (total=%d)",
+                    self.min_confirmations, effective_min, total,
+                )
 
         sorted_dets = sorted(detections, key=lambda x: x.get("timestamp", 0))
 
@@ -125,7 +145,7 @@ class TemporalConsensus:
 
             confirmations = len(window_dets)
 
-            if confirmations >= self.min_confirmations:
+            if confirmations >= effective_min:
                 avg_conf = (
                     sum(d.get("confidence", 0) for d in window_dets)
                     / confirmations

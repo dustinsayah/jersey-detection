@@ -61,6 +61,7 @@ async def analyze(
             enable_audio=analyze_request.enable_audio,
             enable_tracking=analyze_request.enable_tracking,
             enable_pose=analyze_request.enable_pose,
+            quality_mode=analyze_request.quality_mode,
         )
 
     except Exception:

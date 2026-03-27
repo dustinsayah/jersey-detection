@@ -66,6 +66,7 @@ async def run_analyze_pipeline(
     enable_audio: bool = True,
     enable_tracking: bool = True,
     enable_pose: bool = True,
+    quality_mode: str = "auto",
 ) -> dict[str, Any]:
     """Run the full analysis pipeline.
 
@@ -112,7 +113,11 @@ async def run_analyze_pipeline(
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
                 youtube_strategy_used = "all_failed"
                 LOGGER.error("Pipeline: YouTube download failed: %s", exc)
-                return _error_response(f"YouTube download failed: {exc}", time.perf_counter() - start_time)
+                return _error_response(
+                    f"YouTube download failed: {exc}",
+                    time.perf_counter() - start_time,
+                    layer_timings=layer_timings,
+                )
         elif video_url:
             # Direct URL — download it first
             try:
@@ -202,6 +207,22 @@ async def run_analyze_pipeline(
             except Exception as exc:
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: frame extraction failed: %s", exc)
+
+        # ── Resolve quality_mode ──────────────────────────────────────────
+        resolved_quality = quality_mode
+        if quality_mode == "auto" and frames:
+            # Check source video width (before preprocessing) via VideoCapture
+            _probe_w = 0
+            if local_video_path and local_video_path.exists():
+                _cap = cv2.VideoCapture(str(local_video_path))
+                if _cap.isOpened():
+                    _probe_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    _cap.release()
+            resolved_quality = "aggressive" if _probe_w < 960 else "standard"
+            LOGGER.info(
+                "Pipeline: quality_mode auto → %s (source width=%d)",
+                resolved_quality, _probe_w,
+            )
 
         # ── Step 4: Motion scoring ───────────────────────────────────────
         motion_scores: dict[float, float] = {}
@@ -313,6 +334,9 @@ async def run_analyze_pipeline(
                 layer_timings["pose_estimation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
+        # OCR confidence threshold — lower in aggressive mode for compressed video
+        ocr_conf = 0.15 if resolved_quality == "aggressive" else 0.2
+
         # ── Step 7.5a: Universal v2 OCR (best single model) ──────────
         universal_v2_detections: list[dict] = []
         t0 = time.perf_counter()
@@ -321,9 +345,9 @@ async def run_analyze_pipeline(
             roboflow_detector.load()
 
             if roboflow_detector.jersey_number_universal_v1_model is not None:
-                LOGGER.info("Pipeline: Universal v2 layer running")
+                LOGGER.info("Pipeline: Universal v2 layer running (conf=%.2f)", ocr_conf)
                 for t, frame in frames:
-                    dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=0.2)
+                    dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=ocr_conf)
                     universal_v2_detections.extend({**d, "timestamp": t} for d in dets)
                 if universal_v2_detections:
                     phases_used.append("universal_v2_ocr")
@@ -348,7 +372,7 @@ async def run_analyze_pipeline(
             for t, frame in frames:
                 # Full v3 pipeline: player_isolator → color → number_region → OCR
                 dets = roboflow_detector.detect_with_player_crops(
-                    frame, jersey_number=jersey_number, sport=sport, conf=0.2,
+                    frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
                 )
                 # Only keep v3 layer detections (exclude v1/v2 that detect_with_player_crops also runs)
                 v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
@@ -374,14 +398,14 @@ async def run_analyze_pipeline(
 
             LOGGER.info("Pipeline: v2 sport-specific layer running for sport=%s", sport)
             for t, frame in frames:
-                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=0.2)
+                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=ocr_conf)
                 v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
 
             # Also run v1 fallback detectors
             for t, frame in frames:
-                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=0.2)
+                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=ocr_conf)
                 v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=0.2)
+                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=ocr_conf)
                 v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
 
             if v2_sport_detections:
@@ -407,7 +431,7 @@ async def run_analyze_pipeline(
                 LOGGER.info("Pipeline: v3 primary standalone layer running")
                 for t, frame in frames:
                     dets = roboflow_detector.detect_with_v3_primary(
-                        frame, jersey_number=jersey_number, sport=sport, conf=0.2,
+                        frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
                     )
                     v3_primary_detections.extend({**d, "timestamp": t} for d in dets)
                 if v3_primary_detections:
@@ -557,13 +581,23 @@ async def run_analyze_pipeline(
         tc_stats = {"raw_detections": 0, "confirmed_detections": 0,
                     "filtered_out": 0, "cross_layer_confirmed": 0}
         try:
-            from app.services.temporal_consensus import temporal_consensus
+            from app.services.temporal_consensus import TemporalConsensus
+
+            # Aggressive mode: relax temporal consensus for low-quality video
+            if resolved_quality == "aggressive":
+                tc_instance = TemporalConsensus(
+                    min_confirmations=1,
+                    time_window=3.0,
+                    confidence_threshold=0.3,
+                )
+            else:
+                tc_instance = TemporalConsensus()  # default: min=3, window=2.0, thresh=0.5
 
             if all_layer_dets:
-                confirmed_dets = temporal_consensus.filter_detections(
+                confirmed_dets = tc_instance.filter_detections(
                     all_layer_dets, jersey_number
                 )
-                confirmed_dets = temporal_consensus.cross_layer_boost(
+                confirmed_dets = tc_instance.cross_layer_boost(
                     confirmed_dets
                 )
                 tc_stats = {
@@ -642,11 +676,17 @@ async def run_analyze_pipeline(
             LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback")
             for t, frame in frames:
                 motion = motion_scores.get(t, 0)
-                if motion > 30 or _in_audio_boundary(audio_result, t):
+                in_boundary = _in_audio_boundary(audio_result, t)
+                if motion > 30 or in_boundary:
                     pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
+                    # Higher cap (0.7) + audio boundary bonus (0.15) to push
+                    # above the 50-point "Cut" threshold in clip_extractor
+                    conf = motion / 100.0 * 0.7
+                    if in_boundary:
+                        conf = min(1.0, conf + 0.15)
                     detection_points.append(DetectionPoint(
                         timestamp=t,
-                        confidence=motion / 100.0 * 0.5,  # Lower confidence for non-jersey
+                        confidence=conf,
                         jersey_visible=False,
                         motion_score=motion,
                         pose_action=pose.get("action", "standing"),
@@ -760,6 +800,9 @@ async def run_analyze_pipeline(
             "wrong_number_filtered": wrong_number_count,
             "analyze_fps": ANALYZE_FPS,
             "frames_extracted": len(frames),
+            "quality_mode": quality_mode,
+            "resolved_quality": resolved_quality,
+            "ocr_confidence": ocr_conf,
             "ali_working": ali_working,
             "ali_status": ali_status,
             "youtube_strategy_used": youtube_strategy_used,
@@ -877,7 +920,11 @@ def _extract_frames(
     fps: int = 2,
     sport: str = "basketball",
 ) -> list[tuple[float, np.ndarray]]:
-    """Extract frames from video at given FPS."""
+    """Extract frames from video at given FPS.
+
+    ALL sports get preprocessing (upscale + CLAHE + unsharp mask) when
+    the source resolution is below 1920px — not just football.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return []
@@ -895,17 +942,19 @@ def _extract_frames(
         if frame_idx % frame_interval == 0:
             timestamp = frame_idx / video_fps
 
-            # Football-specific: upscale frames for better OCR
-            if sport.lower() == "football":
-                h, w = frame.shape[:2]
-                if w < 1920:
-                    scale = min(2.0, 1920 / w)
-                    frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                    # Apply CLAHE contrast enhancement
-                    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-                    frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            # Upscale + CLAHE + unsharp mask for ALL sports when low-res
+            h, w = frame.shape[:2]
+            if w < 1920:
+                scale = min(2.0, 1920 / w)
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                # CLAHE contrast enhancement
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            # Unsharp mask — sharpen digit edges degraded by YouTube compression
+            blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=3)
+            frame = cv2.addWeighted(frame, 1.5, blurred, -0.5, 0)
 
             frames.append((timestamp, frame))
 
@@ -956,7 +1005,11 @@ def _in_audio_boundary(audio_result: AudioAnalysisResult, timestamp: float) -> b
     return False
 
 
-def _error_response(message: str, elapsed: float) -> dict:
+def _error_response(
+    message: str,
+    elapsed: float,
+    layer_timings: dict | None = None,
+) -> dict:
     return {
         "clips": [],
         "layerUsed": "none",
@@ -979,7 +1032,7 @@ def _error_response(message: str, elapsed: float) -> dict:
             "youtube_strategy_used": None,
             "total_elapsed_ms": round(elapsed * 1000),
             "layers_that_contributed": [],
-            "layer_breakdown": {},
+            "layer_breakdown": layer_timings or {},
             "temporal_consensus": {
                 "raw_detections": 0,
                 "confirmed_detections": 0,

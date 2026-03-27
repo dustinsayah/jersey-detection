@@ -199,5 +199,11 @@ def health(request: Request) -> JSONResponse:
     )
     return JSONResponse(
         status_code=503,
-        content={"status": "error", "detail": detail, "phases": phases},
+        content={
+            "status": "error",
+            "detail": detail,
+            "hint": "Check Railway logs for 'Model warm-up failed'. "
+                    "Common causes: missing model .pt files, OOM, or startup timeout.",
+            "phases": phases,
+        },
     )

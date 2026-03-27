@@ -54,7 +54,14 @@ async def detect(
         )
         return JSONResponse(
             status_code=503,
-            content={"error": f"Detection service is not ready: {detail}"},
+            content={
+                "error": f"Detection service is not ready: {detail}",
+                "startup_error": detail,
+                "hint": "The YOLO models may have failed to load at startup. "
+                        "Check Railway logs for 'Model warm-up failed' errors. "
+                        "Common causes: missing model files, OOM from too many models, "
+                        "or startup timeout.",
+            },
         )
     try:
         detections = await run_in_threadpool(detection_service.detect, detect_request)

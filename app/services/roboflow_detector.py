@@ -308,13 +308,17 @@ class RoboflowDetector:
         )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """2x upscale + CLAHE contrast enhancement for better digit reading."""
+        """2x upscale + CLAHE contrast + unsharp mask for better digit reading."""
         h, w = frame.shape[:2]
         upscaled = cv2.resize(frame, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
         lab = cv2.cvtColor(upscaled, cv2.COLOR_BGR2LAB)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        # Unsharp mask — sharpen digit edges degraded by compression
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
+        sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+        return sharpened
 
     def _parse_number(self, class_name: str) -> int:
         """Extract integer from a class name like '23' or 'digit_5'."""
@@ -811,71 +815,80 @@ class RoboflowDetector:
         return results
 
     def status(self) -> dict:
-        """Report which models are loaded vs missing vs pending."""
-        self.load()
+        """Report which models are available (file exists) or loaded (in memory).
 
-        def _model_status(attr: str) -> str:
+        IMPORTANT: Does NOT call self.load(). Models are reported based on
+        file existence and in-memory state. This keeps the /health endpoint
+        lightweight and prevents OOM from eagerly loading 50+ models.
+        """
+
+        def _model_status(attr: str, filename: str | None = None) -> str:
             model = getattr(self, attr, None)
             if model is not None:
                 return "loaded"
-            return "pending - not yet trained"
+            # Check if file exists on disk (available but not loaded)
+            if filename:
+                path = os.path.join(MODEL_DIR, filename)
+                if os.path.exists(path):
+                    return "available"
+            return "missing"
 
         return {
             # v1 models
-            "football_digit_detector": "loaded" if self.football_digit_model else "missing",
-            "football_player_detector": "loaded" if self.football_player_model else "missing",
+            "football_digit_detector": _model_status("football_digit_model", "football_digit_detector.pt"),
+            "football_player_detector": _model_status("football_player_model", "football_player_detector.pt"),
             "basketball_jersey_ocr": "skipped - pending retrain (mAP50: 0.10)",
-            "football_jersey_tracker": "loaded" if self.football_tracker_model else "missing",
+            "football_jersey_tracker": _model_status("football_tracker_model", "football_jersey_tracker.pt"),
             # v2 models
-            "basketball_jersey_number_v2": _model_status("basketball_jersey_number_v2_model"),
-            "basketball_jersey_number_v3": _model_status("basketball_jersey_number_v3_model"),
-            "basketball_player_detector_v2": _model_status("basketball_player_detector_v2_model"),
-            "football_positions_detector": _model_status("football_positions_model"),
-            "football_presnap_detector": _model_status("football_presnap_model"),
-            "jersey_number_universal_v1": _model_status("jersey_number_universal_v1_model"),
-            "jersey_number_universal_v2": _model_status("jersey_number_universal_v2_model"),
-            "lacrosse_detector_v1": _model_status("lacrosse_v1_model"),
-            "lacrosse_detector_v2": _model_status("lacrosse_v2_model"),
+            "basketball_jersey_number_v2": _model_status("basketball_jersey_number_v2_model", "basketball_jersey_number_v2.pt"),
+            "basketball_jersey_number_v3": _model_status("basketball_jersey_number_v3_model", "basketball_jersey_number_v3.pt"),
+            "basketball_player_detector_v2": _model_status("basketball_player_detector_v2_model", "basketball_player_detector_v2.pt"),
+            "football_positions_detector": _model_status("football_positions_model", "football_positions_detector.pt"),
+            "football_presnap_detector": _model_status("football_presnap_model", "football_presnap_detector.pt"),
+            "jersey_number_universal_v1": _model_status("jersey_number_universal_v1_model", "jersey_number_universal_v1.pt"),
+            "jersey_number_universal_v2": _model_status("jersey_number_universal_v2_model", "jersey_number_universal_v2.pt"),
+            "lacrosse_detector_v1": _model_status("lacrosse_v1_model", "lacrosse_detector_v1.pt"),
+            "lacrosse_detector_v2": _model_status("lacrosse_v2_model", "lacrosse_detector_v2.pt"),
             # v2 ball/action/zone models
-            "basketball_ball_detector": _model_status("basketball_ball_detector_model"),
-            "football_ball_detector": _model_status("football_ball_detector_model"),
-            "lacrosse_ball_detector": _model_status("lacrosse_ball_detector_model"),
-            "basketball_action_detector": _model_status("basketball_action_detector_model"),
-            "basketball_court_zones": _model_status("basketball_court_zones_model"),
+            "basketball_ball_detector": _model_status("basketball_ball_detector_model", "basketball_ball_detector.pt"),
+            "football_ball_detector": _model_status("football_ball_detector_model", "football_ball_detector.pt"),
+            "lacrosse_ball_detector": _model_status("lacrosse_ball_detector_model", "lacrosse_ball_detector.pt"),
+            "basketball_action_detector": _model_status("basketball_action_detector_model", "basketball_action_detector.pt"),
+            "basketball_court_zones": _model_status("basketball_court_zones_model", "basketball_court_zones.pt"),
             # v3 OCR models (YOLOv8m — Ali replacement, train via train_models_v3.ipynb)
-            "jersey_ocr_v3_primary": _model_status("jersey_ocr_v3_primary_model"),
-            "jersey_ocr_v3_secondary": _model_status("jersey_ocr_v3_secondary_model"),
-            "basketball_ocr_v3": _model_status("basketball_ocr_v3_model"),
-            "football_ocr_v3": _model_status("football_ocr_v3_model"),
-            "lacrosse_ocr_v3": _model_status("lacrosse_ocr_v3_model"),
-            "player_isolator_v3": _model_status("player_isolator_v3_model"),
-            "jersey_color_classifier_v3": _model_status("jersey_color_classifier_v3_model"),
-            "number_region_detector_v3": _model_status("number_region_detector_v3_model"),
-            "motion_blur_specialist_v3": _model_status("motion_blur_specialist_v3_model"),
-            "wide_angle_specialist_v3": _model_status("wide_angle_specialist_v3_model"),
-            "dark_jersey_specialist_v3": _model_status("dark_jersey_specialist_v3_model"),
-            "partial_visibility_specialist_v3": _model_status("partial_visibility_specialist_v3_model"),
+            "jersey_ocr_v3_primary": _model_status("jersey_ocr_v3_primary_model", "jersey_ocr_v3_primary.pt"),
+            "jersey_ocr_v3_secondary": _model_status("jersey_ocr_v3_secondary_model", "jersey_ocr_v3_secondary.pt"),
+            "basketball_ocr_v3": _model_status("basketball_ocr_v3_model", "basketball_ocr_v3.pt"),
+            "football_ocr_v3": _model_status("football_ocr_v3_model", "football_ocr_v3.pt"),
+            "lacrosse_ocr_v3": _model_status("lacrosse_ocr_v3_model", "lacrosse_ocr_v3.pt"),
+            "player_isolator_v3": _model_status("player_isolator_v3_model", "player_isolator_v3.pt"),
+            "jersey_color_classifier_v3": _model_status("jersey_color_classifier_v3_model", "jersey_color_classifier_v3.pt"),
+            "number_region_detector_v3": _model_status("number_region_detector_v3_model", "number_region_detector_v3.pt"),
+            "motion_blur_specialist_v3": _model_status("motion_blur_specialist_v3_model", "motion_blur_specialist_v3.pt"),
+            "wide_angle_specialist_v3": _model_status("wide_angle_specialist_v3_model", "wide_angle_specialist_v3.pt"),
+            "dark_jersey_specialist_v3": _model_status("dark_jersey_specialist_v3_model", "dark_jersey_specialist_v3.pt"),
+            "partial_visibility_specialist_v3": _model_status("partial_visibility_specialist_v3_model", "partial_visibility_specialist_v3.pt"),
             # v4 outcome models (YOLOv8m — play outcome detection, train via train_models_v4.ipynb)
-            "basketball_hoop_detector_v4": _model_status("basketball_hoop_detector_v4_model"),
-            "basketball_made_shot_v4": _model_status("basketball_made_shot_v4_model"),
-            "basketball_scoring_zone_v4": _model_status("basketball_scoring_zone_v4_model"),
-            "basketball_dribble_drive_v4": _model_status("basketball_dribble_drive_v4_model"),
-            "basketball_rebound_v4": _model_status("basketball_rebound_v4_model"),
-            "football_completion_detector_v4": _model_status("football_completion_detector_v4_model"),
-            "football_touchdown_detector_v4": _model_status("football_touchdown_detector_v4_model"),
-            "football_sack_detector_v4": _model_status("football_sack_detector_v4_model"),
-            "football_reception_yac_v4": _model_status("football_reception_yac_v4_model"),
-            "football_qb_scramble_v4": _model_status("football_qb_scramble_v4_model"),
-            "lacrosse_goal_detector_v4": _model_status("lacrosse_goal_detector_v4_model"),
-            "lacrosse_shot_quality_v4": _model_status("lacrosse_shot_quality_v4_model"),
-            "lacrosse_ground_ball_v4": _model_status("lacrosse_ground_ball_v4_model"),
-            "crowd_energy_detector_v4": _model_status("crowd_energy_detector_v4_model"),
-            "night_game_specialist_v4": _model_status("night_game_specialist_v4_model"),
-            "indoor_court_specialist_v4": _model_status("indoor_court_specialist_v4_model"),
-            "crowd_obstruction_specialist_v4": _model_status("crowd_obstruction_specialist_v4_model"),
-            "helmet_glare_specialist_v4": _model_status("helmet_glare_specialist_v4_model"),
-            "low_resolution_specialist_v4": _model_status("low_resolution_specialist_v4_model"),
-            "multi_player_cluster_v4": _model_status("multi_player_cluster_v4_model"),
+            "basketball_hoop_detector_v4": _model_status("basketball_hoop_detector_v4_model", "basketball_hoop_detector_v4.pt"),
+            "basketball_made_shot_v4": _model_status("basketball_made_shot_v4_model", "basketball_made_shot_v4.pt"),
+            "basketball_scoring_zone_v4": _model_status("basketball_scoring_zone_v4_model", "basketball_scoring_zone_v4.pt"),
+            "basketball_dribble_drive_v4": _model_status("basketball_dribble_drive_v4_model", "basketball_dribble_drive_v4.pt"),
+            "basketball_rebound_v4": _model_status("basketball_rebound_v4_model", "basketball_rebound_v4.pt"),
+            "football_completion_detector_v4": _model_status("football_completion_detector_v4_model", "football_completion_detector_v4.pt"),
+            "football_touchdown_detector_v4": _model_status("football_touchdown_detector_v4_model", "football_touchdown_detector_v4.pt"),
+            "football_sack_detector_v4": _model_status("football_sack_detector_v4_model", "football_sack_detector_v4.pt"),
+            "football_reception_yac_v4": _model_status("football_reception_yac_v4_model", "football_reception_yac_v4.pt"),
+            "football_qb_scramble_v4": _model_status("football_qb_scramble_v4_model", "football_qb_scramble_v4.pt"),
+            "lacrosse_goal_detector_v4": _model_status("lacrosse_goal_detector_v4_model", "lacrosse_goal_detector_v4.pt"),
+            "lacrosse_shot_quality_v4": _model_status("lacrosse_shot_quality_v4_model", "lacrosse_shot_quality_v4.pt"),
+            "lacrosse_ground_ball_v4": _model_status("lacrosse_ground_ball_v4_model", "lacrosse_ground_ball_v4.pt"),
+            "crowd_energy_detector_v4": _model_status("crowd_energy_detector_v4_model", "crowd_energy_detector_v4.pt"),
+            "night_game_specialist_v4": _model_status("night_game_specialist_v4_model", "night_game_specialist_v4.pt"),
+            "indoor_court_specialist_v4": _model_status("indoor_court_specialist_v4_model", "indoor_court_specialist_v4.pt"),
+            "crowd_obstruction_specialist_v4": _model_status("crowd_obstruction_specialist_v4_model", "crowd_obstruction_specialist_v4.pt"),
+            "helmet_glare_specialist_v4": _model_status("helmet_glare_specialist_v4_model", "helmet_glare_specialist_v4.pt"),
+            "low_resolution_specialist_v4": _model_status("low_resolution_specialist_v4_model", "low_resolution_specialist_v4.pt"),
+            "multi_player_cluster_v4": _model_status("multi_player_cluster_v4_model", "multi_player_cluster_v4.pt"),
         }
 
 

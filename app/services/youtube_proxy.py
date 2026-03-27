@@ -30,6 +30,12 @@ _YT_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})"
 )
 
+# Matches &t=36s, &t=36, ?t=1m30s, &time_continue=36, etc.
+_YT_TIMESTAMP_RE = re.compile(
+    r"[?&](?:t|time_continue)=(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?",
+    re.IGNORECASE,
+)
+
 
 def is_youtube_url(url: str) -> bool:
     return bool(_YT_PATTERN.search(url))
@@ -38,6 +44,36 @@ def is_youtube_url(url: str) -> bool:
 def extract_video_id(url: str) -> str | None:
     m = _YT_PATTERN.search(url)
     return m.group(1) if m else None
+
+
+def normalize_youtube_url(url: str) -> tuple[str, float]:
+    """Normalize a YouTube URL to a clean canonical form.
+
+    Strips tracking/timestamp params (&t=, &list=, &index=, &feature=,
+    &time_continue=, &si=, etc.) that can confuse download strategies.
+
+    Returns:
+        (clean_url, extracted_start_seconds)
+        - clean_url: ``https://www.youtube.com/watch?v=<ID>``
+        - extracted_start_seconds: seconds parsed from ``&t=`` / ``&time_continue=``,
+          or 0.0 if not present.
+    """
+    video_id = extract_video_id(url)
+    if not video_id:
+        # Not a recognized YouTube URL — return as-is
+        return url, 0.0
+
+    # Parse timestamp from URL (e.g. &t=36s, &t=1m30s, &time_continue=90)
+    start_seconds = 0.0
+    ts_match = _YT_TIMESTAMP_RE.search(url)
+    if ts_match:
+        hours = int(ts_match.group(1) or 0)
+        minutes = int(ts_match.group(2) or 0)
+        seconds = int(ts_match.group(3) or 0)
+        start_seconds = float(hours * 3600 + minutes * 60 + seconds)
+
+    clean_url = f"https://www.youtube.com/watch?v={video_id}"
+    return clean_url, start_seconds
 
 
 def _trim_video(
@@ -87,6 +123,17 @@ async def download_youtube(
     Raises RuntimeError only if ALL 5 strategies fail.
     """
     LOGGER.info("youtube_proxy called with URL: %s", url)
+
+    # ── Normalize URL: strip &t=, &list=, &feature=, etc. ──
+    original_url = url
+    url, url_start_seconds = normalize_youtube_url(url)
+    if url != original_url:
+        LOGGER.info("youtube_proxy: normalized URL %s → %s (t=%.0fs)", original_url, url, url_start_seconds)
+    # If caller didn't specify start_time but URL had &t=, use the URL timestamp
+    if url_start_seconds > 0 and start_time == 0:
+        start_time = url_start_seconds
+        LOGGER.info("youtube_proxy: using URL timestamp as start_time=%.0f", start_time)
+
     LOGGER.info("youtube_proxy: RENDER_SERVER_URL=%s, time_range=%s-%s", RENDER_SERVER_URL, start_time, end_time)
     dl_start = time.perf_counter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_"))
@@ -300,7 +347,11 @@ async def download_youtube(
             LOGGER.warning("Strategy 5 failed: %s", exc)
 
     raise RuntimeError(
-        f"All 5 YouTube download strategies failed for: {url}"
+        f"All 5 YouTube download strategies failed for: {url} "
+        f"(original: {original_url}). "
+        f"Strategies: 1=render_server({RENDER_SERVER_URL or 'not_set'}), "
+        f"2=yt-dlp_browser, 3=yt-dlp_android, 4=cobalt, 5=render_extract_frames. "
+        f"Check Railway logs for per-strategy errors."
     )
 
 

@@ -79,13 +79,25 @@ async def _lifespan(application: FastAPI):
         from app.services.detection_runtime import PipelineSettings
 
         settings = PipelineSettings()
+        LOGGER.info(
+            "Startup: verifying runtime deps (ffmpeg=%s, yt-dlp=%s)",
+            settings.ffmpeg_binary, settings.yt_dlp_binary,
+        )
         _verify_runtime_dependencies(settings)
+        LOGGER.info(
+            "Startup: loading models (yolo=%s, person=%s, reader=%s)",
+            settings.yolo_model_source, settings.person_model_source,
+            settings.jersey_reader_backend,
+        )
         get_or_create_detector(settings)
         application.state.detector_ready = True
-        LOGGER.info("Detection stack warmed up at startup")
+        LOGGER.info("Detection stack warmed up at startup — detector_ready=True")
     except Exception as error:
         application.state.startup_error = str(error)
-        LOGGER.exception("Model warm-up failed")
+        LOGGER.exception(
+            "Model warm-up failed — detector_ready will stay False, "
+            "/detect and /analyze will return 503. Error: %s", error,
+        )
     yield
 
 

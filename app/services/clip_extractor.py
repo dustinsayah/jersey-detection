@@ -283,6 +283,20 @@ def extract_clips(
     # Filter out "Cut" grade clips
     result = [c for c in merged if c.grade != "Cut"]
 
+    # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
+    # Score 20+ covers motion-only fallback clips (no jersey confidence).
+    # Returning something is better than returning 0 clips.
+    if not result and merged:
+        rescued = [c for c in merged if c.score >= 20]
+        if rescued:
+            for clip in rescued:
+                clip.grade = "Decent"
+            result = rescued
+            LOGGER.info(
+                "Rescue: all %d clips were Cut — rescued %d with score >= 20",
+                len(merged), len(result),
+            )
+
     LOGGER.info(
         "Extracted %d clips from %d detections (%d clusters, %d after merge/filter)",
         len(result), len(detections), len(clusters), len(result),

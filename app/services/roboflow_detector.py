@@ -9,6 +9,21 @@
 # v3 trains via notebooks/train_models_v3.ipynb
 # v4 outcome models: YOLOv8m (play outcome detection + niche specialists)
 # v4 trains via notebooks/train_models_v4.ipynb
+# v5 models: YOLO11m + VideoMAE (auto-labeled, best accuracy)
+# v5 trains via notebooks/train_models_v5_autolabel.ipynb
+#
+# v5 pipeline integration order:
+#   YouTube URL → download → extract frames every 3 frames
+#   → Ali ensemble (primary jersey OCR)
+#   → jersey_ocr_universal_v5 (secondary OCR layer)
+#   → player_detector_v5 (player isolation)
+#   → outcome_classifier_basketball/football/lacrosse_v5
+#     (fast frame-level outcome: made_shot/touchdown/goal)
+#   → videomae_basketball/football/lacrosse_v5
+#     (temporal outcome confirmation: 16-frame window)
+#   → temporal consensus (cross-validate all layers)
+#   → clip_extractor (score and rank clips)
+#   → build reel → email coaches
 
 from __future__ import annotations
 
@@ -111,6 +126,19 @@ class RoboflowDetector:
         - helmet_glare_specialist_v4.pt
         - low_resolution_specialist_v4.pt
         - multi_player_cluster_v4.pt
+
+    v5 models (Colab train_models_v5_autolabel.ipynb — YOLO11m + VideoMAE):
+      YOLO Detection:
+        - jersey_ocr_universal_v5.pt — replaces/supplements v1-v3 OCR layers
+        - player_detector_v5.pt — supplements existing player detection
+      YOLO Classification (frame-level outcome):
+        - outcome_classifier_basketball_v5.pt — fast frame-level outcome
+        - outcome_classifier_football_v5.pt
+        - outcome_classifier_lacrosse_v5.pt
+      VideoMAE (temporal outcome confirmation, 16-frame window):
+        - videomae_basketball_v5.zip → HuggingFace model directory
+        - videomae_football_v5.zip
+        - videomae_lacrosse_v5.zip
     """
 
     def __init__(self):
@@ -149,6 +177,17 @@ class RoboflowDetector:
         self.wide_angle_specialist_v3_model = None
         self.dark_jersey_specialist_v3_model = None
         self.partial_visibility_specialist_v3_model = None
+        # v5 models (YOLO11m + VideoMAE — auto-labeled, best accuracy)
+        # Place files in app/model/ after training v5 notebook
+        # VideoMAE models: unzip into app/model/videomae_{sport}_v5/
+        self.jersey_ocr_universal_v5_model = None   # jersey_ocr_universal_v5.pt — secondary OCR
+        self.player_detector_v5_model = None         # player_detector_v5.pt — player isolation
+        self.outcome_cls_basketball_v5_model = None  # outcome_classifier_basketball_v5.pt
+        self.outcome_cls_football_v5_model = None    # outcome_classifier_football_v5.pt
+        self.outcome_cls_lacrosse_v5_model = None    # outcome_classifier_lacrosse_v5.pt
+        self.videomae_basketball_v5 = None           # videomae_basketball_v5/ (HuggingFace dir)
+        self.videomae_football_v5 = None             # videomae_football_v5/ (HuggingFace dir)
+        self.videomae_lacrosse_v5 = None             # videomae_lacrosse_v5/ (HuggingFace dir)
         # v4 outcome models (YOLOv8m — play outcome detection)
         self.basketball_hoop_detector_v4_model = None
         self.basketball_made_shot_v4_model = None
@@ -242,6 +281,40 @@ class RoboflowDetector:
             else:
                 logger.info("v3 OCR model pending: %s — train via train_models_v3.ipynb", filename)
 
+        # ── v5 YOLO models (YOLO11m — auto-labeled, load if present) ──
+        # Pipeline: Ali OCR → jersey_ocr_v5 (secondary) → player_detector_v5
+        #           → outcome_cls (frame-level) → VideoMAE (temporal confirm)
+        _v5_yolo_models = {
+            "jersey_ocr_universal_v5.pt": "jersey_ocr_universal_v5_model",
+            "player_detector_v5.pt": "player_detector_v5_model",
+            "outcome_classifier_basketball_v5.pt": "outcome_cls_basketball_v5_model",
+            "outcome_classifier_football_v5.pt": "outcome_cls_football_v5_model",
+            "outcome_classifier_lacrosse_v5.pt": "outcome_cls_lacrosse_v5_model",
+        }
+        for filename, attr in _v5_yolo_models.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                setattr(self, attr, _load_model(filename))
+            else:
+                logger.info("v5 model pending: %s — train via train_models_v5_autolabel.ipynb", filename)
+
+        # ── v5 VideoMAE models (HuggingFace dirs, loaded on demand) ──
+        # These are directories, not .pt files. Load with transformers when needed.
+        _v5_videomae_dirs = {
+            "videomae_basketball_v5": "videomae_basketball_v5",
+            "videomae_football_v5": "videomae_football_v5",
+            "videomae_lacrosse_v5": "videomae_lacrosse_v5",
+        }
+        for dirname, attr in _v5_videomae_dirs.items():
+            dirpath = os.path.join(MODEL_DIR, dirname)
+            if os.path.isdir(dirpath):
+                # Store path — actual HuggingFace model loaded on demand to avoid
+                # importing transformers at startup (heavy dependency)
+                setattr(self, attr, dirpath)
+                logger.info("v5 VideoMAE dir found: %s", dirname)
+            else:
+                logger.info("v5 VideoMAE pending: %s/ — unzip after training", dirname)
+
         # ── v4 outcome models (YOLOv8m — play outcome detection, load if present) ──
         _v4_outcome_models = {
             "basketball_hoop_detector_v4.pt": "basketball_hoop_detector_v4_model",
@@ -302,9 +375,21 @@ class RoboflowDetector:
             for attr in _v4_outcome_models.values()
             if getattr(self, attr) is not None
         )
+        v5_yolo_loaded = sum(
+            1
+            for attr in _v5_yolo_models.values()
+            if getattr(self, attr) is not None
+        )
+        v5_videomae_loaded = sum(
+            1
+            for attr in _v5_videomae_dirs.values()
+            if getattr(self, attr) is not None
+        )
         logger.info(
-            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/12 v3-ocr, %d/20 v4-outcome loaded",
-            v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded, v4_outcome_loaded,
+            "RoboflowDetector: %d/3 v1, %d/9 v2, %d/5 v2-baz, %d/12 v3-ocr, "
+            "%d/20 v4-outcome, %d/5 v5-yolo, %d/3 v5-videomae loaded",
+            v1_loaded, v2_loaded, v2_baz_loaded, v3_ocr_loaded,
+            v4_outcome_loaded, v5_yolo_loaded, v5_videomae_loaded,
         )
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:

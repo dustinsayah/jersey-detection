@@ -225,10 +225,12 @@ class TestRoboflowDetectorStatus:
         detector = RoboflowDetector()
         status = detector.status()
 
-        # All models should be either 'available', 'loaded', or 'missing'
+        # All model keys should be either 'available', 'loaded', or 'missing'
+        # Metadata keys (primary_detection, ali_status, jersey_upscaler_v5) have other values
+        _metadata_keys = {"primary_detection", "ali_status", "basketball_jersey_ocr", "jersey_upscaler_v5"}
         for key, value in status.items():
-            if key == "basketball_jersey_ocr":
-                continue  # This one has a special status
+            if key in _metadata_keys:
+                continue  # These have special status values
             assert value in ("available", "loaded", "missing"), \
                 f"Model {key} has unexpected status: {value}"
 

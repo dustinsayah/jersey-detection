@@ -63,6 +63,11 @@ def _check_phases() -> dict:
     phases["render_server_url"] = render_url
 
     # ── Roboflow trained models ──
+    _v5_keys = {
+        "jersey_ocr_universal_v5", "player_detector_v5",
+        "outcome_cls_basketball_v5", "outcome_cls_football_v5", "outcome_cls_lacrosse_v5",
+        "scoreboard_detector_v5", "dead_ball_classifier_v5", "jersey_upscaler_v5",
+    }
     _v1_keys = {
         "football_digit_detector", "football_player_detector",
         "basketball_jersey_ocr", "football_jersey_tracker",
@@ -91,10 +96,19 @@ def _check_phases() -> dict:
         "crowd_obstruction_specialist_v4", "helmet_glare_specialist_v4",
         "low_resolution_specialist_v4", "multi_player_cluster_v4",
     }
-    _all_versioned_keys = _v1_keys | _v2_baz_keys | _v3_ocr_keys | _v4_outcome_keys
+    _all_versioned_keys = _v5_keys | _v1_keys | _v2_baz_keys | _v3_ocr_keys | _v4_outcome_keys
     try:
         from app.services.roboflow_detector import roboflow_detector
         rf_status = roboflow_detector.status()
+        # Primary detection layer
+        phases["primary_detection"] = rf_status.get("primary_detection", "unknown")
+        phases["ali_status"] = rf_status.get("ali_status", "unknown")
+        # v5 models (PRIMARY)
+        phases["roboflow_models_v5"] = {
+            k: v for k, v in rf_status.items() if k in _v5_keys
+        }
+        v5_loaded = sum(1 for k in _v5_keys if rf_status.get(k) == "loaded")
+        phases["roboflow_v5_summary"] = f"{v5_loaded}/{len(_v5_keys)} loaded"
         phases["roboflow_models_v1"] = {
             k: v for k, v in rf_status.items() if k in _v1_keys
         }
@@ -155,7 +169,11 @@ def _check_phases() -> dict:
 @router.get("/test-youtube")
 async def test_youtube(url: str) -> JSONResponse:
     """Test YouTube download chain and report which strategy worked."""
-    from app.services.youtube_proxy import test_youtube_download
+    from functools import partial
+
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services.youtube_proxy import test_youtube_download_sync
 
     yt_dlp_bin = "yt-dlp"
     ffmpeg_bin = "ffmpeg"
@@ -167,14 +185,16 @@ async def test_youtube(url: str) -> JSONResponse:
     except Exception:
         pass
 
-    result = await test_youtube_download(url, yt_dlp_binary=yt_dlp_bin, ffmpeg_binary=ffmpeg_bin)
+    result = await run_in_threadpool(
+        partial(test_youtube_download_sync, url, yt_dlp_binary=yt_dlp_bin, ffmpeg_binary=ffmpeg_bin)
+    )
     status_code = 200 if result.get("success") else 502
     return JSONResponse(status_code=status_code, content=result)
 
 
 @router.get("/live")
 def live() -> JSONResponse:
-    return JSONResponse(status_code=200, content={"status": "ok"})
+    return JSONResponse(status_code=200, content={"status": "ok", "version": "d0f5af7-sync-proxy"})
 
 
 @router.get("/ready")

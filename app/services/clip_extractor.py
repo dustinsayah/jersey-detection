@@ -30,11 +30,16 @@ _OUTCOME_SCORE_BOOSTS = {
     "drive": 10,            # basketball_dribble_drive_v4
     "qb_scramble": 15,      # football_qb_scramble_v4
     "crowd_energy": 10,     # crowd_energy_detector_v4 (all sports)
+    "score_change": 20,     # scoreboard_detector_v5 (score change detected)
 }
 
-# Clip boundary expansion (seconds)
-EXPAND_BEFORE = 2.0
-EXPAND_AFTER = 4.0
+# Clip boundary expansion — sport-specific defaults (seconds)
+_SPORT_EXPAND = {
+    "basketball": (1.5, 3.0),  # Fast game, tighter clips
+    "football": (2.5, 5.0),    # Play develops slower, needs pre-snap context
+    "lacrosse": (1.5, 3.5),    # Fast transitions
+}
+_DEFAULT_EXPAND = (2.0, 4.0)
 
 # Minimum clip duration
 MIN_CLIP_DURATION = 3.0
@@ -109,8 +114,26 @@ def extract_clips(
             second = int(pt.timestamp)
             energy_lookup[second] = max(energy_lookup.get(second, 0), pt.energy)
 
-    # ── Step 1: Find detection clusters ──────────────────────────────────
+    # ── Step 0: Jitter filter — remove isolated 1-frame false positives ──
     sorted_dets = sorted(detections, key=lambda d: d.timestamp)
+    if len(sorted_dets) >= 3:
+        filtered_dets: list[DetectionPoint] = []
+        for det in sorted_dets:
+            # Count detections within 1 second of this one
+            neighbors = sum(
+                1 for d in sorted_dets
+                if d is not det and abs(d.timestamp - det.timestamp) <= 1.0
+            )
+            # Keep if: has a neighbor OR very high confidence
+            if neighbors >= 1 or det.confidence > 0.85:
+                filtered_dets.append(det)
+        if filtered_dets:
+            jitter_removed = len(sorted_dets) - len(filtered_dets)
+            if jitter_removed > 0:
+                LOGGER.info("Jitter filter: removed %d isolated detections", jitter_removed)
+            sorted_dets = filtered_dets
+
+    # ── Step 1: Find detection clusters ──────────────────────────────────
     clusters: list[list[DetectionPoint]] = []
     current_cluster: list[DetectionPoint] = []
 
@@ -173,9 +196,21 @@ def extract_clips(
         tracking_ids = [d.tracking_id for d in cluster if d.tracking_id is not None]
         tracking_id = max(set(tracking_ids), key=tracking_ids.count) if tracking_ids else None
 
-        # Expand boundaries
-        start_time = max(0, first_t - EXPAND_BEFORE)
-        end_time = min(video_duration, last_t + EXPAND_AFTER) if video_duration > 0 else last_t + EXPAND_AFTER
+        # Tracking continuity: use actual player tracking persistence
+        if tracking_ids and tracking_id is not None:
+            continuous_frames = sum(1 for tid in tracking_ids if tid == tracking_id)
+            tracking_continuity = min(1.0, continuous_frames / 20.0)
+        else:
+            tracking_continuity = min(1.0, len(cluster) / 10.0)
+
+        # v4 outcome: aggregate from cluster
+        v4_outcomes = [d.v4_outcome for d in cluster if d.v4_outcome]
+        dominant_v4 = max(set(v4_outcomes), key=v4_outcomes.count) if v4_outcomes else ""
+
+        # Sport-aware boundary expansion
+        expand_before, expand_after = _SPORT_EXPAND.get(sport.lower(), _DEFAULT_EXPAND)
+        start_time = max(0, first_t - expand_before)
+        end_time = min(video_duration, last_t + expand_after) if video_duration > 0 else last_t + expand_after
 
         # Enforce duration limits
         duration = end_time - start_time
@@ -196,11 +231,13 @@ def extract_clips(
             jersey_confidence=avg_jersey_conf,
             motion_score=avg_motion,
             has_audio_boundary=audio_bounded,
+            audio_confidence=audio_confidence,
             pose_action=dominant_pose,
-            tracking_continuity=min(1.0, len(cluster) / 10.0),
+            tracking_continuity=tracking_continuity,
             crowd_energy=avg_crowd,
             play_duration=play_duration,
             motion_spike=motion_spike,
+            v4_outcome=dominant_v4,
         )
 
         # ── v4: Apply outcome detection boosts ─────────────────────────

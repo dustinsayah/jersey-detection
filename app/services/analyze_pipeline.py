@@ -1,18 +1,23 @@
 # Analyze pipeline orchestrator — chains all detection layers
 #
-# DETECTION CALL CHAIN:
+# DETECTION CALL CHAIN (v5 PRIMARY, Ali LAST RESORT):
 # POST /analyze (app/routes/analyze.py)
 #   → run_analyze_pipeline() [this file]
 #     Step 1: Acquire video (YouTube download or direct URL download)
-#     Step 2: Ali's ensemble — highest priority
+#     Step 2: DEFERRED — Ali runs LAST, only if needed
 #     Step 3: Frame extraction
+#     Step 3.5: Dead ball filtering (skip dead frames before OCR)
 #     Step 4: Motion scoring (optical flow)
 #     Step 5: Audio analysis (whistle + crowd energy)
 #     Step 6: Player tracking (BoT-SORT)
 #     Step 7: Pose estimation (YOLO11n-pose)
-#     Step 7.5a: Universal v2 OCR (jersey_number_universal_v1, mAP50 0.995)
-#     Step 7.5b: v3 OCR pipeline (12 models — Ali replacement layer)
-#     Step 7.5c: v2 sport-specific models (basketball/football/lacrosse)
+#     Step 7.5a: v5 OCR + v5 player detector (PRIMARY)
+#     Step 7.5b: v3 OCR pipeline (secondary confirmation)
+#     Step 7.5c: v2 universal OCR (tertiary — 0.995 mAP50)
+#     Step 7.5d: v2 sport-specific + v1 legacy (fallback)
+#     Step 7.5e: Ali ensemble (LAST RESORT — only if <3 detections from above)
+#     Step 7.6: v4 outcome detection + v5 outcome classification
+#     Step 7.8: Scoreboard detection (score change → clip boost)
 #     Step 8: Cross-layer validation + merge + temporal consensus
 #     Step 9: Stat pipeline
 
@@ -33,8 +38,12 @@ from app.services.audio_types import AudioAnalysisResult
 from app.services.clip_extractor import DetectionPoint, ExtractedClip, extract_clips
 from app.services.motion_scorer import compute_motion_score
 from app.services.play_classifier import classify_play
+from functools import partial
+
+from starlette.concurrency import run_in_threadpool
+
 from app.services.youtube_proxy import (
-    download_youtube,
+    download_youtube_sync,
     extract_audio,
     get_video_duration,
     is_youtube_url,
@@ -98,12 +107,15 @@ async def run_analyze_pipeline(
             try:
                 from app.services.detection_runtime import PipelineSettings
                 settings = PipelineSettings()
-                local_video_path = await download_youtube(
-                    video_url,
-                    start_time=time_range_start,
-                    end_time=time_range_end,
-                    yt_dlp_binary=settings.yt_dlp_binary,
-                    ffmpeg_binary=settings.ffmpeg_binary,
+                local_video_path = await run_in_threadpool(
+                    partial(
+                        download_youtube_sync,
+                        video_url,
+                        start_time=time_range_start,
+                        end_time=time_range_end,
+                        yt_dlp_binary=settings.yt_dlp_binary,
+                        ffmpeg_binary=settings.ffmpeg_binary,
+                    )
                 )
                 phases_used.append("youtube_download")
                 youtube_strategy_used = "download_success"
@@ -146,54 +158,9 @@ async def run_analyze_pipeline(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
-        # ── Step 2: Run existing jersey detection (Ali's ensemble) ─────
+        # ── Step 2: Ali's ensemble is DEFERRED to Step 7.5e (last resort) ──
         jersey_detections: list[dict] = []
-        t0 = time.perf_counter()
-        ali_status = "not_run"
-        try:
-            # If we already downloaded the video (YouTube or direct URL),
-            # pass the local file to Ali — avoids Ali re-downloading.
-            # If no local file, pass the original URL for Ali to handle.
-            if local_video_path and local_video_path.exists():
-                LOGGER.info("Pipeline: passing local file to Ali: %s (%d bytes)",
-                            local_video_path, local_video_path.stat().st_size)
-                ali_video_url = None
-                ali_video_path = str(local_video_path)
-            else:
-                LOGGER.info("Pipeline: passing URL to Ali: %s", (video_url or video_path or "")[:80])
-                ali_video_url = video_url
-                ali_video_path = video_path
-
-            jersey_detections = _run_jersey_detection(
-                video_url=ali_video_url,
-                video_path=ali_video_path,
-                jersey_number=jersey_number,
-                jersey_color=jersey_color,
-                sport=sport,
-                position=position,
-            )
-            if jersey_detections:
-                phases_used.append("jersey_detection")
-                ali_status = "working"
-            else:
-                ali_status = "no_detections"
-            layer_timings["ali_jersey_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": ali_status,
-                "detections": len(jersey_detections),
-                "input_type": "local_file" if ali_video_path else "url",
-                "input": (ali_video_path or ali_video_url or "")[:100],
-            }
-            LOGGER.info("Pipeline: jersey detection found %d frames", len(jersey_detections))
-        except Exception as exc:
-            ali_status = "error"
-            layer_timings["ali_jersey_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "error",
-                "error": str(exc)[:200],
-                "detections": 0,
-            }
-            LOGGER.error("Pipeline: jersey detection failed: %s", exc)
+        ali_status = "deferred"  # Will run ONLY if other layers find <3 detections
 
         # ── Step 3: Extract frames for additional analysis ───────────────
         frames: list[tuple[float, np.ndarray]] = []
@@ -207,6 +174,47 @@ async def run_analyze_pipeline(
             except Exception as exc:
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: frame extraction failed: %s", exc)
+
+        # ── Step 3.5: Dead ball filtering (BEFORE OCR layers) ──────────────
+        dead_ball_count = 0
+        dead_ball_ratio = 0.0
+        dead_ball_by_ts: dict[float, str] = {}  # timestamp → "dead_ball" or "live_play"
+        live_frames: list[tuple[float, np.ndarray]] = frames  # default: all frames
+        if frames:
+            t0 = time.perf_counter()
+            try:
+                from app.services.roboflow_detector import roboflow_detector
+                roboflow_detector.load()
+
+                _live: list[tuple[float, np.ndarray]] = []
+                for ts, frame in frames:
+                    db_result = roboflow_detector.classify_dead_ball(frame)
+                    if db_result:
+                        dead_ball_by_ts[ts] = db_result
+                    if db_result == "dead_ball":
+                        dead_ball_count += 1
+                    else:
+                        _live.append((ts, frame))
+
+                dead_ball_ratio = dead_ball_count / len(frames) if frames else 0.0
+                if _live:
+                    live_frames = _live
+                # If ALL frames are dead ball, keep all frames (something is better than nothing)
+                layer_timings["dead_ball_filter"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success",
+                    "dead_frames": dead_ball_count,
+                    "total_frames": len(frames),
+                    "dead_ratio": round(dead_ball_ratio, 2),
+                    "live_frames_for_ocr": len(live_frames),
+                }
+                LOGGER.info(
+                    "Pipeline: dead ball filter — %d/%d frames skipped (%.0f%%), %d live frames for OCR",
+                    dead_ball_count, len(frames), dead_ball_ratio * 100, len(live_frames),
+                )
+            except Exception as exc:
+                layer_timings["dead_ball_filter"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+                LOGGER.warning("Pipeline: dead ball filter failed (non-fatal): %s", exc)
 
         # ── Resolve quality_mode ──────────────────────────────────────────
         resolved_quality = quality_mode
@@ -337,7 +345,62 @@ async def run_analyze_pipeline(
         # OCR confidence threshold — lower in aggressive mode for compressed video
         ocr_conf = 0.15 if resolved_quality == "aggressive" else 0.2
 
-        # ── Step 7.5a: Universal v2 OCR (best single model) ──────────
+        # Use live_frames (dead ball filtered) for OCR steps, all frames for motion
+        ocr_frames = live_frames if live_frames else frames
+
+        # ── Step 7.5a: v5 OCR + v5 player detector (PRIMARY) ──────────
+        v5_ocr_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            if ocr_frames:
+                LOGGER.info("Pipeline: v5 OCR layer (PRIMARY) running on %d live frames", len(ocr_frames))
+                for t, frame in ocr_frames:
+                    dets = roboflow_detector.detect_jersey_v5(
+                        frame, jersey_number=jersey_number, conf=ocr_conf,
+                    )
+                    v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                if v5_ocr_detections:
+                    phases_used.append("v5_ocr_detection")
+            layer_timings["v5_ocr_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v5_ocr_detections else "no_model_or_no_detections",
+                "detections": len(v5_ocr_detections),
+            }
+            LOGGER.info("Pipeline: v5 OCR (PRIMARY) found %d detections", len(v5_ocr_detections))
+        except Exception as exc:
+            layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)
+
+        # ── Step 7.5b: v3 OCR pipeline (secondary confirmation) ───────
+        v3_ocr_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            LOGGER.info("Pipeline: v3 OCR layer (secondary) running for sport=%s", sport)
+            for t, frame in ocr_frames:
+                dets = roboflow_detector.detect_with_player_crops(
+                    frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
+                )
+                v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
+                v3_ocr_detections.extend({**d, "timestamp": t} for d in v3_only)
+            if v3_ocr_detections:
+                phases_used.append("v3_ocr_detection")
+            layer_timings["v3_ocr_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v3_ocr_detections else "no_detections",
+                "detections": len(v3_ocr_detections),
+            }
+            LOGGER.info("Pipeline: v3 OCR (secondary) found %d detections", len(v3_ocr_detections))
+        except Exception as exc:
+            layer_timings["v3_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v3 OCR layer failed (non-fatal): %s", exc)
+
+        # ── Step 7.5c: v2 universal OCR (tertiary — 0.995 mAP50) ──────
         universal_v2_detections: list[dict] = []
         t0 = time.perf_counter()
         try:
@@ -345,8 +408,8 @@ async def run_analyze_pipeline(
             roboflow_detector.load()
 
             if roboflow_detector.jersey_number_universal_v1_model is not None:
-                LOGGER.info("Pipeline: Universal v2 layer running (conf=%.2f)", ocr_conf)
-                for t, frame in frames:
+                LOGGER.info("Pipeline: Universal v2 layer (tertiary) running (conf=%.2f)", ocr_conf)
+                for t, frame in ocr_frames:
                     dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=ocr_conf)
                     universal_v2_detections.extend({**d, "timestamp": t} for d in dets)
                 if universal_v2_detections:
@@ -361,90 +424,188 @@ async def run_analyze_pipeline(
             layer_timings["universal_v2_ocr"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: Universal v2 layer failed (non-fatal): %s", exc)
 
-        # ── Step 7.5b: v3 OCR pipeline (Ali replacement layer) ───────
-        v3_ocr_detections: list[dict] = []
-        t0 = time.perf_counter()
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.load()
-
-            LOGGER.info("Pipeline: v3 OCR layer running for sport=%s", sport)
-            for t, frame in frames:
-                # Full v3 pipeline: player_isolator → color → number_region → OCR
-                dets = roboflow_detector.detect_with_player_crops(
-                    frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
-                )
-                # Only keep v3 layer detections (exclude v1/v2 that detect_with_player_crops also runs)
-                v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
-                v3_ocr_detections.extend({**d, "timestamp": t} for d in v3_only)
-            if v3_ocr_detections:
-                phases_used.append("v3_ocr_detection")
-            layer_timings["v3_ocr_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if v3_ocr_detections else "no_detections",
-                "detections": len(v3_ocr_detections),
-            }
-            LOGGER.info("Pipeline: v3 OCR found %d detections", len(v3_ocr_detections))
-        except Exception as exc:
-            layer_timings["v3_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: v3 OCR layer failed (non-fatal): %s", exc)
-
-        # ── Step 7.5c: v2 sport-specific models ──────────────────────
+        # ── Step 7.5d: v2 sport-specific + v1 legacy (fallback) ──────
         v2_sport_detections: list[dict] = []
-        t0 = time.perf_counter()
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.load()
-
-            LOGGER.info("Pipeline: v2 sport-specific layer running for sport=%s", sport)
-            for t, frame in frames:
-                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-
-            # Also run v1 fallback detectors
-            for t, frame in frames:
-                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-
-            if v2_sport_detections:
-                phases_used.append("v2_sport_detection")
-            layer_timings["v2_sport_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if v2_sport_detections else "no_detections",
-                "detections": len(v2_sport_detections),
-            }
-            LOGGER.info("Pipeline: v2 sport-specific found %d detections", len(v2_sport_detections))
-        except Exception as exc:
-            layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: v2 sport-specific layer failed (non-fatal): %s", exc)
-
-        # ── Step 7.5d: v3 primary OCR standalone (fallback chain) ──────
         v3_primary_detections: list[dict] = []
         t0 = time.perf_counter()
         try:
             from app.services.roboflow_detector import roboflow_detector
             roboflow_detector.load()
 
+            LOGGER.info("Pipeline: v2 sport-specific + v1 fallback layer running")
+            for t, frame in ocr_frames:
+                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=ocr_conf)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=ocr_conf)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=ocr_conf)
+                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+
+            # v3 primary standalone (runs on crops)
             if roboflow_detector.jersey_ocr_v3_primary_model is not None:
-                LOGGER.info("Pipeline: v3 primary standalone layer running")
-                for t, frame in frames:
+                for t, frame in ocr_frames:
                     dets = roboflow_detector.detect_with_v3_primary(
                         frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
                     )
                     v3_primary_detections.extend({**d, "timestamp": t} for d in dets)
-                if v3_primary_detections:
-                    phases_used.append("v3_primary_standalone")
-            layer_timings["v3_primary_standalone"] = {
+
+            if v2_sport_detections:
+                phases_used.append("v2_sport_detection")
+            if v3_primary_detections:
+                phases_used.append("v3_primary_standalone")
+            layer_timings["v2_sport_detection"] = {
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if v3_primary_detections else "no_detections",
-                "detections": len(v3_primary_detections),
+                "status": "success" if (v2_sport_detections or v3_primary_detections) else "no_detections",
+                "v2_sport_detections": len(v2_sport_detections),
+                "v3_primary_detections": len(v3_primary_detections),
             }
-            LOGGER.info("Pipeline: v3 primary standalone found %d detections", len(v3_primary_detections))
+            LOGGER.info("Pipeline: v2/v1/v3-primary found %d + %d detections",
+                        len(v2_sport_detections), len(v3_primary_detections))
         except Exception as exc:
-            layer_timings["v3_primary_standalone"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: v3 primary standalone layer failed (non-fatal): %s", exc)
+            layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v2/v1 layer failed (non-fatal): %s", exc)
+
+        # ── Step 7.5e: Ali ensemble (LAST RESORT — only if <3 detections) ──
+        # Count total OCR detections from all trained layers
+        total_trained_ocr = len(v5_ocr_detections) + len(v3_ocr_detections) + len(universal_v2_detections) + len(v2_sport_detections) + len(v3_primary_detections)
+        t0 = time.perf_counter()
+
+        if total_trained_ocr < 3:
+            LOGGER.info("Pipeline: Ali ensemble (LAST RESORT) — only %d detections from trained layers, running Ali", total_trained_ocr)
+            try:
+                if local_video_path and local_video_path.exists():
+                    ali_video_url = None
+                    ali_video_path = str(local_video_path)
+                else:
+                    ali_video_url = video_url
+                    ali_video_path = video_path
+
+                jersey_detections = _run_jersey_detection(
+                    video_url=ali_video_url,
+                    video_path=ali_video_path,
+                    jersey_number=jersey_number,
+                    jersey_color=jersey_color,
+                    sport=sport,
+                    position=position,
+                )
+                if jersey_detections:
+                    phases_used.append("jersey_detection")
+                    ali_status = "working_fallback"
+                else:
+                    ali_status = "no_detections"
+                layer_timings["ali_jersey_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": ali_status,
+                    "detections": len(jersey_detections),
+                    "reason": f"last_resort (trained_layers_found={total_trained_ocr})",
+                }
+                LOGGER.info("Pipeline: Ali (last resort) found %d detections", len(jersey_detections))
+            except Exception as exc:
+                ali_status = "error"
+                layer_timings["ali_jersey_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error",
+                    "error": str(exc)[:200],
+                    "detections": 0,
+                }
+                LOGGER.error("Pipeline: Ali jersey detection failed: %s", exc)
+        else:
+            ali_status = "skipped_not_needed"
+            layer_timings["ali_jersey_detection"] = {
+                "elapsed_ms": 0,
+                "status": ali_status,
+                "detections": 0,
+                "reason": f"trained_layers_found={total_trained_ocr} (>=3, Ali not needed)",
+            }
+            LOGGER.info("Pipeline: Ali SKIPPED — %d detections from trained layers sufficient", total_trained_ocr)
+
+        # ── Step 7.6: v4 outcome detection + v5 outcome classification ──
+        v4_outcomes_by_ts: dict[float, str] = {}
+        v4_outcome_detections: list[dict] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            if frames:
+                LOGGER.info("Pipeline: v4 outcome + v5 classifier layer checking availability")
+                # Sample every 3rd frame for outcome detection (speed)
+                for i in range(0, len(frames), 3):
+                    t, frame = frames[i]
+
+                    # v4 outcome models (sport-specific, returns [] if not loaded)
+                    v4_dets = roboflow_detector.detect_outcome_v4(frame, sport=sport)
+                    if v4_dets:
+                        best = max(v4_dets, key=lambda d: d.get("confidence", 0))
+                        v4_outcomes_by_ts[t] = best["outcome"]
+                        v4_outcome_detections.extend(
+                            {**d, "timestamp": t} for d in v4_dets
+                        )
+
+                    # v5 outcome classifier fallback (returns None if not loaded)
+                    if t not in v4_outcomes_by_ts:
+                        v5_outcome = roboflow_detector.classify_outcome_v5(
+                            frame, sport=sport,
+                        )
+                        if v5_outcome:
+                            v4_outcomes_by_ts[t] = v5_outcome
+
+                if v4_outcome_detections:
+                    phases_used.append("v4_outcome_detection")
+
+            layer_timings["v4_outcome_detection"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "success" if v4_outcomes_by_ts else "no_model_or_no_outcomes",
+                "outcomes_found": len(v4_outcomes_by_ts),
+                "detections": len(v4_outcome_detections),
+            }
+            LOGGER.info(
+                "Pipeline: v4/v5 outcome found %d outcomes across %d timestamps",
+                len(v4_outcome_detections), len(v4_outcomes_by_ts),
+            )
+        except Exception as exc:
+            layer_timings["v4_outcome_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: v4 outcome detection failed (non-fatal): %s", exc)
+
+        # ── Step 7.8: Scoreboard detection (score change → clip boost) ──
+        scoreboard_detections: list[dict] = []
+        score_change_timestamps: list[float] = []
+        t0 = time.perf_counter()
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.load()
+
+            if frames and roboflow_detector.scoreboard_detector_v5_model is not None:
+                LOGGER.info("Pipeline: scoreboard detection running (every 5th frame)")
+                prev_crop_hash = None
+                for i in range(0, len(frames), 5):
+                    t, frame = frames[i]
+                    sb_dets = roboflow_detector.detect_scoreboard(frame)
+                    if sb_dets:
+                        scoreboard_detections.extend({**d, "timestamp": t} for d in sb_dets)
+                        # Track score changes via pixel diff of scoreboard region
+                        best = max(sb_dets, key=lambda d: d["confidence"])
+                        bx1, by1, bx2, by2 = [int(c) for c in best["bbox"]]
+                        crop = frame[max(0,by1):min(frame.shape[0],by2), max(0,bx1):min(frame.shape[1],bx2)]
+                        if crop.size > 0:
+                            crop_hash = hash(crop.tobytes()[:1000])
+                            if prev_crop_hash is not None and crop_hash != prev_crop_hash:
+                                score_change_timestamps.append(t)
+                            prev_crop_hash = crop_hash
+
+                if scoreboard_detections:
+                    phases_used.append("scoreboard_detection")
+                layer_timings["scoreboard_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if scoreboard_detections else "no_detections",
+                    "detections": len(scoreboard_detections),
+                    "score_changes": len(score_change_timestamps),
+                }
+                LOGGER.info("Pipeline: scoreboard found %d detections, %d score changes",
+                            len(scoreboard_detections), len(score_change_timestamps))
+        except Exception as exc:
+            layer_timings["scoreboard_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+            LOGGER.warning("Pipeline: scoreboard detection failed (non-fatal): %s", exc)
 
         # ── Step 8: Cross-layer validation + merge ────────────────────
         detection_points: list[DetectionPoint] = []
@@ -486,6 +647,13 @@ async def run_analyze_pipeline(
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v3_ocr_primary_standalone"),
+            })
+        for det in v5_ocr_detections:
+            all_layer_dets_raw.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v5_ocr_universal"),
             })
 
         # ── Diagnostic: log ALL numbers detected before filtering ─────
@@ -537,23 +705,40 @@ async def run_analyze_pipeline(
             layers_present = set(d["layer"] for d in bucket_dets)
             best_conf = max(d["confidence"] for d in bucket_dets)
 
-            # Cross-layer confidence boosts
+            # Cross-layer confidence boosts (v5 PRIMARY, Ali low trust)
             bonus = 0.0
             high_confidence = False
+            has_v5 = any("v5_ocr" in l for l in layers_present)
+            has_v3 = any("v3_ocr_primary" in l for l in layers_present)
+            has_v2 = any("v2_universal" in l for l in layers_present)
+            has_ali = "ali_ensemble" in layers_present
 
-            if "ali_ensemble" in layers_present and len(layers_present) >= 2:
-                # Ali + any other layer agrees
-                bonus += 0.2
-
-            if any("v3_ocr_primary" in l for l in layers_present) and \
-               any("v2_universal" in l for l in layers_present):
-                # v3 primary + v2 universal agree
+            # v5 agreement is highest trust
+            if has_v5 and has_v3:
+                bonus += 0.20
+            elif has_v5 and has_v2:
                 bonus += 0.15
+            elif has_v3 and has_v2:
+                bonus += 0.10
 
+            # Ali agreement is LOW trust
+            if has_ali:
+                if len(layers_present) >= 3:
+                    bonus += 0.05  # Ali confirms others — small bonus
+                # Ali alone — cap confidence, don't trust it
+                # (handled below when computing final_conf)
+
+            # Multi-layer bonus (3+ layers agree = very high confidence)
             if len(layers_present) >= 3:
+                bonus += 0.10
                 high_confidence = True
 
             final_conf = min(1.0, best_conf + bonus)
+
+            # Ali-alone hard cap
+            if has_ali and len(layers_present) == 1:
+                final_conf = min(0.6, best_conf)
+                bonus = 0.0
 
             if len(layers_present) >= 2:
                 cross_layer_agreements.append({
@@ -564,6 +749,14 @@ async def run_analyze_pipeline(
                     "high_confidence": high_confidence,
                 })
 
+            # Find nearest v4 outcome for this timestamp
+            bucket_v4_outcome = ""
+            if v4_outcomes_by_ts:
+                for ts, outcome in v4_outcomes_by_ts.items():
+                    if abs(ts - bucket_ts) < 2.0:
+                        bucket_v4_outcome = outcome
+                        break
+
             detection_points.append(DetectionPoint(
                 timestamp=bucket_ts,
                 confidence=final_conf,
@@ -573,6 +766,7 @@ async def run_analyze_pipeline(
                 pose_action=pose_results.get(bucket_ts, _nearest_pose(pose_results, bucket_ts)).get("action", "standing") if pose_results else "standing",
                 crowd_energy=_get_crowd_energy(audio_result, bucket_ts),
                 tracking_id=tracking_result.target_track_id if tracking_result else None,
+                v4_outcome=bucket_v4_outcome,
             ))
 
         # ── Temporal consensus filtering ─────────────────────────────
@@ -655,15 +849,17 @@ async def run_analyze_pipeline(
         v3_count = len(v3_ocr_detections)
         v2_sport_count = len(v2_sport_detections)
         v3_primary_count = len(v3_primary_detections)
+        v5_ocr_count = len(v5_ocr_detections)
+        v4_outcome_count = len(v4_outcome_detections)
         LOGGER.info(
             "Layer results — Ali: %d, Universal_v1: %d, V3_ocr: %d, "
-            "V2_sport: %d, V3_primary: %d, After_filter: %d",
+            "V2_sport: %d, V3_primary: %d, V5_ocr: %d, V4_outcome: %d, After_filter: %d",
             ali_count, univ_count, v3_count, v2_sport_count,
-            v3_primary_count, len(detection_points),
+            v3_primary_count, v5_ocr_count, v4_outcome_count, len(detection_points),
         )
-        if ali_count == 0 and (univ_count + v3_count + v2_sport_count + v3_primary_count) > 0:
+        if ali_count == 0 and (univ_count + v3_count + v2_sport_count + v3_primary_count + v5_ocr_count) > 0:
             LOGGER.info("Pipeline: Ali found 0 — other layers saved detection!")
-        total_raw = ali_count + univ_count + v3_count + v2_sport_count + v3_primary_count
+        total_raw = ali_count + univ_count + v3_count + v2_sport_count + v3_primary_count + v5_ocr_count
         if total_raw > 0 and len(detection_points) == 0:
             LOGGER.warning(
                 "Pipeline: %d raw detections across all layers → 0 detection_points "
@@ -684,6 +880,13 @@ async def run_analyze_pipeline(
                     conf = motion / 100.0 * 0.7
                     if in_boundary:
                         conf = min(1.0, conf + 0.15)
+                    # Check for v4 outcome even in fallback mode
+                    fallback_v4 = ""
+                    if v4_outcomes_by_ts:
+                        for ts_key, outcome in v4_outcomes_by_ts.items():
+                            if abs(ts_key - t) < 2.0:
+                                fallback_v4 = outcome
+                                break
                     detection_points.append(DetectionPoint(
                         timestamp=t,
                         confidence=conf,
@@ -691,6 +894,7 @@ async def run_analyze_pipeline(
                         motion_score=motion,
                         pose_action=pose.get("action", "standing"),
                         crowd_energy=_get_crowd_energy(audio_result, t),
+                        v4_outcome=fallback_v4,
                     ))
 
         # Extract and rank clips
@@ -768,7 +972,7 @@ async def run_analyze_pipeline(
         # Convert clips to response format
         clips_out = []
         for clip in clips:
-            clips_out.append({
+            clip_dict: dict[str, Any] = {
                 "startTime": clip.start_time,
                 "endTime": clip.end_time,
                 "confidence": clip.confidence,
@@ -780,7 +984,21 @@ async def run_analyze_pipeline(
                 "trackingId": clip.tracking_id,
                 "description": clip.description,
                 "signals": clip.signals,
-            })
+            }
+            # Include v4_outcome from signals if present
+            v4_out = (clip.signals or {}).get("v4_outcome")
+            if v4_out:
+                clip_dict["v4Outcome"] = v4_out
+            # Include enriched fields for frontend
+            clip_dict["deadBallRatio"] = round(dead_ball_ratio, 2)
+            clip_dict["scoreboardDetected"] = len(scoreboard_detections) > 0
+            # Which detection layers found the jersey in this clip's time range
+            clip_layers = set()
+            for det in all_layer_dets:
+                if clip.start_time - 1 <= det.get("timestamp", 0) <= clip.end_time + 1:
+                    clip_layers.add(det.get("layer", "unknown"))
+            clip_dict["detectionLayers"] = sorted(clip_layers)
+            clips_out.append(clip_dict)
 
         # ── Build debug field ──────────────────────────────────────────
         ali_working = ali_status == "working"
@@ -788,22 +1006,37 @@ async def run_analyze_pipeline(
             layer for layer in phases_used
             if layer not in ("youtube_download", "frame_extraction")
         ]
+        # Determine primary detection layer
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            primary_layer = roboflow_detector.get_primary_detection()
+        except Exception:
+            primary_layer = "unknown"
+
         debug = {
+            "primary_layer": primary_layer,
             "ali_detections": len(jersey_detections),
             "universal_v2_detections": len(universal_v2_detections),
             "v3_ocr_detections": len(v3_ocr_detections),
             "v2_sport_detections": len(v2_sport_detections),
             "v3_primary_detections": len(v3_primary_detections),
+            "v5_ocr_detections": len(v5_ocr_detections),
+            "v4_outcome_detections": len(v4_outcome_detections),
+            "v4_outcomes_found": len(v4_outcomes_by_ts),
             "combined_detections": len(detection_points),
             "numbers_detected": sorted(str(n) for n in all_numbers_seen),
             "target_jersey_number": jersey_number,
             "wrong_number_filtered": wrong_number_count,
             "analyze_fps": ANALYZE_FPS,
             "frames_extracted": len(frames),
+            "dead_ball_frames_skipped": dead_ball_count,
+            "dead_ball_ratio": round(dead_ball_ratio, 2),
+            "scoreboard_detections": len(scoreboard_detections),
+            "score_changes_detected": len(score_change_timestamps),
             "quality_mode": quality_mode,
             "resolved_quality": resolved_quality,
             "ocr_confidence": ocr_conf,
-            "ali_working": ali_working,
+            "ali_working": ali_status in ("working_fallback",),
             "ali_status": ali_status,
             "youtube_strategy_used": youtube_strategy_used,
             "total_elapsed_ms": round(elapsed * 1000),
@@ -1022,11 +1255,20 @@ def _error_response(
         "perClipStats": [],
         "actionsDetected": [],
         "debug": {
+            "primary_layer": "none",
             "ali_detections": 0,
             "universal_v2_detections": 0,
             "v3_ocr_detections": 0,
             "v2_sport_detections": 0,
+            "v3_primary_detections": 0,
+            "v5_ocr_detections": 0,
+            "v4_outcome_detections": 0,
+            "v4_outcomes_found": 0,
             "combined_detections": 0,
+            "dead_ball_frames_skipped": 0,
+            "dead_ball_ratio": 0.0,
+            "scoreboard_detections": 0,
+            "score_changes_detected": 0,
             "ali_working": False,
             "ali_status": "not_run",
             "youtube_strategy_used": None,

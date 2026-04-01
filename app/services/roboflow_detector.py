@@ -47,9 +47,10 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
 # Memory limits (MB) — configurable via env vars
-# Railway gives 8GB. Reserve 2-3GB for video frames, inference, OS.
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "4500"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "3500"))
+# Railway effective limit ~2.5GB (Ali warmup takes ~600MB).
+# Reserve ~500MB for video frames + inference tensor spikes.
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "2200"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "1800"))
 
 # Navy / dark color aliases for preprocessing and model selection
 NAVY_ALIASES = [
@@ -381,17 +382,14 @@ class RoboflowDetector:
         is_navy_jersey = is_navy(jersey_color)
         sl = sport.lower()
 
-        # Priority 1: Always needed (v5 core already loaded, these add v3 helpers)
+        # Priority 1: v5 core (already loaded by load())
         to_load = [
             "jersey_ocr_universal_v5",
             "player_detector_v5",
             "dead_ball_classifier_v5",
-            "player_isolator_v3",
-            "jersey_color_classifier_v3",
-            "number_region_detector_v3",
         ]
 
-        # Priority 2: Sport-specific v5 outcome classifier
+        # Priority 2: Sport-specific v5 outcome classifier (one model, ~110MB)
         sport_outcome_cls = {
             "football": "outcome_cls_football_v5",
             "basketball": "outcome_cls_basketball_v5",
@@ -400,21 +398,26 @@ class RoboflowDetector:
         if sl in sport_outcome_cls:
             to_load.append(sport_outcome_cls[sl])
 
-        # Priority 3: Sport-specific OCR fallback (1-2 models only)
+        # Priority 3: v3 helpers ONLY if memory allows (each ~110MB)
+        # On tight-memory Railway instances, these get skipped
+        to_load += [
+            "player_isolator_v3",
+            "jersey_color_classifier_v3",
+            "number_region_detector_v3",
+        ]
+
+        # Priority 4: Sport-specific OCR fallback (only if memory allows)
         sport_ocr = {
-            "football": ["football_ocr_v3", "football_digit_detector"],
+            "football": ["football_ocr_v3"],
             "basketball": ["basketball_ocr_v3"],
             "lacrosse": ["lacrosse_ocr_v3"],
         }
         to_load += sport_ocr.get(sl, [])
 
-        # Priority 4: Universal v2 OCR (small models, ~6MB each)
-        to_load += ["jersey_number_universal_v1", "jersey_number_universal_v2"]
-
         # Priority 5: Dark jersey specialists (if applicable)
         if is_dark or is_navy_jersey:
             dark_models = ["dark_jersey_specialist_v3"]
-            to_load = to_load[:6] + dark_models + to_load[6:]
+            to_load.append(dark_models[0])
 
         loaded_models: list[str] = []
         for model_name in to_load:
@@ -454,15 +457,13 @@ class RoboflowDetector:
     def unload_request_models(self) -> None:
         """Unload non-essential models after a request to free memory.
 
-        Keeps v5 essential models and dead_ball_classifier loaded.
+        Keeps ONLY the 3 v5 essential models loaded between requests.
+        Outcome classifiers are unloaded (reloaded per-request if needed).
         """
         keep_attrs = {
             "jersey_ocr_universal_v5_model",
             "player_detector_v5_model",
             "dead_ball_classifier_v5_model",
-            "outcome_cls_basketball_v5_model",
-            "outcome_cls_football_v5_model",
-            "outcome_cls_lacrosse_v5_model",
         }
         unloaded = 0
         for model_name, (filename, attr) in self._MODEL_REGISTRY.items():
@@ -498,24 +499,22 @@ class RoboflowDetector:
             else:
                 logger.info("v5 model pending: %s", filename)
 
-        # ── v5 HEAVY models (loaded if memory allows) ──
-        _v5_heavy = {
+        # ── v5 ESSENTIAL models only (OCR + player detection) ──
+        # Outcome classifiers and scoreboard are deferred to load_for_request()
+        # to keep startup RSS under 1.5GB (Ali warmup already uses ~600MB)
+        _v5_essential = {
             "jersey_ocr_universal_v5.pt": "jersey_ocr_universal_v5_model",
             "player_detector_v5.pt": "player_detector_v5_model",
-            "outcome_classifier_basketball_v5.pt": "outcome_cls_basketball_v5_model",
-            "outcome_classifier_football_v5.pt": "outcome_cls_football_v5_model",
-            "outcome_classifier_lacrosse_v5.pt": "outcome_cls_lacrosse_v5_model",
-            "scoreboard_detector_v5.pt": "scoreboard_detector_v5_model",
         }
-        if self._memory_ok_for_loading("v5-lightweight"):
-            for filename, attr in _v5_heavy.items():
+        if self._memory_ok_for_loading("v5-essential"):
+            for filename, attr in _v5_essential.items():
                 path = os.path.join(MODEL_DIR, filename)
                 if os.path.exists(path):
                     setattr(self, attr, _load_model(filename))
                 else:
                     logger.info("v5 model pending: %s", filename)
         else:
-            logger.info("v5 heavy models skipped — memory pressure (each ~330MB)")
+            logger.info("v5 essential models skipped — memory pressure")
 
         # Load jersey super-resolution model (PyTorch .pth, not YOLO)
         try:
@@ -530,14 +529,14 @@ class RoboflowDetector:
             logger.info("Jersey SR import failed: %s — bicubic fallback", exc)
             self._jersey_upscaler = None
 
-        # v3/v2/v4/v1 models are NOT loaded at startup — load_for_request() handles them
-        # This keeps startup RSS under 2GB so there's room for per-request model loading
-        _v5_yolo_models = {**_v5_lightweight, **_v5_heavy}
-        v5_loaded = sum(1 for attr in _v5_yolo_models.values() if getattr(self, attr, None) is not None)
+        # v3/v2/v4/v1 + v5 outcome/scoreboard are NOT loaded at startup
+        # load_for_request() handles them on-demand
+        _v5_startup = {**_v5_lightweight, **_v5_essential}
+        v5_loaded = sum(1 for attr in _v5_startup.values() if getattr(self, attr, None) is not None)
         logger.info(
-            "load() complete: %d/%d v5 models loaded, RSS=%.0fMB. "
-            "v3/v2/v4 models deferred to load_for_request().",
-            v5_loaded, len(_v5_yolo_models), self._get_rss_mb(),
+            "load() complete: %d/%d v5 essential models loaded, RSS=%.0fMB. "
+            "Outcome classifiers + v3/v2/v4 deferred to load_for_request().",
+            v5_loaded, len(_v5_startup), self._get_rss_mb(),
         )
 
         self._loaded = True

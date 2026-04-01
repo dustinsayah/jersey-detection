@@ -65,11 +65,17 @@ async def detect(
         )
     try:
         detections = await run_in_threadpool(detection_service.detect, detect_request)
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        import traceback
+        tb = traceback.format_exc()
         LOGGER.exception("Detection request failed")
         return JSONResponse(
             status_code=500,
-            content={"error": "Internal detection error. See server logs for details."},
+            content={
+                "error": "Internal detection error. See server logs for details.",
+                "exception": str(exc),
+                "traceback": tb[-2000:],
+            },
         )
     elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
     LOGGER.info(

@@ -119,6 +119,10 @@ async def download_youtube(
 ) -> Path:
     """Download a YouTube video using a 5-strategy chain.
 
+    .. deprecated::
+        This async function calls blocking subprocess.run() on the event loop
+        thread. Use ``download_youtube_sync`` via ``run_in_threadpool`` instead.
+
     Returns path to a local .mp4 file.
     Raises RuntimeError only if ALL 5 strategies fail.
     """
@@ -170,6 +174,9 @@ async def download_youtube(
                         return output_path
 
                     # JSON response — render server returns cloudinaryUrl
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "text" not in ct:
+                        raise ValueError(f"Strategy 1: unexpected content-type '{ct}', skipping JSON parse")
                     data = resp.json()
                     LOGGER.info("youtube_proxy: Strategy 1 response: %s", data)
                     download_url = (
@@ -199,10 +206,11 @@ async def download_youtube(
 
     # ── Strategy 2: yt-dlp with cookies and browser spoofing ──────────
     try:
-        LOGGER.info("Strategy 2: yt-dlp with browser spoofing")
+        LOGGER.info("Strategy 2: yt-dlp with browser spoofing + remote-components")
         cmd = [
             yt_dlp_binary,
             "--no-check-certificate",
+            "--remote-components", "ejs:github",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
             "--format", "best[height<=720]/best",
@@ -215,7 +223,7 @@ async def download_youtube(
             cmd.extend(["--force-keyframes-at-cuts"])
         cmd.append(url)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
             elapsed = round(time.perf_counter() - dl_start, 1)
             file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
@@ -229,13 +237,14 @@ async def download_youtube(
 
     # ── Strategy 3: yt-dlp with android client ────────────────────────
     try:
-        LOGGER.info("Strategy 3: yt-dlp with android client extractor")
+        LOGGER.info("Strategy 3: yt-dlp with android client + remote-components")
         # Remove any partial file from strategy 2
         if output_path.exists():
             output_path.unlink()
         cmd = [
             yt_dlp_binary,
             "--no-check-certificate",
+            "--remote-components", "ejs:github",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
             "--extractor-args", "youtube:player_client=android",
@@ -249,7 +258,7 @@ async def download_youtube(
             cmd.extend(["--force-keyframes-at-cuts"])
         cmd.append(url)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
             elapsed = round(time.perf_counter() - dl_start, 1)
             file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
@@ -322,6 +331,9 @@ async def download_youtube(
                         return output_path
 
                     # May return JSON with a video URL
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "text" not in ct:
+                        raise ValueError(f"Strategy 5: unexpected content-type '{ct}', skipping JSON parse")
                     data = resp.json()
                     download_url = (
                         data.get("cloudinaryUrl")
@@ -348,6 +360,202 @@ async def download_youtube(
 
     raise RuntimeError(
         f"All 5 YouTube download strategies failed for: {url} "
+        f"(original: {original_url}). "
+        f"Strategies: 1=render_server({RENDER_SERVER_URL or 'not_set'}), "
+        f"2=yt-dlp_browser, 3=yt-dlp_android, 4=cobalt, 5=render_extract_frames. "
+        f"Check Railway logs for per-strategy errors."
+    )
+
+
+def download_youtube_sync(
+    url: str,
+    *,
+    start_time: float = 0,
+    end_time: float = 0,
+    yt_dlp_binary: str = "yt-dlp",
+    ffmpeg_binary: str = "ffmpeg",
+) -> Path:
+    """Synchronous version of download_youtube for use from threadpool workers.
+
+    Same 5-strategy chain but uses httpx.Client (sync) instead of AsyncClient.
+    """
+    LOGGER.info("youtube_proxy_sync called with URL: %s", url)
+
+    original_url = url
+    url, url_start_seconds = normalize_youtube_url(url)
+    if url != original_url:
+        LOGGER.info("youtube_proxy_sync: normalized %s → %s (t=%.0fs)", original_url, url, url_start_seconds)
+    if url_start_seconds > 0 and start_time == 0:
+        start_time = url_start_seconds
+
+    LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s", RENDER_SERVER_URL, start_time, end_time)
+    dl_start = time.perf_counter()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_sync_"))
+    output_path = tmp_dir / "video.mp4"
+
+    # ── Strategy 1: Render server proxy ──
+    if RENDER_SERVER_URL:
+        try:
+            LOGGER.info("youtube_proxy_sync: Strategy 1 — render server")
+            with httpx.Client(timeout=httpx.Timeout(90)) as client:
+                payload: dict = {"youtubeUrl": url}
+                if start_time > 0:
+                    payload["startTime"] = start_time
+                if end_time > 0:
+                    payload["endTime"] = end_time
+                resp = client.post(f"{RENDER_SERVER_URL}/download-youtube", json=payload)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "")
+                    if "video" in content_type or "octet-stream" in content_type:
+                        output_path.write_bytes(resp.content)
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 1 (bytes)", round(len(resp.content)/1024/1024, 1), elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                        return output_path
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "text" not in ct:
+                        raise ValueError(f"Sync Strategy 1: unexpected content-type '{ct}', skipping JSON parse")
+                    data = resp.json()
+                    download_url = data.get("cloudinaryUrl") or data.get("downloadUrl") or data.get("url") or data.get("videoUrl")
+                    if download_url:
+                        dl_resp = client.get(download_url, follow_redirects=True)
+                        if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                            output_path.write_bytes(dl_resp.content)
+                            elapsed = round(time.perf_counter() - dl_start, 1)
+                            LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 1 (cloudinary)", round(len(dl_resp.content)/1024/1024, 1), elapsed)
+                            if start_time > 0 or end_time > 0:
+                                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                            return output_path
+                LOGGER.warning("Sync Strategy 1 failed: %d: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            LOGGER.warning("Sync Strategy 1 failed: %s", exc)
+
+    # ── Strategy 2: yt-dlp with browser spoofing ──
+    try:
+        LOGGER.info("youtube_proxy_sync: Strategy 2 — yt-dlp browser spoof + remote-components")
+        cmd = [
+            yt_dlp_binary, "--no-check-certificate",
+            "--remote-components", "ejs:github",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "--add-header", "Accept-Language:en-US,en;q=0.9",
+            "--format", "best[height<=720]/best",
+            "--no-playlist", "-o", str(output_path),
+        ]
+        if start_time > 0 or end_time > 0:
+            section = f"*{start_time}-{end_time}" if end_time > 0 else f"*{start_time}-inf"
+            cmd.extend(["--download-sections", section, "--force-keyframes-at-cuts"])
+        cmd.append(url)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 2", round(output_path.stat().st_size/1024/1024, 1), elapsed)
+            if start_time > 0 or end_time > 0:
+                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            return output_path
+        LOGGER.warning("Sync Strategy 2 failed: %s", result.stderr[:300])
+    except Exception as exc:
+        LOGGER.warning("Sync Strategy 2 failed: %s", exc)
+
+    # ── Strategy 3: yt-dlp with android client ──
+    try:
+        LOGGER.info("youtube_proxy_sync: Strategy 3 — yt-dlp android + remote-components")
+        if output_path.exists():
+            output_path.unlink()
+        cmd = [
+            yt_dlp_binary, "--no-check-certificate",
+            "--remote-components", "ejs:github",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "--add-header", "Accept-Language:en-US,en;q=0.9",
+            "--extractor-args", "youtube:player_client=android",
+            "--format", "worst", "--no-playlist", "-o", str(output_path),
+        ]
+        if start_time > 0 or end_time > 0:
+            section = f"*{start_time}-{end_time}" if end_time > 0 else f"*{start_time}-inf"
+            cmd.extend(["--download-sections", section, "--force-keyframes-at-cuts"])
+        cmd.append(url)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 3", round(output_path.stat().st_size/1024/1024, 1), elapsed)
+            if start_time > 0 or end_time > 0:
+                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            return output_path
+        LOGGER.warning("Sync Strategy 3 failed: %s", result.stderr[:300])
+    except Exception as exc:
+        LOGGER.warning("Sync Strategy 3 failed: %s", exc)
+
+    # ── Strategy 4: Cobalt API ──
+    try:
+        LOGGER.info("youtube_proxy_sync: Strategy 4 — Cobalt API")
+        with httpx.Client(timeout=httpx.Timeout(30)) as client:
+            cobalt_resp = client.post(
+                "https://co.wuk.sh/api/json",
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json={"url": url, "vQuality": "480"},
+            )
+            if cobalt_resp.status_code == 200:
+                cobalt_data = cobalt_resp.json()
+                cobalt_url = cobalt_data.get("url")
+                if cobalt_url:
+                    dl_resp = client.get(cobalt_url, follow_redirects=True)
+                    if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                        if output_path.exists():
+                            output_path.unlink()
+                        output_path.write_bytes(dl_resp.content)
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 4", round(len(dl_resp.content)/1024/1024, 1), elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                        return output_path
+            LOGGER.warning("Sync Strategy 4 failed: Cobalt %d", cobalt_resp.status_code)
+    except Exception as exc:
+        LOGGER.warning("Sync Strategy 4 failed: %s", exc)
+
+    # ── Strategy 5: Render server /extract-frames ──
+    if RENDER_SERVER_URL:
+        try:
+            LOGGER.info("youtube_proxy_sync: Strategy 5 — extract-frames")
+            with httpx.Client(timeout=httpx.Timeout(120)) as client:
+                payload = {"youtubeUrl": url}
+                if start_time > 0:
+                    payload["startTime"] = start_time
+                if end_time > 0:
+                    payload["endTime"] = end_time
+                resp = client.post(f"{RENDER_SERVER_URL}/extract-frames", json=payload)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "")
+                    if "video" in content_type or "octet-stream" in content_type:
+                        if output_path.exists():
+                            output_path.unlink()
+                        output_path.write_bytes(resp.content)
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 5", round(len(resp.content)/1024/1024, 1), elapsed)
+                        if start_time > 0 or end_time > 0:
+                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                        return output_path
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "text" not in ct:
+                        raise ValueError(f"Sync Strategy 5: unexpected content-type '{ct}', skipping JSON parse")
+                    data = resp.json()
+                    download_url = data.get("cloudinaryUrl") or data.get("downloadUrl") or data.get("url") or data.get("videoUrl")
+                    if download_url:
+                        dl_resp = client.get(download_url, follow_redirects=True)
+                        if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                            if output_path.exists():
+                                output_path.unlink()
+                            output_path.write_bytes(dl_resp.content)
+                            elapsed = round(time.perf_counter() - dl_start, 1)
+                            LOGGER.info("Sync downloaded: %sMB in %ss via Strategy 5 (URL)", round(len(dl_resp.content)/1024/1024, 1), elapsed)
+                            if start_time > 0 or end_time > 0:
+                                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                            return output_path
+                LOGGER.warning("Sync Strategy 5 failed: %d", resp.status_code)
+        except Exception as exc:
+            LOGGER.warning("Sync Strategy 5 failed: %s", exc)
+
+    raise RuntimeError(
+        f"All 5 YouTube download strategies failed (sync) for: {url} "
         f"(original: {original_url}). "
         f"Strategies: 1=render_server({RENDER_SERVER_URL or 'not_set'}), "
         f"2=yt-dlp_browser, 3=yt-dlp_android, 4=cobalt, 5=render_extract_frames. "
@@ -401,6 +609,79 @@ async def test_youtube_download(
     # Full download test
     try:
         path = await download_youtube(
+            url,
+            yt_dlp_binary=yt_dlp_binary,
+            ffmpeg_binary=ffmpeg_binary,
+        )
+        elapsed = round(time.perf_counter() - start, 1)
+        file_size = path.stat().st_size if path.exists() else 0
+        return {
+            "success": True,
+            "file_size": file_size,
+            "file_size_mb": round(file_size / 1024 / 1024, 2),
+            "elapsed": elapsed,
+            "file_path": str(path),
+            "render_server_url": RENDER_SERVER_URL,
+            "strategy_results": strategy_results,
+        }
+    except Exception as exc:
+        elapsed = round(time.perf_counter() - start, 1)
+        return {
+            "success": False,
+            "error": str(exc),
+            "elapsed": elapsed,
+            "render_server_url": RENDER_SERVER_URL,
+            "strategy_results": strategy_results,
+        }
+
+
+def test_youtube_download_sync(
+    url: str,
+    yt_dlp_binary: str = "yt-dlp",
+    ffmpeg_binary: str = "ffmpeg",
+) -> dict:
+    """Synchronous version of test_youtube_download for use from threadpool."""
+    start = time.perf_counter()
+    strategy_results: list[dict] = []
+
+    # Test Strategy 1: Render server
+    s1_start = time.perf_counter()
+    try:
+        with httpx.Client(timeout=httpx.Timeout(60)) as client:
+            payload = {"youtubeUrl": url}
+            resp = client.post(f"{RENDER_SERVER_URL}/download-youtube", json=payload)
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "")
+                data = resp.json() if "json" in ct else {}
+                cloud_url = data.get("cloudinaryUrl", "")
+                if cloud_url:
+                    strategy_results.append({
+                        "strategy": 1, "name": "render_server",
+                        "status": "success", "cloudinaryUrl": cloud_url,
+                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                    })
+                else:
+                    strategy_results.append({
+                        "strategy": 1, "name": "render_server",
+                        "status": "no_url", "response": str(resp.text[:200]),
+                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                    })
+            else:
+                strategy_results.append({
+                    "strategy": 1, "name": "render_server",
+                    "status": f"http_{resp.status_code}",
+                    "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                })
+    except Exception as exc:
+        strategy_results.append({
+            "strategy": 1, "name": "render_server",
+            "status": "error", "error": str(exc)[:200],
+            "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+        })
+
+    # Full download test using sync chain
+    try:
+        path = download_youtube_sync(
             url,
             yt_dlp_binary=yt_dlp_binary,
             ffmpeg_binary=ffmpeg_binary,

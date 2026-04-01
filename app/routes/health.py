@@ -194,7 +194,58 @@ async def test_youtube(url: str) -> JSONResponse:
 
 @router.get("/live")
 def live() -> JSONResponse:
-    return JSONResponse(status_code=200, content={"status": "ok", "version": "d0f5af7-sync-proxy"})
+    model_dir = Path("/app/app/model") if Path("/app/app/model").exists() else Path("app/model")
+    pt_count = len(list(model_dir.glob("*.pt"))) + len(list(model_dir.glob("*.pth")))
+
+    try:
+        from app.services.roboflow_detector import roboflow_detector
+        primary = roboflow_detector.get_primary_detection()
+    except Exception:
+        primary = "unknown"
+
+    return JSONResponse(status_code=200, content={
+        "status": "ok",
+        "version": "v6.0",
+        "models": pt_count,
+        "primary_detection": primary,
+    })
+
+
+@router.get("/models")
+def models_inventory() -> JSONResponse:
+    """Return a JSON inventory of all loaded/available/missing models."""
+    model_dir = Path("/app/app/model") if Path("/app/app/model").exists() else Path("app/model")
+
+    try:
+        from app.services.roboflow_detector import roboflow_detector
+        status = roboflow_detector.status()
+        primary = status.pop("primary_detection", "unknown")
+        ali_status = status.pop("ali_status", "unknown")
+
+        loaded = [k for k, v in status.items() if v == "loaded"]
+        available = [k for k, v in status.items() if v == "available"]
+        missing = [k for k, v in status.items() if v == "missing"]
+        # Include special-status items that aren't loaded/available/missing
+        other = {k: v for k, v in status.items()
+                 if v not in ("loaded", "available", "missing")}
+        for k in other:
+            available.append(k)  # Count fallbacks as available
+    except Exception:
+        loaded, available, missing = [], [], []
+        primary = "unknown"
+        ali_status = "unknown"
+
+    total = len(loaded) + len(available) + len(missing)
+
+    return JSONResponse(status_code=200, content={
+        "total_models": total,
+        "loaded": sorted(loaded),
+        "available": sorted(available),
+        "missing": sorted(missing),
+        "primary_detection": primary,
+        "ali_status": ali_status,
+        "version": "v6.0",
+    })
 
 
 @router.get("/ready")

@@ -9,7 +9,8 @@ class TestHealth:
     def test_live_returns_ok(self, client: TestClient) -> None:
         response = client.get("/live")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        data = response.json()
+        assert data["status"] == "ok"
 
     def test_health_returns_ok_when_ready(self, client: TestClient) -> None:
         response = client.get("/health")

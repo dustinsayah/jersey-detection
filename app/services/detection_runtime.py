@@ -360,7 +360,7 @@ class PipelineSettings:
         default_factory=lambda: _env_optional_str("YT_DLP_JS_RUNTIMES", "deno") or "deno"
     )
     youtube_clip_seconds: int | None = field(
-        default_factory=lambda: _env_optional_int("YOUTUBE_CLIP_SECONDS")
+        default_factory=lambda: _env_optional_int("YOUTUBE_CLIP_SECONDS", 120)
     )
 
     pipeline_workers: int = field(

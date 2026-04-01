@@ -1,0 +1,12 @@
+# Skip large files for railway up
+# NOTE: app/model/*.pt (172MB) MUST be included — COPY app /app/app needs them
+# app/model/public/ (1.4GB) is downloaded during Docker build by bootstrap_public_reader.py
+app/model/public/
+external/
+notebooks/
+tests/
+*.md
+*.mp4
+*.zip
+.git/
+__pycache__/

@@ -182,6 +182,8 @@ def _download_youtube_video(
         settings.yt_dlp_binary,
         "--js-runtimes",
         settings.yt_dlp_js_runtimes,
+        "--remote-components",
+        "ejs:github",
     ]
     if clip_seconds is not None:
         command.extend([
@@ -263,10 +265,14 @@ def _resolve_video_source(
 
     if _is_http_url(video_url):
         if _is_youtube_url(video_url):
-            return _download_youtube_video(
-                video_url=video_url,
-                work_dir=work_dir,
-                settings=settings,
+            from app.services.youtube_proxy import download_youtube_sync
+            end_time = float(settings.youtube_clip_seconds) if settings.youtube_clip_seconds else 0
+            LOGGER.info("Using youtube_proxy_sync 5-strategy chain for: %s", video_url)
+            return download_youtube_sync(
+                url=video_url,
+                end_time=end_time,
+                yt_dlp_binary=settings.yt_dlp_binary,
+                ffmpeg_binary=settings.ffmpeg_binary,
             )
         ext = _safe_extension(urllib.parse.urlparse(video_url).path)
         return _download_direct_video(video_url, work_dir / f"input_download{ext}")

@@ -35,7 +35,7 @@ class TestPipelineSettings:
 
         settings = PipelineSettings()
 
-        assert settings.youtube_clip_seconds is None
+        assert settings.youtube_clip_seconds == 120
         assert settings.early_exit_consecutive == 0
 
     def test_person_model_default_points_to_official_model_name_or_bundled_copy(self) -> None:
@@ -80,9 +80,10 @@ class TestPipelineSettings:
 
 
 class TestYoutubeDownloadBehavior:
-    def test_download_youtube_video_uses_full_video_when_clip_limit_unset(
+    def test_download_youtube_video_clips_to_default_120s(
         self, tmp_path
     ) -> None:
+        """Default youtube_clip_seconds=120 prevents full-video download (gateway timeout fix)."""
         commands: list[list[str]] = []
         settings = PipelineSettings()
 
@@ -99,7 +100,10 @@ class TestYoutubeDownloadBehavior:
             )
 
         assert output.name == "youtube_input.mp4"
-        assert "--download-sections" not in commands[0]
+        assert "--download-sections" in commands[0]
+        # Should clip to 120s by default
+        idx = commands[0].index("--download-sections")
+        assert commands[0][idx + 1] == "*0-120"
 
     def test_download_youtube_video_applies_clip_limit_when_configured(
         self, tmp_path

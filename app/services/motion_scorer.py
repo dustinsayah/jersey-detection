@@ -108,9 +108,16 @@ def compute_motion_score(
             )
             player_motion = float(corrected_mag.mean())
 
-        # Normalize to 0-100
-        # Empirical: 0 flow → 0, ~5 pixels/frame → 50, ~10+ → 100
-        score = min(100.0, player_motion * 10.0)
+        # Normalize to 0-100 with 3-tier exponential scaling
+        # Tier 1 (0-2 px/frame): minimal motion — walking, standing → 0-20
+        # Tier 2 (2-6 px/frame): steady motion — jogging, positioning → 20-75
+        # Tier 3 (6+ px/frame): explosive motion — sprinting, jumping, cutting → 75-100
+        if player_motion < 2.0:
+            score = player_motion * 10.0
+        elif player_motion < 6.0:
+            score = 20.0 + (player_motion - 2.0) * 13.75
+        else:
+            score = min(100.0, 75.0 + (player_motion - 6.0) * 6.25)
 
         return MotionScore(
             score=round(score, 1),

@@ -248,9 +248,23 @@ def models_inventory() -> JSONResponse:
     })
 
 
-@router.get("/ready")
 @router.get("/health")
 def health(request: Request) -> JSONResponse:
+    """Liveness probe — always returns 200 so Railway keeps the container."""
+    ready = getattr(request.app.state, "detector_ready", False)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok" if ready else "warming_up",
+            "version": "v6.0",
+            "detector_ready": ready,
+        },
+    )
+
+
+@router.get("/ready")
+def ready(request: Request) -> JSONResponse:
+    """Readiness probe — returns 503 if models not loaded yet."""
     phases = _check_phases()
 
     if getattr(request.app.state, "detector_ready", False):

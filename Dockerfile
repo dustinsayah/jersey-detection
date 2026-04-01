@@ -69,6 +69,6 @@ COPY layers /app/layers
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/live || exit 1"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/health || exit 1"
 
 CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout ${GUNICORN_TIMEOUT:-1800} asgi:app"]

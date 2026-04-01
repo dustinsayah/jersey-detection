@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 
 from contextlib import asynccontextmanager
 
@@ -68,36 +69,42 @@ def _verify_runtime_dependencies(settings) -> None:
         raise RuntimeError(f"Runtime dependency verification failed: {error}") from error
 
 
-@asynccontextmanager
-async def _lifespan(application: FastAPI):
-    """Load models at startup so the first request doesn't wait."""
-    _configure_logging()
-    application.state.detector_ready = False
-    application.state.startup_error = None
+def _warmup_models(application: FastAPI) -> None:
+    """Background thread: load models so the first request is faster."""
     try:
         from app.services.detection_detector import get_or_create_detector
         from app.services.detection_runtime import PipelineSettings
 
         settings = PipelineSettings()
         LOGGER.info(
-            "Startup: verifying runtime deps (ffmpeg=%s, yt-dlp=%s)",
+            "Warmup: verifying runtime deps (ffmpeg=%s, yt-dlp=%s)",
             settings.ffmpeg_binary, settings.yt_dlp_binary,
         )
         _verify_runtime_dependencies(settings)
         LOGGER.info(
-            "Startup: loading models (yolo=%s, person=%s, reader=%s)",
+            "Warmup: loading models (yolo=%s, person=%s, reader=%s)",
             settings.yolo_model_source, settings.person_model_source,
             settings.jersey_reader_backend,
         )
         get_or_create_detector(settings)
         application.state.detector_ready = True
-        LOGGER.info("Detection stack warmed up at startup — detector_ready=True")
+        LOGGER.info("Detection stack warmed up — detector_ready=True")
     except Exception as error:
         application.state.startup_error = str(error)
         LOGGER.exception(
-            "Model warm-up failed — detector_ready will stay False, "
-            "/detect and /analyze will return 503. Error: %s", error,
+            "Model warm-up failed — detector_ready stays False. Error: %s", error,
         )
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Start model loading in background so the app is immediately healthy."""
+    _configure_logging()
+    application.state.detector_ready = False
+    application.state.startup_error = None
+    LOGGER.info("App starting — launching model warmup in background thread")
+    thread = threading.Thread(target=_warmup_models, args=(application,), daemon=True)
+    thread.start()
     yield
 
 

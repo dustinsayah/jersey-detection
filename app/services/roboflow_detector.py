@@ -47,8 +47,27 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
 # Memory limits (MB) — configurable via env vars
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "4000"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "2200"))
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "6000"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "4500"))
+
+# Navy / dark color aliases for preprocessing and model selection
+NAVY_ALIASES = [
+    "navy", "navy blue", "dark blue", "darkblue", "dark_blue",
+    "midnight blue", "midnight", "royal blue", "dark navy",
+    "charcoal blue", "#001f5b", "#00205b", "#000080", "#003087",
+]
+DARK_COLOR_ALIASES = NAVY_ALIASES + [
+    "black", "dark", "charcoal", "dark green", "dark_green",
+    "dark red", "dark_red", "maroon", "forest green",
+]
+
+
+def is_navy(color_string: str) -> bool:
+    return color_string.strip().lower() in [a.lower() for a in NAVY_ALIASES]
+
+
+def is_dark_color(color_string: str) -> bool:
+    return color_string.strip().lower() in [a.lower() for a in DARK_COLOR_ALIASES]
 
 
 def _load_model(filename: str):
@@ -157,6 +176,9 @@ class RoboflowDetector:
     def __init__(self):
         self._loaded = False
         self._last_used: dict[str, float] = {}
+        self._request_jersey_color: str = "white"  # Set per-request for preprocessing
+        self._request_models_called: list[str] = []  # Track which models ran
+        self._request_detections_per_model: dict[str, int] = {}  # Count per model
         # v1 models
         self.football_digit_model = None
         self.football_player_model = None
@@ -272,6 +294,200 @@ class RoboflowDetector:
             )
             return False
         return True
+
+    # ── Context-aware model loading per request ─────────────────────────
+
+    # Maps model name → (filename, attribute name)
+    _MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+        # v5 essential
+        "jersey_ocr_universal_v5": ("jersey_ocr_universal_v5.pt", "jersey_ocr_universal_v5_model"),
+        "player_detector_v5": ("player_detector_v5.pt", "player_detector_v5_model"),
+        "dead_ball_classifier_v5": ("dead_ball_classifier_v5.pt", "dead_ball_classifier_v5_model"),
+        "outcome_cls_football_v5": ("outcome_classifier_football_v5.pt", "outcome_cls_football_v5_model"),
+        "outcome_cls_basketball_v5": ("outcome_classifier_basketball_v5.pt", "outcome_cls_basketball_v5_model"),
+        "outcome_cls_lacrosse_v5": ("outcome_classifier_lacrosse_v5.pt", "outcome_cls_lacrosse_v5_model"),
+        # v3 OCR
+        "jersey_ocr_v3_primary": ("jersey_ocr_v3_primary.pt", "jersey_ocr_v3_primary_model"),
+        "jersey_ocr_v3_secondary": ("jersey_ocr_v3_secondary.pt", "jersey_ocr_v3_secondary_model"),
+        "basketball_ocr_v3": ("basketball_ocr_v3.pt", "basketball_ocr_v3_model"),
+        "football_ocr_v3": ("football_ocr_v3.pt", "football_ocr_v3_model"),
+        "lacrosse_ocr_v3": ("lacrosse_ocr_v3.pt", "lacrosse_ocr_v3_model"),
+        "player_isolator_v3": ("player_isolator_v3.pt", "player_isolator_v3_model"),
+        "jersey_color_classifier_v3": ("jersey_color_classifier_v3.pt", "jersey_color_classifier_v3_model"),
+        "number_region_detector_v3": ("number_region_detector_v3.pt", "number_region_detector_v3_model"),
+        # v3 specialists
+        "dark_jersey_specialist_v3": ("dark_jersey_specialist_v3.pt", "dark_jersey_specialist_v3_model"),
+        "motion_blur_specialist_v3": ("motion_blur_specialist_v3.pt", "motion_blur_specialist_v3_model"),
+        "wide_angle_specialist_v3": ("wide_angle_specialist_v3.pt", "wide_angle_specialist_v3_model"),
+        "partial_visibility_specialist_v3": ("partial_visibility_specialist_v3.pt", "partial_visibility_specialist_v3_model"),
+        "night_game_specialist_v4": ("night_game_specialist_v4.pt", "night_game_specialist_v4_model"),
+        "helmet_glare_specialist_v4": ("helmet_glare_specialist_v4.pt", "helmet_glare_specialist_v4_model"),
+        "indoor_court_specialist_v4": ("indoor_court_specialist_v4.pt", "indoor_court_specialist_v4_model"),
+        "low_resolution_specialist_v4": ("low_resolution_specialist_v4.pt", "low_resolution_specialist_v4_model"),
+        "crowd_obstruction_specialist_v4": ("crowd_obstruction_specialist_v4.pt", "crowd_obstruction_specialist_v4_model"),
+        "multi_player_cluster_v4": ("multi_player_cluster_v4.pt", "multi_player_cluster_v4_model"),
+        # v2 universal
+        "jersey_number_universal_v1": ("jersey_number_universal_v1.pt", "jersey_number_universal_v1_model"),
+        "jersey_number_universal_v2": ("jersey_number_universal_v2.pt", "jersey_number_universal_v2_model"),
+        # v2 sport-specific
+        "basketball_jersey_number_v2": ("basketball_jersey_number_v2.pt", "basketball_jersey_number_v2_model"),
+        "football_positions_detector": ("football_positions_detector.pt", "football_positions_model"),
+        "football_presnap_detector": ("football_presnap_detector.pt", "football_presnap_model"),
+        "lacrosse_v1": ("lacrosse_detector_v1.pt", "lacrosse_v1_model"),
+        # v4 outcome - basketball
+        "basketball_hoop_detector_v4": ("basketball_hoop_detector_v4.pt", "basketball_hoop_detector_v4_model"),
+        "basketball_made_shot_v4": ("basketball_made_shot_v4.pt", "basketball_made_shot_v4_model"),
+        "basketball_scoring_zone_v4": ("basketball_scoring_zone_v4.pt", "basketball_scoring_zone_v4_model"),
+        "basketball_dribble_drive_v4": ("basketball_dribble_drive_v4.pt", "basketball_dribble_drive_v4_model"),
+        "basketball_rebound_v4": ("basketball_rebound_v4.pt", "basketball_rebound_v4_model"),
+        # v4 outcome - football
+        "football_completion_detector_v4": ("football_completion_detector_v4.pt", "football_completion_detector_v4_model"),
+        "football_touchdown_detector_v4": ("football_touchdown_detector_v4.pt", "football_touchdown_detector_v4_model"),
+        "football_sack_detector_v4": ("football_sack_detector_v4.pt", "football_sack_detector_v4_model"),
+        "football_reception_yac_v4": ("football_reception_yac_v4.pt", "football_reception_yac_v4_model"),
+        "football_qb_scramble_v4": ("football_qb_scramble_v4.pt", "football_qb_scramble_v4_model"),
+        # v4 outcome - lacrosse
+        "lacrosse_goal_detector_v4": ("lacrosse_goal_detector_v4.pt", "lacrosse_goal_detector_v4_model"),
+        "lacrosse_shot_quality_v4": ("lacrosse_shot_quality_v4.pt", "lacrosse_shot_quality_v4_model"),
+        "lacrosse_ground_ball_v4": ("lacrosse_ground_ball_v4.pt", "lacrosse_ground_ball_v4_model"),
+        # v4 cross-sport
+        "crowd_energy_detector_v4": ("crowd_energy_detector_v4.pt", "crowd_energy_detector_v4_model"),
+        # v1 legacy
+        "football_digit_detector": ("football_digit_detector.pt", "football_digit_model"),
+        "football_player_detector": ("football_player_detector.pt", "football_player_model"),
+        "football_jersey_tracker": ("football_jersey_tracker.pt", "football_tracker_model"),
+    }
+
+    def load_for_request(self, sport: str, jersey_color: str = "white") -> list[str]:
+        """Load only the models relevant to this specific request.
+
+        Returns list of model names that were loaded for this request.
+        Keeps essential v5 models always loaded, adds sport-specific and
+        condition-specific models on demand.
+        """
+        self.load()  # Ensure base v5 models are loaded
+
+        is_dark = is_dark_color(jersey_color)
+        is_navy_jersey = is_navy(jersey_color)
+        sl = sport.lower()
+
+        # Always needed
+        to_load = [
+            "jersey_ocr_universal_v5",
+            "player_detector_v5",
+            "dead_ball_classifier_v5",
+            "player_isolator_v3",
+            "jersey_color_classifier_v3",
+            "number_region_detector_v3",
+            "jersey_ocr_v3_primary",
+        ]
+
+        # Sport-specific OCR
+        sport_ocr = {
+            "football": ["football_ocr_v3", "jersey_ocr_v3_secondary", "football_positions_detector",
+                         "football_digit_detector", "football_player_detector", "football_jersey_tracker"],
+            "basketball": ["basketball_ocr_v3", "basketball_jersey_number_v2", "jersey_ocr_v3_secondary"],
+            "lacrosse": ["lacrosse_ocr_v3", "jersey_ocr_v3_secondary"],
+        }
+        to_load += sport_ocr.get(sl, [])
+
+        # Sport-specific outcome models
+        sport_outcomes = {
+            "football": [
+                "football_completion_detector_v4", "football_touchdown_detector_v4",
+                "football_sack_detector_v4", "football_reception_yac_v4",
+                "football_qb_scramble_v4", "outcome_cls_football_v5",
+            ],
+            "basketball": [
+                "basketball_hoop_detector_v4", "basketball_made_shot_v4",
+                "basketball_scoring_zone_v4", "basketball_dribble_drive_v4",
+                "basketball_rebound_v4", "outcome_cls_basketball_v5",
+            ],
+            "lacrosse": [
+                "lacrosse_goal_detector_v4", "lacrosse_shot_quality_v4",
+                "lacrosse_ground_ball_v4", "outcome_cls_lacrosse_v5",
+            ],
+        }
+        to_load += sport_outcomes.get(sl, [])
+
+        # Universal v2 OCR (always helpful)
+        to_load += ["jersey_number_universal_v1", "jersey_number_universal_v2"]
+
+        # Cross-sport
+        to_load += ["crowd_energy_detector_v4"]
+
+        # Dark/navy jersey specialists — load FIRST priority for dark jerseys
+        if is_dark or is_navy_jersey:
+            # Insert dark specialists at high priority
+            dark_models = [
+                "dark_jersey_specialist_v3",
+                "night_game_specialist_v4",
+                "helmet_glare_specialist_v4",
+                "low_resolution_specialist_v4",
+            ]
+            to_load = dark_models + to_load
+
+        loaded_models: list[str] = []
+        for model_name in to_load:
+            if model_name not in self._MODEL_REGISTRY:
+                continue
+            filename, attr = self._MODEL_REGISTRY[model_name]
+            # Skip if already loaded
+            if getattr(self, attr, None) is not None:
+                loaded_models.append(model_name)
+                continue
+            # Check memory before loading
+            rss = self._get_rss_mb()
+            if rss > 0 and rss >= MEMORY_LIMIT_MB:
+                logger.warning(
+                    "load_for_request: skipping %s — memory at %.0fMB (limit %dMB)",
+                    model_name, rss, MEMORY_LIMIT_MB,
+                )
+                break
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                model = _load_model(filename)
+                if model is not None:
+                    setattr(self, attr, model)
+                    self._last_used[attr] = time.time()
+                    loaded_models.append(model_name)
+                    logger.info(
+                        "load_for_request: loaded %s (RSS=%.0fMB)",
+                        model_name, self._get_rss_mb(),
+                    )
+
+        logger.info(
+            "load_for_request: %d models loaded for sport=%s color=%s (dark=%s navy=%s)",
+            len(loaded_models), sport, jersey_color, is_dark, is_navy_jersey,
+        )
+        return loaded_models
+
+    def unload_request_models(self) -> None:
+        """Unload non-essential models after a request to free memory.
+
+        Keeps v5 essential models and dead_ball_classifier loaded.
+        """
+        keep_attrs = {
+            "jersey_ocr_universal_v5_model",
+            "player_detector_v5_model",
+            "dead_ball_classifier_v5_model",
+            "outcome_cls_basketball_v5_model",
+            "outcome_cls_football_v5_model",
+            "outcome_cls_lacrosse_v5_model",
+        }
+        unloaded = 0
+        for model_name, (filename, attr) in self._MODEL_REGISTRY.items():
+            if attr in keep_attrs:
+                continue
+            if getattr(self, attr, None) is not None:
+                setattr(self, attr, None)
+                unloaded += 1
+        if unloaded > 0:
+            gc.collect()
+            logger.info(
+                "unload_request_models: freed %d models (RSS=%.0fMB)",
+                unloaded, self._get_rss_mb(),
+            )
 
     def load(self):
         """Lazy-load all models on first use.
@@ -502,18 +718,68 @@ class RoboflowDetector:
             "yes" if self.scoreboard_detector_v5_model is not None else "no",
         )
 
-    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """2x upscale + CLAHE contrast + unsharp mask for better digit reading."""
+    def _preprocess(self, frame: np.ndarray, jersey_color: str | None = None) -> np.ndarray:
+        """2x upscale + CLAHE contrast + unsharp mask for better digit reading.
+
+        Enhanced preprocessing for dark/navy jerseys:
+        - Higher CLAHE clipLimit (5.0 for navy, 4.0 for dark)
+        - Stronger unsharp mask
+        - Gamma correction for brightness boost
+        """
+        if jersey_color is None:
+            jersey_color = self._request_jersey_color
+
         h, w = frame.shape[:2]
         upscaled = cv2.resize(frame, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+        # Determine preprocessing intensity based on jersey color
+        _is_navy = is_navy(jersey_color)
+        _is_dark = is_dark_color(jersey_color)
+
+        clip_limit = 5.0 if _is_navy else (4.0 if _is_dark else 3.0)
+        unsharp_strength = 2.0 if _is_navy else (1.8 if _is_dark else 1.5)
+
         lab = cv2.cvtColor(upscaled, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
         lab[:, :, 0] = clahe.apply(lab[:, :, 0])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # Gamma correction for dark jerseys — brighten the image
+        if _is_navy or _is_dark:
+            gamma = 1.5 if _is_navy else 1.3
+            inv_gamma = 1.0 / gamma
+            table = np.array([
+                ((i / 255.0) ** inv_gamma) * 255
+                for i in range(256)
+            ]).astype("uint8")
+            enhanced = cv2.LUT(enhanced, table)
+
         # Unsharp mask — sharpen digit edges degraded by compression
         blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
-        sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+        sharpened = cv2.addWeighted(
+            enhanced, unsharp_strength, blurred, -(unsharp_strength - 1.0), 0,
+        )
         return sharpened
+
+    def _track_model_call(self, model_name: str, detection_count: int = 0) -> None:
+        """Track model usage for per-request auditing."""
+        if model_name not in self._request_models_called:
+            self._request_models_called.append(model_name)
+        self._request_detections_per_model[model_name] = (
+            self._request_detections_per_model.get(model_name, 0) + detection_count
+        )
+
+    def reset_request_tracking(self) -> None:
+        """Reset per-request tracking counters."""
+        self._request_models_called = []
+        self._request_detections_per_model = {}
+
+    def get_request_summary(self) -> dict:
+        """Get per-request model usage summary."""
+        return {
+            "models_called": list(self._request_models_called),
+            "detections_per_model": dict(self._request_detections_per_model),
+        }
 
     def _parse_number(self, class_name: str) -> int:
         """Extract integer from a class name like '23' or 'digit_5'."""
@@ -783,6 +1049,23 @@ class RoboflowDetector:
             except Exception as e:
                 logger.debug("%s error: %s", spec_layer, e)
 
+        # Track all v3 models that ran
+        for model_obj, layer_name in [
+            (self.number_region_detector_v3_model, "number_region_detector_v3"),
+            (self.jersey_ocr_v3_primary_model, "jersey_ocr_v3_primary"),
+            (self.jersey_ocr_v3_secondary_model, "jersey_ocr_v3_secondary"),
+        ]:
+            if model_obj is not None:
+                self._track_model_call(layer_name, 0)
+        if sport_model is not None:
+            self._track_model_call(sport_layer, 0)
+        for spec_model, spec_layer in specialists:
+            if spec_model is not None:
+                self._track_model_call(spec_layer, 0)
+        # Count actual matched detections by layer
+        for d in dets:
+            self._track_model_call(d.get("layer", "v3_unknown"), 1)
+
         return dets
 
     def _run_universal_ocr(
@@ -814,6 +1097,7 @@ class RoboflowDetector:
                         })
             except Exception as e:
                 logger.debug("%s error: %s", layer_name, e)
+            self._track_model_call(layer_name, sum(1 for d in dets if d.get("layer") == layer_name))
         return dets
 
     def _run_sport_specific_v2(
@@ -926,6 +1210,34 @@ class RoboflowDetector:
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
+
+            # Jersey color classifier — skip players with wrong jersey color
+            if self.jersey_color_classifier_v3_model is not None:
+                try:
+                    color_results = self.jersey_color_classifier_v3_model(
+                        crop, conf=0.3, verbose=False,
+                    )
+                    if color_results and color_results[0].probs is not None:
+                        probs = color_results[0].probs
+                        top_class = probs.top1
+                        top_conf = probs.top1conf.item()
+                        predicted_color = self.jersey_color_classifier_v3_model.names[top_class]
+                        # Skip this player if color doesn't match and confidence is high
+                        req_color = self._request_jersey_color.lower()
+                        pred_lower = predicted_color.lower()
+                        # Navy matches: navy, dark_blue, blue
+                        color_match = (
+                            req_color in pred_lower
+                            or pred_lower in req_color
+                            or (is_navy(req_color) and any(c in pred_lower for c in ["navy", "dark", "blue"]))
+                            or (req_color == "white" and "white" in pred_lower)
+                        )
+                        if not color_match and top_conf > 0.6:
+                            self._track_model_call("jersey_color_classifier_v3", 0)
+                            continue  # Skip this player — wrong team
+                    self._track_model_call("jersey_color_classifier_v3", 1)
+                except Exception as e:
+                    logger.debug("jersey_color_classifier_v3 error: %s", e)
 
             # Priority 1: universal v2 (best accuracy — 0.995 mAP50)
             dets = self._run_universal_ocr(crop, jersey_number, conf=0.2)
@@ -1135,6 +1447,7 @@ class RoboflowDetector:
                     })
             except Exception as e:
                 logger.debug("v4 %s error: %s", attr, e)
+            self._track_model_call(f"v4_{outcome_name}", sum(1 for d in dets if d.get("layer") == f"v4_{outcome_name}"))
 
         return dets
 
@@ -1156,7 +1469,9 @@ class RoboflowDetector:
         try:
             upscaled_crop = self._maybe_upscale(crop)
             enhanced = self._preprocess(upscaled_crop)
-            results = self.jersey_ocr_universal_v5_model(enhanced, conf=conf, verbose=False)[0]
+            # Lower confidence for dark jerseys
+            effective_conf = min(conf, 0.12) if is_dark_color(self._request_jersey_color) else conf
+            results = self.jersey_ocr_universal_v5_model(enhanced, conf=effective_conf, verbose=False)[0]
             for box in results.boxes:
                 name = self.jersey_ocr_universal_v5_model.names[int(box.cls)]
                 num = self._parse_number(name)
@@ -1171,6 +1486,7 @@ class RoboflowDetector:
                     })
         except Exception as e:
             logger.debug("v5 OCR error: %s", e)
+        self._track_model_call("jersey_ocr_universal_v5", len(dets))
         return dets
 
     def detect_players_v5(

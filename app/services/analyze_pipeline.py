@@ -158,6 +158,16 @@ async def run_analyze_pipeline(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
+        # ── Step 2a: Load context-aware models for this request ──────────
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.reset_request_tracking()
+            roboflow_detector._request_jersey_color = jersey_color
+            request_models = roboflow_detector.load_for_request(sport, jersey_color)
+            LOGGER.info("Pipeline: loaded %d models for sport=%s color=%s", len(request_models), sport, jersey_color)
+        except Exception as exc:
+            LOGGER.warning("Pipeline: load_for_request failed (non-fatal): %s", exc)
+
         # ── Step 2: Ali's ensemble is DEFERRED to Step 7.5e (last resort) ──
         jersey_detections: list[dict] = []
         ali_status = "deferred"  # Will run ONLY if other layers find <3 detections
@@ -342,11 +352,48 @@ async def run_analyze_pipeline(
                 layer_timings["pose_estimation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
-        # OCR confidence threshold — lower in aggressive mode for compressed video
-        ocr_conf = 0.15 if resolved_quality == "aggressive" else 0.2
+        # OCR confidence threshold — lower in aggressive mode or dark jerseys
+        from app.services.roboflow_detector import is_dark_color, is_navy
+        _is_dark_jersey = is_dark_color(jersey_color)
+        _is_navy_jersey = is_navy(jersey_color)
+        if _is_navy_jersey:
+            ocr_conf = 0.12
+        elif _is_dark_jersey:
+            ocr_conf = 0.15
+        elif resolved_quality == "aggressive":
+            ocr_conf = 0.15
+        else:
+            ocr_conf = 0.2
 
         # Use live_frames (dead ball filtered) for OCR steps, all frames for motion
         ocr_frames = live_frames if live_frames else frames
+
+        # ── Frame preprocessing for dark/navy jerseys ──────────────────
+        if _is_dark_jersey and ocr_frames:
+            LOGGER.info("Pipeline: applying dark jersey preprocessing (navy=%s)", _is_navy_jersey)
+            preprocessed: list[tuple[float, np.ndarray]] = []
+            for t, frame in ocr_frames:
+                h, w = frame.shape[:2]
+                # Upscale small frames
+                if w < 1280:
+                    scale = 1280 / w
+                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+                # CLAHE for dark jerseys
+                clip_limit = 5.0 if _is_navy_jersey else 4.0
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                # Gamma boost for dark jerseys
+                gamma = 1.5 if _is_navy_jersey else 1.3
+                inv_gamma = 1.0 / gamma
+                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+                frame = cv2.LUT(frame, table)
+                # Unsharp mask
+                gaussian = cv2.GaussianBlur(frame, (0, 0), 2.0)
+                frame = cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
+                preprocessed.append((t, frame))
+            ocr_frames = preprocessed
 
         # ── Step 7.5a: v5 OCR + v5 player detector (PRIMARY) ──────────
         v5_ocr_detections: list[dict] = []
@@ -777,15 +824,20 @@ async def run_analyze_pipeline(
         try:
             from app.services.temporal_consensus import TemporalConsensus
 
-            # Aggressive mode: relax temporal consensus for low-quality video
-            if resolved_quality == "aggressive":
+            # Relaxed temporal consensus — 2 confirmations in 3s window
+            # Aggressive mode (low quality or dark jerseys) → even more relaxed
+            if resolved_quality == "aggressive" or _is_dark_jersey:
                 tc_instance = TemporalConsensus(
                     min_confirmations=1,
                     time_window=3.0,
-                    confidence_threshold=0.3,
+                    confidence_threshold=0.2,
                 )
             else:
-                tc_instance = TemporalConsensus()  # default: min=3, window=2.0, thresh=0.5
+                tc_instance = TemporalConsensus(
+                    min_confirmations=2,
+                    time_window=3.0,
+                    confidence_threshold=0.3,
+                )
 
             if all_layer_dets:
                 confirmed_dets = tc_instance.filter_detections(
@@ -1013,6 +1065,39 @@ async def run_analyze_pipeline(
         except Exception:
             primary_layer = "unknown"
 
+        # Get per-request model tracking
+        request_summary = {}
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            request_summary = roboflow_detector.get_request_summary()
+        except Exception:
+            pass
+
+        # Memory info
+        memory_rss_mb = 0
+        try:
+            import psutil
+            memory_rss_mb = round(psutil.Process().memory_info().rss / 1024 / 1024)
+        except Exception:
+            pass
+
+        # ── Detection summary log ──────────────────────────────────────
+        target_found = jersey_number in all_numbers_seen
+        LOGGER.info("=== DETECTION SUMMARY ===")
+        LOGGER.info("Sport: %s, Jersey: #%d, Color: %s", sport, jersey_number, jersey_color)
+        LOGGER.info("Frames processed: %d", len(frames))
+        LOGGER.info("Models called this request: %s", request_summary.get("models_called", []))
+        LOGGER.info("Detections per model:")
+        for model_name, count in request_summary.get("detections_per_model", {}).items():
+            LOGGER.info("  %s: %d detections", model_name, count)
+        LOGGER.info("Numbers detected: %s", sorted(all_numbers_seen))
+        LOGGER.info("Target number #%d found: %s", jersey_number, target_found)
+        LOGGER.info("Clips before filter: %d", len(clips))
+        LOGGER.info("Clips after filter: %d", len(clips_out))
+        LOGGER.info("Final clips: %d", len(clips_out))
+        LOGGER.info("Memory RSS: %dMB", memory_rss_mb)
+        LOGGER.info("=========================")
+
         debug = {
             "primary_layer": primary_layer,
             "ali_detections": len(jersey_detections),
@@ -1026,6 +1111,8 @@ async def run_analyze_pipeline(
             "combined_detections": len(detection_points),
             "numbers_detected": sorted(str(n) for n in all_numbers_seen),
             "target_jersey_number": jersey_number,
+            "target_number_found": target_found,
+            "frames_with_target": sum(1 for d in all_layer_dets if d.get("number_detected") == jersey_number),
             "wrong_number_filtered": wrong_number_count,
             "analyze_fps": ANALYZE_FPS,
             "frames_extracted": len(frames),
@@ -1044,6 +1131,11 @@ async def run_analyze_pipeline(
             "layer_breakdown": layer_timings,
             "temporal_consensus": tc_stats,
             "cross_layer_agreements": cross_layer_agreements,
+            "models_called": request_summary.get("models_called", []),
+            "detections_per_model": request_summary.get("detections_per_model", {}),
+            "clips_before_filter": len(clips),
+            "clips_after_filter": len(clips_out),
+            "memory_rss_mb": memory_rss_mb,
         }
 
         return {
@@ -1061,6 +1153,12 @@ async def run_analyze_pipeline(
         }
 
     finally:
+        # Unload request-specific models to free memory
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.unload_request_models()
+        except Exception:
+            pass
         # Cleanup temp files
         if tmp_dir and tmp_dir.exists():
             try:

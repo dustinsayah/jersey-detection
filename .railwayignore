@@ -1,7 +1,53 @@
-# Skip large files for railway up
-# NOTE: app/model/*.pt (172MB) MUST be included — COPY app /app/app needs them
-# app/model/public/ (1.4GB) is downloaded during Docker build by bootstrap_public_reader.py
+# Skip large files for railway up — keep under 500MB
+# Only include: 7 core models + color classifier + isolator + region detector + upscaler + 9 small models = ~465MB
+# Everything else downloaded on-demand or handled by fallback logic
 app/model/public/
+app/model/videomae_basketball_v5/
+app/model/videomae_football_v5/
+app/model/videomae_lacrosse_v5/
+# v4 outcome models (50MB each × 20 = 1GB)
+app/model/basketball_hoop_detector_v4.pt
+app/model/basketball_made_shot_v4.pt
+app/model/basketball_scoring_zone_v4.pt
+app/model/basketball_dribble_drive_v4.pt
+app/model/basketball_rebound_v4.pt
+app/model/football_completion_detector_v4.pt
+app/model/football_touchdown_detector_v4.pt
+app/model/football_sack_detector_v4.pt
+app/model/football_reception_yac_v4.pt
+app/model/football_qb_scramble_v4.pt
+app/model/lacrosse_goal_detector_v4.pt
+app/model/lacrosse_shot_quality_v4.pt
+app/model/lacrosse_ground_ball_v4.pt
+app/model/crowd_energy_detector_v4.pt
+app/model/night_game_specialist_v4.pt
+app/model/indoor_court_specialist_v4.pt
+app/model/crowd_obstruction_specialist_v4.pt
+app/model/helmet_glare_specialist_v4.pt
+app/model/low_resolution_specialist_v4.pt
+app/model/multi_player_cluster_v4.pt
+# v3 specialist models (50MB each × 4 = 200MB) — pipeline falls back to v5 OCR
+app/model/dark_jersey_specialist_v3.pt
+app/model/motion_blur_specialist_v3.pt
+app/model/partial_visibility_specialist_v3.pt
+app/model/wide_angle_specialist_v3.pt
+# v3 OCR fallbacks (50MB each × 5 = 250MB) — universal v5 OCR handles these
+app/model/basketball_ocr_v3.pt
+app/model/football_ocr_v3.pt
+app/model/lacrosse_ocr_v3.pt
+app/model/jersey_ocr_v3_primary.pt
+app/model/jersey_ocr_v3_secondary.pt
+# v2 ball/action/zone models — never called in inference
+app/model/basketball_ball_detector.pt
+app/model/football_ball_detector.pt
+app/model/lacrosse_ball_detector.pt
+app/model/basketball_action_detector.pt
+app/model/basketball_court_zones.pt
+# Unused/redundant models
+app/model/basketball_jersey_ocr.pt
+app/model/basketball_jersey_number_v3.pt
+app/model/basketball_player_detector_v2.pt
+app/model/lacrosse_detector_v2.pt
 external/
 notebooks/
 tests/

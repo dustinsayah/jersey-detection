@@ -47,8 +47,9 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
 # Memory limits (MB) — configurable via env vars
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "6000"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "4500"))
+# Railway gives 8GB. Reserve 2-3GB for video frames, inference, OS.
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "4500"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "3500"))
 
 # Navy / dark color aliases for preprocessing and model selection
 NAVY_ALIASES = [
@@ -364,6 +365,15 @@ class RoboflowDetector:
         Returns list of model names that were loaded for this request.
         Keeps essential v5 models always loaded, adds sport-specific and
         condition-specific models on demand.
+
+        Loading priority (stops when memory limit reached):
+          1. v5 core (already loaded at startup)
+          2. Player isolator + color classifier + number region detector
+          3. Sport-specific OCR fallback
+          4. v5 outcome classifier for this sport
+          5. v2 universal OCR
+          6. Dark jersey specialists (if applicable)
+          7. v4 outcome models (only if memory allows — v5 classifier covers most cases)
         """
         self.load()  # Ensure base v5 models are loaded
 
@@ -371,7 +381,7 @@ class RoboflowDetector:
         is_navy_jersey = is_navy(jersey_color)
         sl = sport.lower()
 
-        # Always needed
+        # Priority 1: Always needed (v5 core already loaded, these add v3 helpers)
         to_load = [
             "jersey_ocr_universal_v5",
             "player_detector_v5",
@@ -379,53 +389,32 @@ class RoboflowDetector:
             "player_isolator_v3",
             "jersey_color_classifier_v3",
             "number_region_detector_v3",
-            "jersey_ocr_v3_primary",
         ]
 
-        # Sport-specific OCR
+        # Priority 2: Sport-specific v5 outcome classifier
+        sport_outcome_cls = {
+            "football": "outcome_cls_football_v5",
+            "basketball": "outcome_cls_basketball_v5",
+            "lacrosse": "outcome_cls_lacrosse_v5",
+        }
+        if sl in sport_outcome_cls:
+            to_load.append(sport_outcome_cls[sl])
+
+        # Priority 3: Sport-specific OCR fallback (1-2 models only)
         sport_ocr = {
-            "football": ["football_ocr_v3", "jersey_ocr_v3_secondary", "football_positions_detector",
-                         "football_digit_detector", "football_player_detector", "football_jersey_tracker"],
-            "basketball": ["basketball_ocr_v3", "basketball_jersey_number_v2", "jersey_ocr_v3_secondary"],
-            "lacrosse": ["lacrosse_ocr_v3", "jersey_ocr_v3_secondary"],
+            "football": ["football_ocr_v3", "football_digit_detector"],
+            "basketball": ["basketball_ocr_v3"],
+            "lacrosse": ["lacrosse_ocr_v3"],
         }
         to_load += sport_ocr.get(sl, [])
 
-        # Sport-specific outcome models
-        sport_outcomes = {
-            "football": [
-                "football_completion_detector_v4", "football_touchdown_detector_v4",
-                "football_sack_detector_v4", "football_reception_yac_v4",
-                "football_qb_scramble_v4", "outcome_cls_football_v5",
-            ],
-            "basketball": [
-                "basketball_hoop_detector_v4", "basketball_made_shot_v4",
-                "basketball_scoring_zone_v4", "basketball_dribble_drive_v4",
-                "basketball_rebound_v4", "outcome_cls_basketball_v5",
-            ],
-            "lacrosse": [
-                "lacrosse_goal_detector_v4", "lacrosse_shot_quality_v4",
-                "lacrosse_ground_ball_v4", "outcome_cls_lacrosse_v5",
-            ],
-        }
-        to_load += sport_outcomes.get(sl, [])
-
-        # Universal v2 OCR (always helpful)
+        # Priority 4: Universal v2 OCR (small models, ~6MB each)
         to_load += ["jersey_number_universal_v1", "jersey_number_universal_v2"]
 
-        # Cross-sport
-        to_load += ["crowd_energy_detector_v4"]
-
-        # Dark/navy jersey specialists — load FIRST priority for dark jerseys
+        # Priority 5: Dark jersey specialists (if applicable)
         if is_dark or is_navy_jersey:
-            # Insert dark specialists at high priority
-            dark_models = [
-                "dark_jersey_specialist_v3",
-                "night_game_specialist_v4",
-                "helmet_glare_specialist_v4",
-                "low_resolution_specialist_v4",
-            ]
-            to_load = dark_models + to_load
+            dark_models = ["dark_jersey_specialist_v3"]
+            to_load = to_load[:6] + dark_models + to_load[6:]
 
         loaded_models: list[str] = []
         for model_name in to_load:
@@ -457,8 +446,8 @@ class RoboflowDetector:
                     )
 
         logger.info(
-            "load_for_request: %d models loaded for sport=%s color=%s (dark=%s navy=%s)",
-            len(loaded_models), sport, jersey_color, is_dark, is_navy_jersey,
+            "load_for_request: %d models loaded for sport=%s color=%s (dark=%s navy=%s RSS=%.0fMB)",
+            len(loaded_models), sport, jersey_color, is_dark, is_navy_jersey, self._get_rss_mb(),
         )
         return loaded_models
 
@@ -490,18 +479,15 @@ class RoboflowDetector:
             )
 
     def load(self):
-        """Lazy-load all models on first use.
+        """Lazy-load ESSENTIAL models on first use.
 
-        Loading order: v5 FIRST (primary), v3, v2, v4, v1, Ali LAST.
-        Memory check after each group — Ali gets evicted first if pressure.
+        Only loads v5 core models at startup (~1.5GB RSS).
+        All v3/v2/v4/v1 models are loaded on-demand by load_for_request().
         """
         if self._loaded:
             return
 
-        # ── PRIORITY GROUP 1a: v5 LIGHTWEIGHT models (classifier + upscaler only) ──
-        # NOTE: YOLO11m models are ~330MB each in RAM. On Railway (8GB limit),
-        # loading 3+ v5 models + video processing causes OOM. Only load the
-        # lightweight dead_ball classifier here. OCR via Ali ensemble is primary.
+        # ── v5 LIGHTWEIGHT models (classifier + upscaler only) ──
         _v5_lightweight = {
             "dead_ball_classifier_v5.pt": "dead_ball_classifier_v5_model",
         }
@@ -512,7 +498,7 @@ class RoboflowDetector:
             else:
                 logger.info("v5 model pending: %s", filename)
 
-        # ── PRIORITY GROUP 1b: v5 HEAVY models (loaded if memory allows) ──
+        # ── v5 HEAVY models (loaded if memory allows) ──
         _v5_heavy = {
             "jersey_ocr_universal_v5.pt": "jersey_ocr_universal_v5_model",
             "player_detector_v5.pt": "player_detector_v5_model",
@@ -521,7 +507,6 @@ class RoboflowDetector:
             "outcome_classifier_lacrosse_v5.pt": "outcome_cls_lacrosse_v5_model",
             "scoreboard_detector_v5.pt": "scoreboard_detector_v5_model",
         }
-        _v5_yolo_models = {**_v5_lightweight, **_v5_heavy}
         if self._memory_ok_for_loading("v5-lightweight"):
             for filename, attr in _v5_heavy.items():
                 path = os.path.join(MODEL_DIR, filename)
@@ -545,149 +530,17 @@ class RoboflowDetector:
             logger.info("Jersey SR import failed: %s — bicubic fallback", exc)
             self._jersey_upscaler = None
 
-        if not self._memory_ok_for_loading("v5"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, {}, {}, {}, {}, {}, {})
-            return
-
-        # ── v5 VideoMAE models (HuggingFace dirs, loaded on demand) ──
-        _v5_videomae_dirs = {
-            "videomae_basketball_v5": "videomae_basketball_v5",
-            "videomae_football_v5": "videomae_football_v5",
-            "videomae_lacrosse_v5": "videomae_lacrosse_v5",
-        }
-        for dirname, attr in _v5_videomae_dirs.items():
-            dirpath = os.path.join(MODEL_DIR, dirname)
-            if os.path.isdir(dirpath):
-                setattr(self, attr, dirpath)
-                logger.info("v5 VideoMAE dir found: %s", dirname)
-            else:
-                logger.info("v5 VideoMAE pending: %s/", dirname)
-
-        if not self._memory_ok_for_loading("v5-videomae"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, {}, {}, {}, {}, {}, _v5_videomae_dirs)
-            return
-
-        # ── PRIORITY GROUP 2: v3 OCR models (secondary confirmation) ──
-        _v3_ocr_models = {
-            "jersey_ocr_v3_primary.pt": "jersey_ocr_v3_primary_model",
-            "jersey_ocr_v3_secondary.pt": "jersey_ocr_v3_secondary_model",
-            "basketball_ocr_v3.pt": "basketball_ocr_v3_model",
-            "football_ocr_v3.pt": "football_ocr_v3_model",
-            "lacrosse_ocr_v3.pt": "lacrosse_ocr_v3_model",
-            "player_isolator_v3.pt": "player_isolator_v3_model",
-            "jersey_color_classifier_v3.pt": "jersey_color_classifier_v3_model",
-            "number_region_detector_v3.pt": "number_region_detector_v3_model",
-            "motion_blur_specialist_v3.pt": "motion_blur_specialist_v3_model",
-            "wide_angle_specialist_v3.pt": "wide_angle_specialist_v3_model",
-            "dark_jersey_specialist_v3.pt": "dark_jersey_specialist_v3_model",
-            "partial_visibility_specialist_v3.pt": "partial_visibility_specialist_v3_model",
-        }
-        for filename, attr in _v3_ocr_models.items():
-            path = os.path.join(MODEL_DIR, filename)
-            if os.path.exists(path):
-                setattr(self, attr, _load_model(filename))
-            else:
-                logger.info("v3 OCR model pending: %s", filename)
-
-        if not self._memory_ok_for_loading("v3"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, _v3_ocr_models, {}, {}, {}, {}, _v5_videomae_dirs)
-            return
-
-        # ── PRIORITY GROUP 3: v2 models (tertiary — 0.995 mAP50 universal) ──
-        _v2_models = {
-            "basketball_jersey_number_v2.pt": "basketball_jersey_number_v2_model",
-            "basketball_jersey_number_v3.pt": "basketball_jersey_number_v3_model",
-            "basketball_player_detector_v2.pt": "basketball_player_detector_v2_model",
-            "football_positions_detector.pt": "football_positions_model",
-            "football_presnap_detector.pt": "football_presnap_model",
-            "jersey_number_universal_v1.pt": "jersey_number_universal_v1_model",
-            "jersey_number_universal_v2.pt": "jersey_number_universal_v2_model",
-            "lacrosse_detector_v1.pt": "lacrosse_v1_model",
-            "lacrosse_detector_v2.pt": "lacrosse_v2_model",
-        }
-        for filename, attr in _v2_models.items():
-            path = os.path.join(MODEL_DIR, filename)
-            if os.path.exists(path):
-                setattr(self, attr, _load_model(filename))
-            else:
-                logger.info("v2 model pending: %s", filename)
-
-        if not self._memory_ok_for_loading("v2"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, _v3_ocr_models, _v2_models, {}, {}, {}, _v5_videomae_dirs)
-            return
-
-        # ── v2 ball/action/zone models ──
-        _v2_baz_models = {
-            "basketball_ball_detector.pt": "basketball_ball_detector_model",
-            "football_ball_detector.pt": "football_ball_detector_model",
-            "lacrosse_ball_detector.pt": "lacrosse_ball_detector_model",
-            "basketball_action_detector.pt": "basketball_action_detector_model",
-            "basketball_court_zones.pt": "basketball_court_zones_model",
-        }
-        for filename, attr in _v2_baz_models.items():
-            path = os.path.join(MODEL_DIR, filename)
-            if os.path.exists(path):
-                setattr(self, attr, _load_model(filename))
-            else:
-                logger.info("v2 ball/action/zone model pending: %s", filename)
-
-        if not self._memory_ok_for_loading("v2-baz"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, _v3_ocr_models, _v2_models, _v2_baz_models, {}, {}, _v5_videomae_dirs)
-            return
-
-        # ── PRIORITY GROUP 4: v4 outcome models ──
-        _v4_outcome_models = {
-            "basketball_hoop_detector_v4.pt": "basketball_hoop_detector_v4_model",
-            "basketball_made_shot_v4.pt": "basketball_made_shot_v4_model",
-            "basketball_scoring_zone_v4.pt": "basketball_scoring_zone_v4_model",
-            "basketball_dribble_drive_v4.pt": "basketball_dribble_drive_v4_model",
-            "basketball_rebound_v4.pt": "basketball_rebound_v4_model",
-            "football_completion_detector_v4.pt": "football_completion_detector_v4_model",
-            "football_touchdown_detector_v4.pt": "football_touchdown_detector_v4_model",
-            "football_sack_detector_v4.pt": "football_sack_detector_v4_model",
-            "football_reception_yac_v4.pt": "football_reception_yac_v4_model",
-            "football_qb_scramble_v4.pt": "football_qb_scramble_v4_model",
-            "lacrosse_goal_detector_v4.pt": "lacrosse_goal_detector_v4_model",
-            "lacrosse_shot_quality_v4.pt": "lacrosse_shot_quality_v4_model",
-            "lacrosse_ground_ball_v4.pt": "lacrosse_ground_ball_v4_model",
-            "crowd_energy_detector_v4.pt": "crowd_energy_detector_v4_model",
-            "night_game_specialist_v4.pt": "night_game_specialist_v4_model",
-            "indoor_court_specialist_v4.pt": "indoor_court_specialist_v4_model",
-            "crowd_obstruction_specialist_v4.pt": "crowd_obstruction_specialist_v4_model",
-            "helmet_glare_specialist_v4.pt": "helmet_glare_specialist_v4_model",
-            "low_resolution_specialist_v4.pt": "low_resolution_specialist_v4_model",
-            "multi_player_cluster_v4.pt": "multi_player_cluster_v4_model",
-        }
-        for filename, attr in _v4_outcome_models.items():
-            path = os.path.join(MODEL_DIR, filename)
-            if os.path.exists(path):
-                setattr(self, attr, _load_model(filename))
-            else:
-                logger.info("v4 outcome model pending: %s", filename)
-
-        if not self._memory_ok_for_loading("v4"):
-            self._loaded = True
-            self._log_load_summary(_v5_yolo_models, _v3_ocr_models, _v2_models, _v2_baz_models, _v4_outcome_models, {}, _v5_videomae_dirs)
-            return
-
-        # ── PRIORITY GROUP 5: v1 models (legacy football, load last before Ali) ──
-        _v1_models_map = {}
-        self.football_digit_model = _load_model("football_digit_detector.pt")
-        self.football_player_model = _load_model("football_player_detector.pt")
-        self.football_tracker_model = _load_model("football_jersey_tracker.pt")
-        # basketball_jersey_ocr.pt — DISABLED: mAP50 0.10
-        self.basketball_jersey_model = None
+        # v3/v2/v4/v1 models are NOT loaded at startup — load_for_request() handles them
+        # This keeps startup RSS under 2GB so there's room for per-request model loading
+        _v5_yolo_models = {**_v5_lightweight, **_v5_heavy}
+        v5_loaded = sum(1 for attr in _v5_yolo_models.values() if getattr(self, attr, None) is not None)
+        logger.info(
+            "load() complete: %d/%d v5 models loaded, RSS=%.0fMB. "
+            "v3/v2/v4 models deferred to load_for_request().",
+            v5_loaded, len(_v5_yolo_models), self._get_rss_mb(),
+        )
 
         self._loaded = True
-        self._log_load_summary(
-            _v5_yolo_models, _v3_ocr_models, _v2_models,
-            _v2_baz_models, _v4_outcome_models, _v1_models_map, _v5_videomae_dirs,
-        )
 
     def _log_load_summary(self, v5_map, v3_map, v2_map, v2baz_map, v4_map, v1_map, vmae_map):
         """Log model load counts."""

@@ -102,9 +102,13 @@ async def _lifespan(application: FastAPI):
     _configure_logging()
     application.state.detector_ready = False
     application.state.startup_error = None
-    LOGGER.info("App starting — launching model warmup in background thread")
-    thread = threading.Thread(target=_warmup_models, args=(application,), daemon=True)
-    thread.start()
+
+    if os.getenv("SKIP_MODEL_WARMUP", "").lower() in ("1", "true", "yes"):
+        LOGGER.info("SKIP_MODEL_WARMUP set — skipping all model loading at startup")
+    else:
+        LOGGER.info("App starting — launching model warmup in background thread")
+        thread = threading.Thread(target=_warmup_models, args=(application,), daemon=True)
+        thread.start()
     yield
 
 

@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
 # Memory limits (MB) — configurable via env vars
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "6000"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "5000"))
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "4500"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "3000"))
 
 
 def _load_model(filename: str):

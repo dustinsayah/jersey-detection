@@ -352,7 +352,7 @@ async def run_analyze_pipeline(
                 layer_timings["pose_estimation"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: pose estimation failed: %s", exc)
 
-        # OCR confidence threshold — lower in aggressive mode or dark jerseys
+        # OCR confidence threshold — lower for dark jerseys, football, aggressive mode
         from app.services.roboflow_detector import is_dark_color, is_navy
         _is_dark_jersey = is_dark_color(jersey_color)
         _is_navy_jersey = is_navy(jersey_color)
@@ -360,10 +360,12 @@ async def run_analyze_pipeline(
             ocr_conf = 0.12
         elif _is_dark_jersey:
             ocr_conf = 0.15
+        elif sport.lower() == "football":
+            ocr_conf = FOOTBALL_CONF_THRESHOLD  # 0.15 — smaller numbers on helmets/distance
         elif resolved_quality == "aggressive":
             ocr_conf = 0.15
         else:
-            ocr_conf = 0.2
+            ocr_conf = 0.18  # Lowered from 0.2 for better recall
 
         # Use live_frames (dead ball filtered) for OCR steps, all frames for motion
         ocr_frames = live_frames if live_frames else frames
@@ -395,7 +397,7 @@ async def run_analyze_pipeline(
                 preprocessed.append((t, frame))
             ocr_frames = preprocessed
 
-        # ── Step 7.5a: v5 OCR + v5 player detector (PRIMARY) ──────────
+        # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
         v5_ocr_detections: list[dict] = []
         t0 = time.perf_counter()
         try:
@@ -405,10 +407,35 @@ async def run_analyze_pipeline(
             if ocr_frames:
                 LOGGER.info("Pipeline: v5 OCR layer (PRIMARY) running on %d live frames", len(ocr_frames))
                 for t, frame in ocr_frames:
-                    dets = roboflow_detector.detect_jersey_v5(
-                        frame, jersey_number=jersey_number, conf=ocr_conf,
-                    )
-                    v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                    # First: detect players in the frame
+                    players = roboflow_detector.detect_players_v5(frame, conf=0.25)
+                    if players:
+                        # Run OCR on each player crop (much better than full frame)
+                        for player in players:
+                            x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
+                            h, w = frame.shape[:2]
+                            # Pad crop by 10% for context
+                            pad_x = int((x2 - x1) * 0.1)
+                            pad_y = int((y2 - y1) * 0.1)
+                            cx1 = max(0, x1 - pad_x)
+                            cy1 = max(0, y1 - pad_y)
+                            cx2 = min(w, x2 + pad_x)
+                            cy2 = min(h, y2 + pad_y)
+                            crop = frame[cy1:cy2, cx1:cx2]
+                            if crop.size == 0:
+                                continue
+                            dets = roboflow_detector.detect_jersey_v5(
+                                crop, jersey_number=jersey_number, conf=ocr_conf,
+                                skip_preprocess=True,
+                            )
+                            v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                    else:
+                        # Fallback: run OCR on full frame if no players found
+                        dets = roboflow_detector.detect_jersey_v5(
+                            frame, jersey_number=jersey_number, conf=ocr_conf,
+                            skip_preprocess=True,
+                        )
+                        v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
                 if v5_ocr_detections:
                     phases_used.append("v5_ocr_detection")
             layer_timings["v5_ocr_detection"] = {
@@ -870,27 +897,36 @@ async def run_analyze_pipeline(
                     for cd in confirmed_dets:
                         confirmed_timestamps.add(cd.get("timestamp", 0))
                     pre_filter_count = len(detection_points)
-                    detection_points = [
+                    # Widen timestamp matching to 1.5s (was 0.5s)
+                    filtered_dp = [
                         dp for dp in detection_points
                         if any(
-                            abs(dp.timestamp - cts) < 0.5
+                            abs(dp.timestamp - cts) < 1.5
                             for cts in confirmed_timestamps
                         )
                     ]
-                    if len(detection_points) < pre_filter_count:
+                    # Only apply filter if it keeps at least some detections
+                    if filtered_dp:
+                        detection_points = filtered_dp
                         LOGGER.info(
                             "Pipeline: temporal consensus reduced detection_points "
                             "%d → %d",
                             pre_filter_count, len(detection_points),
                         )
-                elif detection_points:
-                    # Consensus found 0 confirmed — drop all detection points
+                    else:
+                        LOGGER.warning(
+                            "Pipeline: temporal consensus timestamp match found 0 "
+                            "of %d — keeping original detection_points",
+                            pre_filter_count,
+                        )
+                else:
+                    # Consensus found 0 confirmed — keep detection_points anyway
+                    # The jitter filter in clip_extractor handles false positives
                     LOGGER.warning(
-                        "Pipeline: temporal consensus confirmed 0 of %d "
-                        "detection_points — clearing all (likely false positives)",
-                        len(detection_points),
+                        "Pipeline: temporal consensus confirmed 0 of %d raw — "
+                        "keeping %d detection_points (jitter filter will handle FPs)",
+                        len(all_layer_dets), len(detection_points),
                     )
-                    detection_points = []
 
         except Exception as exc:
             LOGGER.warning("Pipeline: temporal consensus failed (non-fatal): %s", exc)
@@ -1273,19 +1309,13 @@ def _extract_frames(
         if frame_idx % frame_interval == 0:
             timestamp = frame_idx / video_fps
 
-            # Upscale + CLAHE + unsharp mask for ALL sports when low-res
+            # Upscale low-res video to ~1280px width for better detection
+            # NOTE: CLAHE/unsharp moved to dark jersey preprocessing block
+            # to avoid double-preprocessing. Clean frames work better for v5 OCR.
             h, w = frame.shape[:2]
-            if w < 1920:
-                scale = min(2.0, 1920 / w)
+            if w < 1280:
+                scale = min(2.0, 1280 / w)
                 frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                # CLAHE contrast enhancement
-                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            # Unsharp mask — sharpen digit edges degraded by YouTube compression
-            blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=3)
-            frame = cv2.addWeighted(frame, 1.5, blurred, -0.5, 0)
 
             frames.append((timestamp, frame))
 

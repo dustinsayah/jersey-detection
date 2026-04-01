@@ -644,7 +644,11 @@ class RoboflowDetector:
     def _check_adjacent_digits(
         self, target: int, all_boxes, model
     ) -> bool:
-        """Check if two adjacent single-digit detections form the target number."""
+        """Check if two adjacent single-digit detections form the target number.
+
+        Uses relative adjacency (box width * 3) instead of fixed 100px
+        to handle preprocessing upscaling.
+        """
         if target < 10:
             return False
         target_str = str(target)
@@ -657,10 +661,21 @@ class RoboflowDetector:
 
         for i, (d1, b1) in enumerate(single_digits):
             for d2, b2 in single_digits[i + 1 :]:
-                # Check horizontal adjacency (within 100px)
-                if abs(b1[0] - b2[0]) < 100:
-                    if str(d1) + str(d2) == target_str or str(d2) + str(d1) == target_str:
-                        return True
+                # Relative adjacency: within 3x the average box width
+                w1 = b1[2] - b1[0]
+                w2 = b2[2] - b2[0]
+                max_gap = max(w1, w2) * 3.0
+                # Check horizontal center distance
+                cx1 = (b1[0] + b1[2]) / 2
+                cx2 = (b2[0] + b2[2]) / 2
+                if abs(cx1 - cx2) < max_gap:
+                    # Also check vertical alignment (within 2x height)
+                    cy1 = (b1[1] + b1[3]) / 2
+                    cy2 = (b2[1] + b2[3]) / 2
+                    h_avg = ((b1[3] - b1[1]) + (b2[3] - b2[1])) / 2
+                    if abs(cy1 - cy2) < h_avg * 2:
+                        if str(d1) + str(d2) == target_str or str(d2) + str(d1) == target_str:
+                            return True
         return False
 
     def detect_football_digits(
@@ -1188,8 +1203,12 @@ class RoboflowDetector:
     def _maybe_upscale(self, crop: np.ndarray) -> np.ndarray:
         """Upscale small jersey crops before OCR. Returns crop unchanged if large enough."""
         h, w = crop.shape[:2]
-        if max(h, w) <= 64 and self._jersey_upscaler is not None:
+        # SR upscaler for very small crops (jersey number region)
+        if max(h, w) <= 128 and self._jersey_upscaler is not None:
             return self._jersey_upscaler.upscale(crop)
+        # Bicubic 2x for medium crops
+        if max(h, w) <= 200:
+            return cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
         return crop
 
     # ── Dead ball classifier ───────────────────────────────────────────────
@@ -1311,8 +1330,13 @@ class RoboflowDetector:
         crop: np.ndarray,
         jersey_number: int,
         conf: float = 0.2,
+        skip_preprocess: bool = False,
     ) -> list[dict]:
-        """Run jersey_ocr_universal_v5 on a crop. Returns [] if model not loaded."""
+        """Run jersey_ocr_universal_v5 on a crop. Returns [] if model not loaded.
+
+        Args:
+            skip_preprocess: If True, skip _preprocess() (frames already preprocessed by pipeline).
+        """
         self.load()
         if self.jersey_ocr_universal_v5_model is None:
             return []
@@ -1320,8 +1344,15 @@ class RoboflowDetector:
 
         dets: list[dict] = []
         try:
-            upscaled_crop = self._maybe_upscale(crop)
-            enhanced = self._preprocess(upscaled_crop)
+            if skip_preprocess:
+                # Frames already preprocessed by pipeline — just upscale small crops
+                h, w = crop.shape[:2]
+                if max(h, w) < 128:
+                    crop = cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+                enhanced = crop
+            else:
+                upscaled_crop = self._maybe_upscale(crop)
+                enhanced = self._preprocess(upscaled_crop)
             # Lower confidence for dark jerseys
             effective_conf = min(conf, 0.12) if is_dark_color(self._request_jersey_color) else conf
             results = self.jersey_ocr_universal_v5_model(enhanced, conf=effective_conf, verbose=False)[0]
@@ -1395,7 +1426,16 @@ class RoboflowDetector:
 
         try:
             results = model(frame, conf=conf, verbose=False)[0]
-            if results.boxes and len(results.boxes) > 0:
+            # Handle both classify models (probs) and detect models (boxes)
+            if hasattr(results, 'probs') and results.probs is not None:
+                # Classification model output
+                top_class = results.probs.top1
+                top_conf = float(results.probs.top1conf)
+                if top_conf >= conf:
+                    class_name = model.names[top_class]
+                    return class_name.lower().replace(" ", "_")
+            elif results.boxes and len(results.boxes) > 0:
+                # Detection model output
                 best = max(results.boxes, key=lambda b: float(b.conf))
                 class_name = model.names[int(best.cls)]
                 return class_name.lower().replace(" ", "_")

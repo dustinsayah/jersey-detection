@@ -119,13 +119,13 @@ def extract_clips(
     if len(sorted_dets) >= 3:
         filtered_dets: list[DetectionPoint] = []
         for det in sorted_dets:
-            # Count detections within 1 second of this one
+            # Count detections within 2 seconds of this one (was 1s)
             neighbors = sum(
                 1 for d in sorted_dets
-                if d is not det and abs(d.timestamp - det.timestamp) <= 1.0
+                if d is not det and abs(d.timestamp - det.timestamp) <= 2.0
             )
-            # Keep if: has a neighbor OR very high confidence
-            if neighbors >= 1 or det.confidence > 0.85:
+            # Keep if: has a neighbor OR moderate-high confidence (was 0.85)
+            if neighbors >= 1 or det.confidence > 0.5:
                 filtered_dets.append(det)
         if filtered_dets:
             jitter_removed = len(sorted_dets) - len(filtered_dets)

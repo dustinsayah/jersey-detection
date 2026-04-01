@@ -47,10 +47,11 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 
 # Memory limits (MB) — configurable via env vars
-# Railway effective limit ~2.5GB (Ali warmup takes ~600MB).
-# Reserve ~500MB for video frames + inference tensor spikes.
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "2200"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "1800"))
+# Railway kills at ~2300MB RSS. Ali warmup uses ~1100MB.
+# v5 essential models add ~650MB (→ ~1750MB).
+# Leave ~400MB for inference tensors + frame buffers.
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "1900"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "1700"))
 
 # Navy / dark color aliases for preprocessing and model selection
 NAVY_ALIASES = [
@@ -389,7 +390,8 @@ class RoboflowDetector:
             "dead_ball_classifier_v5",
         ]
 
-        # Priority 2: Sport-specific v5 outcome classifier (one model, ~110MB)
+        # Priority 2: Sport-specific v5 outcome classifier (~60MB)
+        # This is the ONLY additional model we load — keeps RSS under 1900MB
         sport_outcome_cls = {
             "football": "outcome_cls_football_v5",
             "basketball": "outcome_cls_basketball_v5",
@@ -398,26 +400,10 @@ class RoboflowDetector:
         if sl in sport_outcome_cls:
             to_load.append(sport_outcome_cls[sl])
 
-        # Priority 3: v3 helpers ONLY if memory allows (each ~110MB)
-        # On tight-memory Railway instances, these get skipped
-        to_load += [
-            "player_isolator_v3",
-            "jersey_color_classifier_v3",
-            "number_region_detector_v3",
-        ]
-
-        # Priority 4: Sport-specific OCR fallback (only if memory allows)
-        sport_ocr = {
-            "football": ["football_ocr_v3"],
-            "basketball": ["basketball_ocr_v3"],
-            "lacrosse": ["lacrosse_ocr_v3"],
-        }
-        to_load += sport_ocr.get(sl, [])
-
-        # Priority 5: Dark jersey specialists (if applicable)
-        if is_dark or is_navy_jersey:
-            dark_models = ["dark_jersey_specialist_v3"]
-            to_load.append(dark_models[0])
+        # v3 helpers, sport-specific OCR, universal v2, and dark jersey
+        # specialists are ALL skipped to stay within Railway's ~2.3GB kill
+        # threshold. The v5 pipeline alone (player_detector + ocr_universal)
+        # provides primary detection capability.
 
         loaded_models: list[str] = []
         for model_name in to_load:

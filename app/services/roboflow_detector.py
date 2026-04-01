@@ -282,22 +282,36 @@ class RoboflowDetector:
         if self._loaded:
             return
 
-        # ── PRIORITY GROUP 1: v5 YOLO models (PRIMARY detection layer) ──
-        _v5_yolo_models = {
+        # ── PRIORITY GROUP 1a: v5 ESSENTIAL models (OCR + dead ball) ──
+        _v5_essential = {
             "jersey_ocr_universal_v5.pt": "jersey_ocr_universal_v5_model",
             "player_detector_v5.pt": "player_detector_v5_model",
-            "outcome_classifier_basketball_v5.pt": "outcome_cls_basketball_v5_model",
-            "outcome_classifier_football_v5.pt": "outcome_cls_football_v5_model",
-            "outcome_classifier_lacrosse_v5.pt": "outcome_cls_lacrosse_v5_model",
-            "scoreboard_detector_v5.pt": "scoreboard_detector_v5_model",
             "dead_ball_classifier_v5.pt": "dead_ball_classifier_v5_model",
         }
-        for filename, attr in _v5_yolo_models.items():
+        for filename, attr in _v5_essential.items():
             path = os.path.join(MODEL_DIR, filename)
             if os.path.exists(path):
                 setattr(self, attr, _load_model(filename))
             else:
                 logger.info("v5 model pending: %s", filename)
+
+        # ── PRIORITY GROUP 1b: v5 OPTIONAL models (outcome classifiers) ──
+        _v5_optional = {
+            "outcome_classifier_basketball_v5.pt": "outcome_cls_basketball_v5_model",
+            "outcome_classifier_football_v5.pt": "outcome_cls_football_v5_model",
+            "outcome_classifier_lacrosse_v5.pt": "outcome_cls_lacrosse_v5_model",
+            "scoreboard_detector_v5.pt": "scoreboard_detector_v5_model",
+        }
+        _v5_yolo_models = {**_v5_essential, **_v5_optional}
+        if self._memory_ok_for_loading("v5-essential"):
+            for filename, attr in _v5_optional.items():
+                path = os.path.join(MODEL_DIR, filename)
+                if os.path.exists(path):
+                    setattr(self, attr, _load_model(filename))
+                else:
+                    logger.info("v5 model pending: %s", filename)
+        else:
+            logger.info("v5 optional models skipped — memory pressure")
 
         # Load jersey super-resolution model (PyTorch .pth, not YOLO)
         try:

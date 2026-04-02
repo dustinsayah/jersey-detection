@@ -70,9 +70,14 @@ def _verify_runtime_dependencies(settings) -> None:
 
 
 def _warmup_models(application: FastAPI) -> None:
-    """Background thread: load models so the first request is faster."""
+    """Background thread: verify deps only. Models loaded on first request.
+
+    Ali detector (jersey_number_yolo11m.pt + yolo26n-seg.pt + public_reader)
+    uses ~1.1GB RSS. Railway OOM-kills at ~2.3GB. Skipping Ali warmup leaves
+    room for Roboflow v5 models (~700MB) + inference tensors (~400MB).
+    Ali detector loads on-demand via /detect endpoint if needed.
+    """
     try:
-        from app.services.detection_detector import get_or_create_detector
         from app.services.detection_runtime import PipelineSettings
 
         settings = PipelineSettings()
@@ -81,14 +86,11 @@ def _warmup_models(application: FastAPI) -> None:
             settings.ffmpeg_binary, settings.yt_dlp_binary,
         )
         _verify_runtime_dependencies(settings)
-        LOGGER.info(
-            "Warmup: loading models (yolo=%s, person=%s, reader=%s)",
-            settings.yolo_model_source, settings.person_model_source,
-            settings.jersey_reader_backend,
-        )
-        get_or_create_detector(settings)
+        # Ali detector NOT loaded at startup — saves ~1.1GB RSS.
+        # /analyze uses Roboflow v5 (loaded on first request).
+        # /detect loads Ali on-demand via get_or_create_detector().
         application.state.detector_ready = True
-        LOGGER.info("Detection stack warmed up — detector_ready=True")
+        LOGGER.info("Warmup complete (deps verified, models deferred) — detector_ready=True")
     except Exception as error:
         application.state.startup_error = str(error)
         LOGGER.exception(

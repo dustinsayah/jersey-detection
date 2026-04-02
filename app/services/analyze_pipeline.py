@@ -214,7 +214,25 @@ async def run_analyze_pipeline(
                         _live.append((ts, frame))
 
                 dead_ball_ratio = dead_ball_count / len(frames) if frames else 0.0
-                if _live:
+                live_ratio = len(_live) / len(frames) if frames else 1.0
+
+                # Safety: if dead ball ratio > 50% OR less than 30% of frames survive,
+                # the classifier is likely miscalibrated — use ALL frames instead.
+                if dead_ball_ratio > 0.5:
+                    LOGGER.warning(
+                        "Pipeline: dead ball ratio %.0f%% exceeds 50%% cap — classifier likely miscalibrated. "
+                        "Using ALL %d frames instead of %d filtered.",
+                        dead_ball_ratio * 100, len(frames), len(_live),
+                    )
+                    live_frames = frames  # override: keep all frames
+                elif live_ratio < 0.3:
+                    LOGGER.warning(
+                        "Pipeline: only %.0f%% frames survived dead ball filter (minimum 30%%). "
+                        "Using ALL %d frames instead of %d filtered.",
+                        live_ratio * 100, len(frames), len(_live),
+                    )
+                    live_frames = frames  # override: keep all frames
+                elif _live:
                     live_frames = _live
                 # If ALL frames are dead ball, keep all frames (something is better than nothing)
                 layer_timings["dead_ball_filter"] = {
@@ -224,10 +242,12 @@ async def run_analyze_pipeline(
                     "total_frames": len(frames),
                     "dead_ratio": round(dead_ball_ratio, 2),
                     "live_frames_for_ocr": len(live_frames),
+                    "filter_bypassed": dead_ball_ratio > 0.5 or live_ratio < 0.3,
                 }
                 LOGGER.info(
-                    "Pipeline: dead ball filter — %d/%d frames skipped (%.0f%%), %d live frames for OCR",
+                    "Pipeline: dead ball filter — %d/%d frames skipped (%.0f%%), %d live frames for OCR%s",
                     dead_ball_count, len(frames), dead_ball_ratio * 100, len(live_frames),
+                    " [BYPASSED — too aggressive]" if (dead_ball_ratio > 0.5 or live_ratio < 0.3) else "",
                 )
             except Exception as exc:
                 layer_timings["dead_ball_filter"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}

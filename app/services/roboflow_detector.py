@@ -400,10 +400,13 @@ class RoboflowDetector:
         if sl in sport_outcome_cls:
             to_load.append(sport_outcome_cls[sl])
 
-        # v3 helpers, sport-specific OCR, universal v2, and dark jersey
-        # specialists are ALL skipped to stay within Railway's ~2.3GB kill
-        # threshold. The v5 pipeline alone (player_detector + ocr_universal)
-        # provides primary detection capability.
+        # Priority 3: Sport-specific v3 OCR fallback (football gets extra OCR layer)
+        if sl == "football":
+            to_load.append("football_ocr_v3")
+
+        # Priority 4: Dark jersey specialist (helps with dark/navy jerseys)
+        if is_dark or is_navy_jersey:
+            to_load.append("dark_jersey_specialist_v3")
 
         loaded_models: list[str] = []
         for model_name in to_load:
@@ -1324,8 +1327,17 @@ class RoboflowDetector:
         """
         self.load()
         if self.jersey_ocr_universal_v5_model is None:
+            logger.warning("v5 OCR: model is None — not loaded")
             return []
         self._last_used["jersey_ocr_universal_v5_model"] = time.time()
+
+        # Log model class names on first call for diagnostics
+        try:
+            model_names = self.jersey_ocr_universal_v5_model.names
+            nc = len(model_names) if model_names else 0
+            logger.info("v5 OCR: model has nc=%d, classes=%s", nc, model_names)
+        except Exception:
+            logger.warning("v5 OCR: could not read model class names")
 
         dets: list[dict] = []
         try:
@@ -1338,9 +1350,33 @@ class RoboflowDetector:
             else:
                 upscaled_crop = self._maybe_upscale(crop)
                 enhanced = self._preprocess(upscaled_crop)
-            # Lower confidence for dark jerseys
-            effective_conf = min(conf, 0.12) if is_dark_color(self._request_jersey_color) else conf
+            # Floor confidence at 0.05 to avoid missing detections
+            effective_conf = min(conf, 0.05)
+            if is_dark_color(self._request_jersey_color):
+                effective_conf = min(effective_conf, 0.05)
+            logger.info(
+                "v5 OCR: running on crop %dx%d, requested conf=%.3f, effective_conf=%.3f, jersey_number=%s",
+                enhanced.shape[1], enhanced.shape[0], conf, effective_conf, jersey_number,
+            )
             results = self.jersey_ocr_universal_v5_model(enhanced, conf=effective_conf, verbose=False)[0]
+
+            # Diagnostic: log ALL raw detections before jersey number filtering
+            raw_count = len(results.boxes) if results.boxes is not None else 0
+            if raw_count > 0:
+                raw_details = []
+                for box in results.boxes:
+                    cls_name = self.jersey_ocr_universal_v5_model.names[int(box.cls)]
+                    raw_details.append(f"{cls_name}({float(box.conf):.3f})")
+                logger.info(
+                    "v5 OCR: raw detections=%d: %s",
+                    raw_count, ", ".join(raw_details),
+                )
+            else:
+                logger.warning(
+                    "v5 OCR: 0 raw detections on %dx%d crop (conf=%.3f). Model may need retraining or crop too small.",
+                    enhanced.shape[1], enhanced.shape[0], effective_conf,
+                )
+
             for box in results.boxes:
                 name = self.jersey_ocr_universal_v5_model.names[int(box.cls)]
                 num = self._parse_number(name)
@@ -1353,6 +1389,10 @@ class RoboflowDetector:
                         "number_detected": num,
                         "layer": "v5_ocr_universal",
                     })
+            logger.info(
+                "v5 OCR: %d raw → %d matched (target jersey #%s)",
+                raw_count, len(dets), jersey_number,
+            )
         except Exception as e:
             logger.debug("v5 OCR error: %s", e)
         self._track_model_call("jersey_ocr_universal_v5", len(dets))

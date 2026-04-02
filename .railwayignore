@@ -26,14 +26,12 @@ app/model/crowd_obstruction_specialist_v4.pt
 app/model/helmet_glare_specialist_v4.pt
 app/model/low_resolution_specialist_v4.pt
 app/model/multi_player_cluster_v4.pt
-# v3 specialist models (50MB each × 4 = 200MB) — pipeline falls back to v5 OCR
-app/model/dark_jersey_specialist_v3.pt
+# v3 specialist models (50MB each) — dark_jersey kept for dark/navy fallback
 app/model/motion_blur_specialist_v3.pt
 app/model/partial_visibility_specialist_v3.pt
 app/model/wide_angle_specialist_v3.pt
-# v3 OCR fallbacks (50MB each × 5 = 250MB) — universal v5 OCR handles these
+# v3 OCR fallbacks (50MB each) — football_ocr kept for football fallback
 app/model/basketball_ocr_v3.pt
-app/model/football_ocr_v3.pt
 app/model/lacrosse_ocr_v3.pt
 app/model/jersey_ocr_v3_primary.pt
 app/model/jersey_ocr_v3_secondary.pt

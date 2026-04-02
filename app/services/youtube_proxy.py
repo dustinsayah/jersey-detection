@@ -36,9 +36,9 @@ _YT_TIMESTAMP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Format string — prefer highest quality for jersey OCR accuracy
-# Try merged 1080p first, then 720p, then any best MP4, then format 18 as last resort
-_ANDROID_FORMAT = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
+# Format string — prefer highest quality muxed MP4 for jersey OCR accuracy
+# Priority: muxed 720p mp4 (safe for OpenCV) → muxed best mp4 → merged 1080p → format 18 fallback
+_ANDROID_FORMAT = "best[height<=720][ext=mp4]/best[ext=mp4]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/18/best"
 
 
 def is_youtube_url(url: str) -> bool:

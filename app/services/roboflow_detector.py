@@ -1194,12 +1194,19 @@ class RoboflowDetector:
     def _maybe_upscale(self, crop: np.ndarray) -> np.ndarray:
         """Upscale small jersey crops before OCR. Returns crop unchanged if large enough."""
         h, w = crop.shape[:2]
+        logger.info("Crop before upscale: %dx%dpx (max=%d)", w, h, max(h, w))
         # SR upscaler for very small crops (jersey number region)
         if max(h, w) <= 128 and self._jersey_upscaler is not None:
-            return self._jersey_upscaler.upscale(crop)
+            result = self._jersey_upscaler.upscale(crop)
+            rh, rw = result.shape[:2]
+            logger.info("Crop after SR upscale: %dx%dpx", rw, rh)
+            return result
         # Bicubic 2x for medium crops
         if max(h, w) <= 200:
-            return cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            result = cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            logger.info("Crop after bicubic 2x: %dx%dpx", w * 2, h * 2)
+            return result
+        logger.info("Crop large enough, no upscale needed: %dx%dpx", w, h)
         return crop
 
     # ── Dead ball classifier ───────────────────────────────────────────────

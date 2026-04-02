@@ -126,9 +126,14 @@ async def run_analyze_pipeline(
                 youtube_strategy_used = "download_success"
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
                 LOGGER.info("Pipeline: YouTube video downloaded to %s", local_video_path)
-                # Log resolution for diagnostic purposes
+                # Log resolution for diagnostic purposes — also include in API response
                 vid_w, vid_h = get_video_resolution(local_video_path)
                 LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
+                layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
+                # Log file size
+                file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+                layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
+                LOGGER.info("Pipeline: Downloaded file size = %sMB", file_size_mb)
             except Exception as exc:
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
                 youtube_strategy_used = "all_failed"
@@ -443,6 +448,9 @@ async def run_analyze_pipeline(
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
         v5_ocr_detections: list[dict] = []
+        v5_players_found = 0
+        v5_no_player_frames = 0
+        v5_crop_dims: list[str] = []
         t0 = time.perf_counter()
         try:
             from app.services.roboflow_detector import roboflow_detector
@@ -453,6 +461,7 @@ async def run_analyze_pipeline(
                 for t, frame in ocr_frames:
                     # First: detect players in the frame
                     players = roboflow_detector.detect_players_v5(frame, conf=0.20)
+                    v5_players_found += len(players) if players else 0
                     if players:
                         # Run OCR on each player crop (much better than full frame)
                         for player in players:
@@ -468,12 +477,15 @@ async def run_analyze_pipeline(
                             crop = frame[cy1:cy2, cx1:cx2]
                             if crop.size == 0:
                                 continue
+                            ch, cw = crop.shape[:2]
+                            v5_crop_dims.append(f"{cw}x{ch}")
                             dets = roboflow_detector.detect_jersey_v5(
                                 crop, jersey_number=jersey_number, conf=ocr_conf,
                                 skip_preprocess=True,
                             )
                             v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
                     else:
+                        v5_no_player_frames += 1
                         # Fallback: run OCR on full frame if no players found
                         dets = roboflow_detector.detect_jersey_v5(
                             frame, jersey_number=jersey_number, conf=ocr_conf,
@@ -486,8 +498,12 @@ async def run_analyze_pipeline(
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000),
                 "status": "success" if v5_ocr_detections else "no_model_or_no_detections",
                 "detections": len(v5_ocr_detections),
+                "players_found": v5_players_found,
+                "no_player_frames": v5_no_player_frames,
+                "crop_dimensions_sample": v5_crop_dims[:10],
             }
-            LOGGER.info("Pipeline: v5 OCR (PRIMARY) found %d detections", len(v5_ocr_detections))
+            LOGGER.info("Pipeline: v5 OCR (PRIMARY) found %d detections, %d players, crop dims: %s",
+                        len(v5_ocr_detections), v5_players_found, v5_crop_dims[:5])
         except Exception as exc:
             layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)

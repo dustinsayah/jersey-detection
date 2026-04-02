@@ -397,6 +397,19 @@ async def run_analyze_pipeline(
                 preprocessed.append((t, frame))
             ocr_frames = preprocessed
 
+        # ── Free Ali's models before loading Roboflow ──────────────────
+        # Ali's warmup detector (jersey_number_yolo11m.pt + yolo26n-seg.pt +
+        # public_reader_ensemble) uses ~600MB. Railway kills at ~2.3GB.
+        # Freeing Ali here gives Roboflow enough room for v5 inference.
+        try:
+            from app.services.detection_detector import clear_detector_cache
+            import gc as _gc
+            clear_detector_cache()
+            _gc.collect()
+            LOGGER.info("Pipeline: freed Ali detector cache before Roboflow loading")
+        except Exception:
+            pass
+
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
         v5_ocr_detections: list[dict] = []
         t0 = time.perf_counter()

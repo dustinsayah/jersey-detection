@@ -63,7 +63,7 @@ FOOTBALL_MAX_CLIP = 12.0
 ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
 
 # Hard cap on total frames to prevent OOM on long videos
-MAX_FRAMES = int(os.getenv("MAX_FRAMES", "200"))
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "150"))
 
 
 async def run_analyze_pipeline(

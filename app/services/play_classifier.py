@@ -112,6 +112,16 @@ def classify_play(
     elif matched_rule and matched_rule.priority >= 6:
         score = min(100, score + 5)
 
+    # Football QB boost: QBs are in every offensive play, so motion/outcome
+    # signals are highly reliable even without jersey detection at 360p
+    if sport.lower() == "football" and position and position.lower() in ("qb", "quarterback"):
+        if v4_outcome in ("pass_play", "qb_scramble", "completion", "sack", "touchdown"):
+            score = min(100, score + 15)
+            LOGGER.debug("QB position boost +15 for v4_outcome=%s", v4_outcome)
+        if pose_action in ("standing", "throwing"):
+            score = min(100, score + 10)
+            LOGGER.debug("QB pose boost +10 for pose=%s", pose_action)
+
     # Grade assignment
     if score >= 90:
         grade = "Elite"

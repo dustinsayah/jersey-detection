@@ -23,14 +23,16 @@ _OUTCOME_SCORE_BOOSTS = {
     "made_shot": 25,        # basketball_made_shot_v4 + basketball_hoop_detector_v4
     "touchdown": 30,        # football_touchdown_detector_v4
     "goal": 30,             # lacrosse_goal_detector_v4
+    "pass_play": 20,        # football — confirmed offensive play, QB involved
     "completion": 15,       # football_completion_detector_v4
     "sack": 15,             # football_sack_detector_v4
     "rebound": 10,          # basketball_rebound_v4
     "ground_ball": 10,      # lacrosse_ground_ball_v4
     "drive": 10,            # basketball_dribble_drive_v4
-    "qb_scramble": 15,      # football_qb_scramble_v4
+    "qb_scramble": 20,      # football_qb_scramble_v4 (boosted for QB plays)
     "crowd_energy": 10,     # crowd_energy_detector_v4 (all sports)
     "score_change": 20,     # scoreboard_detector_v5 (score change detected)
+    "reception_yac": 15,    # football_reception_yac_v4
 }
 
 # Clip boundary expansion — sport-specific defaults (seconds)
@@ -321,17 +323,17 @@ def extract_clips(
     result = [c for c in merged if c.grade != "Cut"]
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
-    # Score 20+ covers motion-only fallback clips (no jersey confidence).
-    # Returning something is better than returning 0 clips.
+    # Football at 360p often can't detect jerseys — rescue more aggressively.
+    rescue_threshold = 15 if sport.lower() == "football" else 20
     if not result and merged:
-        rescued = [c for c in merged if c.score >= 20]
+        rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:
             for clip in rescued:
                 clip.grade = "Decent"
             result = rescued
             LOGGER.info(
-                "Rescue: all %d clips were Cut — rescued %d with score >= 20",
-                len(merged), len(result),
+                "Rescue: all %d clips were Cut — rescued %d with score >= %d (sport=%s)",
+                len(merged), len(result), rescue_threshold, sport,
             )
 
     LOGGER.info(

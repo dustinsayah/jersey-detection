@@ -1,13 +1,8 @@
 # YouTube download proxy — 5-strategy robust download chain
-# Strategies tried in order until one succeeds:
-# 1. Render server proxy (cloudinary cache)
-# 2. yt-dlp with ANDROID client (proven working Apr 2026)
-# 3. yt-dlp with android+web combo
-# 4. yt-dlp Python library with android client (no subprocess)
-# 5. Render server /extract-frames (last resort)
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -19,6 +14,15 @@ from pathlib import Path
 import httpx
 
 LOGGER = logging.getLogger(__name__)
+
+@dataclasses.dataclass
+class DownloadResult:
+    """Result from download_youtube_sync with trimming metadata."""
+    path: Path
+    was_sectioned: bool = False  # True when --download-sections was used (timestamps start at 0)
+    requested_start: float = 0
+    requested_end: float = 0
+
 
 # Render server URL
 RENDER_SERVER_URL = os.getenv(
@@ -272,15 +276,12 @@ def download_youtube_sync(
     end_time: float = 0,
     yt_dlp_binary: str = "yt-dlp",
     ffmpeg_binary: str = "ffmpeg",
-) -> Path:
+) -> DownloadResult:
     """Synchronous 5-strategy YouTube download chain.
 
-    Strategy order:
-    1. Render server proxy (cloudinary cache — fastest)
-    2. yt-dlp subprocess with android client (proven working Apr 2026)
-    3. yt-dlp subprocess with android+web combo
-    4. yt-dlp Python library with android client
-    5. Render server /extract-frames (last resort)
+    Returns DownloadResult with trimming metadata so callers know
+    whether the video timestamps start at 0 (was_sectioned=True)
+    or at the original YouTube timestamps (was_sectioned=False).
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
@@ -291,6 +292,7 @@ def download_youtube_sync(
     if url_start_seconds > 0 and start_time == 0:
         start_time = url_start_seconds
 
+    has_time_range = start_time > 0 or end_time > 0
     LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s", RENDER_SERVER_URL, start_time, end_time)
     dl_start = time.perf_counter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_sync_"))
@@ -298,48 +300,52 @@ def download_youtube_sync(
 
     strategy_errors: list[str] = []
 
-    # ── Strategy 1: yt-dlp web client with DASH (720p/1080p) ──
+    def _make_result(path: Path, sectioned: bool) -> DownloadResult:
+        return DownloadResult(
+            path=path,
+            was_sectioned=sectioned and has_time_range,
+            requested_start=start_time,
+            requested_end=end_time,
+        )
+
+    # ── Strategy 1: yt-dlp android_vr client (best no-token client for quality) ──
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                        client="web", start_time=start_time, end_time=end_time,
+                        client="android_vr", start_time=start_time, end_time=end_time,
                         strategy_name="Strategy 1", format_override=_HQ_FORMAT):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 1 (yt-dlp web HQ)", elapsed)
-        if start_time > 0 or end_time > 0:
-            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-        return output_path
-    strategy_errors.append("1=yt-dlp_web_hq_failed")
+        LOGGER.info("Sync downloaded in %ss via Strategy 1 (yt-dlp android_vr HQ)", elapsed)
+        # yt-dlp --download-sections already trimmed → timestamps start at 0
+        return _make_result(output_path, sectioned=has_time_range)
+    strategy_errors.append("1=yt-dlp_android_vr_failed")
 
-    # ── Strategy 2: yt-dlp android client (muxed, usually 360p) ──
+    # ── Strategy 2: yt-dlp android client (muxed fallback) ──
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android", start_time=start_time, end_time=end_time,
                         strategy_name="Strategy 2"):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 2 (yt-dlp android)", elapsed)
-        if start_time > 0 or end_time > 0:
-            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-        return output_path
+        return _make_result(output_path, sectioned=has_time_range)
     strategy_errors.append("2=yt-dlp_android_failed")
 
-    # ── Strategy 3: yt-dlp Python library with web client ──
-    if _yt_dlp_python_download(url, output_path, client="web",
+    # ── Strategy 3: yt-dlp Python library with android_vr ──
+    if _yt_dlp_python_download(url, output_path, client="android_vr",
                                start_time=start_time, end_time=end_time,
                                strategy_name="Strategy 3",
                                format_override=_HQ_FORMAT):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 3 (Python lib web HQ)", elapsed)
-        if start_time > 0 or end_time > 0:
-            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-        return output_path
-    strategy_errors.append("3=python_lib_web_failed")
+        LOGGER.info("Sync downloaded in %ss via Strategy 3 (Python lib android_vr)", elapsed)
+        return _make_result(output_path, sectioned=has_time_range)
+    strategy_errors.append("3=python_lib_android_vr_failed")
 
-    # ── Strategy 4: Render server proxy (may serve lower quality) ──
+    # ── Strategy 4: Render server proxy (may serve lower quality, does NOT section) ──
     with httpx.Client(timeout=httpx.Timeout(90)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 4"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 4 (render server)", elapsed)
-            if start_time > 0 or end_time > 0:
+            # Render server may return full video — trim it
+            if has_time_range:
                 output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-            return output_path
+            return _make_result(output_path, sectioned=False)
     strategy_errors.append("4=render_server_failed")
 
     # ── Strategy 5: Render server /extract-frames (last resort) ──
@@ -361,9 +367,9 @@ def download_youtube_sync(
                         output_path.write_bytes(resp.content)
                         elapsed = round(time.perf_counter() - dl_start, 1)
                         LOGGER.info("Sync downloaded in %ss via Strategy 5 (extract-frames)", elapsed)
-                        if start_time > 0 or end_time > 0:
+                        if has_time_range:
                             output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-                        return output_path
+                        return _make_result(output_path, sectioned=False)
                     ct = resp.headers.get("content-type", "")
                     if "json" in ct or "text" in ct:
                         data = resp.json()
@@ -376,9 +382,9 @@ def download_youtube_sync(
                                 output_path.write_bytes(dl_resp.content)
                                 elapsed = round(time.perf_counter() - dl_start, 1)
                                 LOGGER.info("Sync downloaded in %ss via Strategy 5 (extract-frames URL)", elapsed)
-                                if start_time > 0 or end_time > 0:
+                                if has_time_range:
                                     output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-                                return output_path
+                                return _make_result(output_path, sectioned=False)
                 LOGGER.warning("Strategy 5 failed: %d", resp.status_code)
         except Exception as exc:
             LOGGER.warning("Strategy 5 failed: %s", exc)
@@ -400,7 +406,7 @@ async def download_youtube(
     yt_dlp_binary: str = "yt-dlp",
     ffmpeg_binary: str = "ffmpeg",
     timeout: float = 120,
-) -> Path:
+) -> DownloadResult:
     """Async version — delegates to sync via threadpool."""
     from functools import partial
     from starlette.concurrency import run_in_threadpool

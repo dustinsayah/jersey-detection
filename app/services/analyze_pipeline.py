@@ -43,6 +43,7 @@ from functools import partial
 from starlette.concurrency import run_in_threadpool
 
 from app.services.youtube_proxy import (
+    DownloadResult,
     download_youtube_sync,
     extract_audio,
     get_video_duration,
@@ -112,7 +113,7 @@ async def run_analyze_pipeline(
             try:
                 from app.services.detection_runtime import PipelineSettings
                 settings = PipelineSettings()
-                local_video_path = await run_in_threadpool(
+                dl_result: DownloadResult = await run_in_threadpool(
                     partial(
                         download_youtube_sync,
                         video_url,
@@ -122,14 +123,24 @@ async def run_analyze_pipeline(
                         ffmpeg_binary=settings.ffmpeg_binary,
                     )
                 )
+                local_video_path = dl_result.path
+                # If video was pre-trimmed by --download-sections, adjust frame extraction range
+                if dl_result.was_sectioned:
+                    LOGGER.info("Pipeline: video was pre-sectioned (%.0f-%.0f) → extracting from 0", time_range_start, time_range_end)
+                    extract_start = 0.0
+                    extract_end = (time_range_end - time_range_start) if time_range_end > 0 else 0.0
+                else:
+                    extract_start = time_range_start
+                    extract_end = time_range_end
                 phases_used.append("youtube_download")
                 youtube_strategy_used = "download_success"
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
-                LOGGER.info("Pipeline: YouTube video downloaded to %s", local_video_path)
+                LOGGER.info("Pipeline: YouTube video downloaded to %s (sectioned=%s)", local_video_path, dl_result.was_sectioned)
                 # Log resolution for diagnostic purposes — also include in API response
                 vid_w, vid_h = get_video_resolution(local_video_path)
                 LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
                 layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
+                layer_timings["youtube_download"]["was_sectioned"] = dl_result.was_sectioned
                 # Log file size
                 file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
                 layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
@@ -145,6 +156,8 @@ async def run_analyze_pipeline(
                 )
         elif video_url:
             # Direct URL — download it first
+            extract_start = time_range_start
+            extract_end = time_range_end
             try:
                 import httpx
                 tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_dl_"))
@@ -155,13 +168,17 @@ async def run_analyze_pipeline(
                         local_video_path.write_bytes(resp.content)
                         LOGGER.info("Pipeline: direct URL downloaded, %d bytes", len(resp.content))
                     else:
-                        # Fall through to existing detection pipeline which handles URLs
                         local_video_path = None
             except Exception as exc:
                 LOGGER.warning("Pipeline: direct download failed, will pass URL to detector: %s", exc)
                 local_video_path = None
         elif video_path:
+            extract_start = time_range_start
+            extract_end = time_range_end
             local_video_path = Path(video_path)
+        else:
+            extract_start = time_range_start
+            extract_end = time_range_end
 
         # Get video duration
         video_duration = 0.0
@@ -192,7 +209,7 @@ async def run_analyze_pipeline(
             try:
                 frames = _extract_frames(
                     local_video_path, fps=ANALYZE_FPS, sport=sport,
-                    start_sec=time_range_start, end_sec=time_range_end,
+                    start_sec=extract_start, end_sec=extract_end,
                 )
                 frames_processed = len(frames)
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
@@ -1039,11 +1056,14 @@ async def run_analyze_pipeline(
 
         # If jersey detection found nothing, generate detection points from motion/audio
         if not detection_points and _frame_timestamps:
-            LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback")
+            # Football at 360p: lower motion threshold since jersey OCR can't help
+            is_football = sport.lower() == "football"
+            motion_threshold = 20 if is_football else 30
+            LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d)", motion_threshold)
             for t in _frame_timestamps:
                 motion = motion_scores.get(t, 0)
                 in_boundary = _in_audio_boundary(audio_result, t)
-                if motion > 30 or in_boundary:
+                if motion > motion_threshold or in_boundary:
                     pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
                     # Higher cap (0.7) + audio boundary bonus (0.15) to push
                     # above the 50-point "Cut" threshold in clip_extractor

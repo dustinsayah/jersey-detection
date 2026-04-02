@@ -268,12 +268,13 @@ def _resolve_video_source(
             from app.services.youtube_proxy import download_youtube_sync
             end_time = float(settings.youtube_clip_seconds) if settings.youtube_clip_seconds else 0
             LOGGER.info("Using youtube_proxy_sync 5-strategy chain for: %s", video_url)
-            return download_youtube_sync(
+            dl_result = download_youtube_sync(
                 url=video_url,
                 end_time=end_time,
                 yt_dlp_binary=settings.yt_dlp_binary,
                 ffmpeg_binary=settings.ffmpeg_binary,
             )
+            return dl_result.path
         ext = _safe_extension(urllib.parse.urlparse(video_url).path)
         return _download_direct_video(video_url, work_dir / f"input_download{ext}")
 

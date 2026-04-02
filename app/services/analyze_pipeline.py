@@ -57,9 +57,13 @@ FOOTBALL_MIN_CLIP = 3.0
 FOOTBALL_MAX_CLIP = 12.0
 
 # Frame sampling: how many FPS to extract for Roboflow layers.
-# Default 10 = every 3rd frame at 30fps (600 frames for 60s clip).
+# Default 2 = 1 frame per 0.5s. Railway OOM kills at ~2.3GB;
+# each 1280×720 frame ≈ 2.7MB, so 200 frames ≈ 540MB.
 # Configurable via ANALYZE_FPS env var.
-ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "10"))
+ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
+
+# Hard cap on total frames to prevent OOM on long videos
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "200"))
 
 
 async def run_analyze_pipeline(
@@ -177,7 +181,10 @@ async def run_analyze_pipeline(
         if local_video_path and local_video_path.exists():
             t0 = time.perf_counter()
             try:
-                frames = _extract_frames(local_video_path, fps=ANALYZE_FPS, sport=sport)
+                frames = _extract_frames(
+                    local_video_path, fps=ANALYZE_FPS, sport=sport,
+                    start_sec=time_range_start, end_sec=time_range_end,
+                )
                 frames_processed = len(frames)
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
                 LOGGER.info("Pipeline: extracted %d frames", len(frames))
@@ -694,6 +701,28 @@ async def run_analyze_pipeline(
             layer_timings["scoreboard_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: scoreboard detection failed (non-fatal): %s", exc)
 
+        # ── Free frame pixel data — all frame-dependent steps are done ──
+        # Keep timestamps but release the heavy numpy arrays
+        _frame_timestamps = [t for t, _ in frames] if frames else []
+        _frame_count = len(_frame_timestamps)
+        # Clear the lists to release numpy memory
+        if frames:
+            frames.clear()
+        if live_frames:
+            live_frames.clear()
+        try:
+            ocr_frames.clear()
+        except Exception:
+            pass
+        import gc as _gc
+        _gc.collect()
+        try:
+            import psutil
+            _rss = psutil.Process().memory_info().rss // (1024 * 1024)
+            LOGGER.info("Pipeline: freed %d frames, RSS after gc=%dMB", _frame_count, _rss)
+        except Exception:
+            LOGGER.info("Pipeline: freed %d frames", _frame_count)
+
         # ── Step 8: Cross-layer validation + merge ────────────────────
         detection_points: list[DetectionPoint] = []
         cross_layer_agreements: list[dict] = []
@@ -968,10 +997,10 @@ async def run_analyze_pipeline(
                 total_raw,
             )
 
-        # If jersey detection found nothing but we have frames, generate detection points from motion/audio
-        if not detection_points and frames:
+        # If jersey detection found nothing, generate detection points from motion/audio
+        if not detection_points and _frame_timestamps:
             LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback")
-            for t, frame in frames:
+            for t in _frame_timestamps:
                 motion = motion_scores.get(t, 0)
                 in_boundary = _in_audio_boundary(audio_result, t)
                 if motion > 30 or in_boundary:
@@ -1007,6 +1036,14 @@ async def run_analyze_pipeline(
             video_duration=video_duration,
         )
 
+        # ── Unload request-specific models to free memory ──
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.unload_request_models()
+            LOGGER.info("Pipeline: unloaded request models after inference")
+        except Exception:
+            pass
+
         # Apply football-specific clip duration limits
         if sport.lower() == "football":
             for clip in clips:
@@ -1024,7 +1061,7 @@ async def run_analyze_pipeline(
                 for c in clips
             ]
             stat_result = run_stat_pipeline(
-                frames=frames,
+                frames=[],  # frames freed after OCR to save memory
                 sport=sport,
                 jersey_number=jersey_number,
                 position=position,
@@ -1299,11 +1336,15 @@ def _extract_frames(
     video_path: Path,
     fps: int = 2,
     sport: str = "basketball",
+    start_sec: float = 0,
+    end_sec: float = 0,
+    max_frames: int = 0,
 ) -> list[tuple[float, np.ndarray]]:
     """Extract frames from video at given FPS.
 
-    ALL sports get preprocessing (upscale + CLAHE + unsharp mask) when
-    the source resolution is below 1920px — not just football.
+    Args:
+        start_sec/end_sec: Only extract frames in [start, end]. 0/0 = full video.
+        max_frames: Hard cap on total frames (0 = use global MAX_FRAMES).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1311,20 +1352,29 @@ def _extract_frames(
 
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_interval = max(1, int(video_fps / fps))
+    cap_limit = max_frames if max_frames > 0 else MAX_FRAMES
     frames: list[tuple[float, np.ndarray]] = []
     frame_idx = 0
+
+    # If start_sec > 0, seek ahead to save time
+    if start_sec > 0:
+        start_frame = int(start_sec * video_fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_idx = start_frame
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_idx % frame_interval == 0:
-            timestamp = frame_idx / video_fps
+        timestamp = frame_idx / video_fps
 
+        # Stop if past end of time range
+        if end_sec > 0 and timestamp > end_sec:
+            break
+
+        if frame_idx % frame_interval == 0 and timestamp >= start_sec:
             # Upscale low-res video to ~1280px width for better detection
-            # NOTE: CLAHE/unsharp moved to dark jersey preprocessing block
-            # to avoid double-preprocessing. Clean frames work better for v5 OCR.
             h, w = frame.shape[:2]
             if w < 1280:
                 scale = min(2.0, 1280 / w)
@@ -1332,9 +1382,17 @@ def _extract_frames(
 
             frames.append((timestamp, frame))
 
+            if len(frames) >= cap_limit:
+                LOGGER.info("Frame extraction: hit MAX_FRAMES cap (%d)", cap_limit)
+                break
+
         frame_idx += 1
 
     cap.release()
+    LOGGER.info(
+        "Extracted %d frames (fps=%d, range=%.1f-%.1f, cap=%d)",
+        len(frames), fps, start_sec, end_sec, cap_limit,
+    )
     return frames
 
 

@@ -49,9 +49,10 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 # Memory limits (MB) — configurable via env vars
 # Railway kills at ~2300MB RSS. Ali warmup uses ~1100MB.
 # v5 essential models add ~650MB (→ ~1750MB).
-# Leave ~400MB for inference tensors + frame buffers.
-MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "1900"))
-MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "1700"))
+# Railway survived 3609MB RSS (Apr 2026) — raise limits to avoid
+# premature model eviction.  Keep a margin for inference tensors.
+MEMORY_LIMIT_MB = int(os.getenv("MEMORY_LIMIT_MB", "4000"))
+MEMORY_WARNING_MB = int(os.getenv("MEMORY_WARNING_MB", "3500"))
 
 # Navy / dark color aliases for preprocessing and model selection
 NAVY_ALIASES = [
@@ -488,22 +489,24 @@ class RoboflowDetector:
             else:
                 logger.info("v5 model pending: %s", filename)
 
-        # ── v5 ESSENTIAL models only (OCR + player detection) ──
-        # Outcome classifiers and scoreboard are deferred to load_for_request()
-        # to keep startup RSS under 1.5GB (Ali warmup already uses ~600MB)
+        # ── v5 ESSENTIAL models (OCR + player detection) — ALWAYS load ──
+        # These are the PRIMARY detection path — never skip due to memory.
+        # Railway survives 3600+ MB RSS; skipping these breaks all OCR.
         _v5_essential = {
             "jersey_ocr_universal_v5.pt": "jersey_ocr_universal_v5_model",
             "player_detector_v5.pt": "player_detector_v5_model",
         }
-        if self._memory_ok_for_loading("v5-essential"):
-            for filename, attr in _v5_essential.items():
-                path = os.path.join(MODEL_DIR, filename)
-                if os.path.exists(path):
-                    setattr(self, attr, _load_model(filename))
+        for filename, attr in _v5_essential.items():
+            path = os.path.join(MODEL_DIR, filename)
+            if os.path.exists(path):
+                model = _load_model(filename)
+                if model is not None:
+                    setattr(self, attr, model)
+                    logger.info("v5 essential loaded: %s (RSS=%.0fMB)", filename, self._get_rss_mb())
                 else:
-                    logger.info("v5 model pending: %s", filename)
-        else:
-            logger.info("v5 essential models skipped — memory pressure")
+                    logger.error("CRITICAL: _load_model returned None for v5 essential %s", filename)
+            else:
+                logger.error("CRITICAL: v5 essential model file MISSING: %s", path)
 
         # Load jersey super-resolution model (PyTorch .pth, not YOLO)
         try:
@@ -1377,17 +1380,29 @@ class RoboflowDetector:
                     enhanced.shape[1], enhanced.shape[0], effective_conf,
                 )
 
+            # Check for digit composition first (e.g., two "1" digits → jersey #11)
+            digits_compose = self._check_adjacent_digits(
+                jersey_number, results.boxes, self.jersey_ocr_universal_v5_model
+            ) if jersey_number >= 10 else False
+
             for box in results.boxes:
                 name = self.jersey_ocr_universal_v5_model.names[int(box.cls)]
                 num = self._parse_number(name)
-                if num == jersey_number or self._check_adjacent_digits(
-                    jersey_number, results.boxes, self.jersey_ocr_universal_v5_model
-                ):
+                if num == jersey_number:
+                    # Direct match (single-digit jersey or exact class match)
                     dets.append({
                         "confidence": float(box.conf),
                         "bbox": box.xyxy[0].tolist(),
-                        "number_detected": num,
+                        "number_detected": jersey_number,
                         "layer": "v5_ocr_universal",
+                    })
+                elif digits_compose and num is not None and str(num) in str(jersey_number):
+                    # Digit is part of composed number — report target number
+                    dets.append({
+                        "confidence": float(box.conf) * 0.85,  # slight penalty for composed
+                        "bbox": box.xyxy[0].tolist(),
+                        "number_detected": jersey_number,
+                        "layer": "v5_ocr_universal_composed",
                     })
             logger.info(
                 "v5 OCR: %d raw → %d matched (target jersey #%s)",

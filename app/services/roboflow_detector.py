@@ -1345,10 +1345,17 @@ class RoboflowDetector:
         dets: list[dict] = []
         try:
             if skip_preprocess:
-                # Frames already preprocessed by pipeline — just upscale small crops
+                # Frames already preprocessed by pipeline — aggressively upscale crops
+                # for digit detection. At 360p, player crops are often 50-120px wide,
+                # making jersey digits only 10-20px. Need at least 3x for reliable OCR.
                 h, w = crop.shape[:2]
-                if max(h, w) < 128:
-                    crop = cv2.resize(crop, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+                target_min = 320  # Target minimum dimension for OCR
+                scale = max(1, target_min / max(h, w))
+                if scale > 1:
+                    crop = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+                    # Apply sharpening after upscale
+                    gaussian = cv2.GaussianBlur(crop, (0, 0), 1.5)
+                    crop = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
                 enhanced = crop
             else:
                 upscaled_crop = self._maybe_upscale(crop)

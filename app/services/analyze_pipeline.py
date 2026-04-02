@@ -448,15 +448,15 @@ async def run_analyze_pipeline(
                 LOGGER.info("Pipeline: v5 OCR layer (PRIMARY) running on %d live frames", len(ocr_frames))
                 for t, frame in ocr_frames:
                     # First: detect players in the frame
-                    players = roboflow_detector.detect_players_v5(frame, conf=0.25)
+                    players = roboflow_detector.detect_players_v5(frame, conf=0.20)
                     if players:
                         # Run OCR on each player crop (much better than full frame)
                         for player in players:
                             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
                             h, w = frame.shape[:2]
-                            # Pad crop by 10% for context
-                            pad_x = int((x2 - x1) * 0.1)
-                            pad_y = int((y2 - y1) * 0.1)
+                            # Pad crop by 25% — gives more context for digit detection
+                            pad_x = int((x2 - x1) * 0.25)
+                            pad_y = int((y2 - y1) * 0.25)
                             cx1 = max(0, x1 - pad_x)
                             cy1 = max(0, y1 - pad_y)
                             cx2 = min(w, x2 + pad_x)
@@ -1221,7 +1221,7 @@ async def run_analyze_pipeline(
             "frames_with_target": sum(1 for d in all_layer_dets if d.get("number_detected") == jersey_number),
             "wrong_number_filtered": wrong_number_count,
             "analyze_fps": ANALYZE_FPS,
-            "frames_extracted": len(frames),
+            "frames_extracted": frames_processed,
             "dead_ball_frames_skipped": dead_ball_count,
             "dead_ball_ratio": round(dead_ball_ratio, 2),
             "scoreboard_detections": len(scoreboard_detections),

@@ -36,8 +36,9 @@ _YT_TIMESTAMP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Format string that works with android client (returns format 18 = 360p mp4)
-_ANDROID_FORMAT = "best[height<=480][ext=mp4]/best[ext=mp4]/18/best"
+# Format string — prefer highest quality for jersey OCR accuracy
+# Try merged 1080p first, then 720p, then any best MP4, then format 18 as last resort
+_ANDROID_FORMAT = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
 
 
 def is_youtube_url(url: str) -> bool:
@@ -123,6 +124,7 @@ def _yt_dlp_download(
         "--extractor-args", f"youtube:player_client={client}",
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "--format", _ANDROID_FORMAT,
+        "--merge-output-format", "mp4",
         "--no-playlist",
         "--socket-timeout", "30",
         "-o", str(output_path),
@@ -167,6 +169,7 @@ def _yt_dlp_python_download(
 
         ydl_opts = {
             "format": _ANDROID_FORMAT,
+            "merge_output_format": "mp4",
             "outtmpl": str(output_path),
             "extractor_args": {"youtube": {"player_client": [client]}},
             "no_check_certificate": True,
@@ -478,6 +481,25 @@ def test_youtube_download_sync(
             "render_server_url": RENDER_SERVER_URL,
             "strategy_results": strategy_results,
         }
+
+
+def get_video_resolution(video_path: Path, ffprobe_binary: str = "ffprobe") -> tuple[int, int]:
+    """Get video resolution (width, height) using ffprobe."""
+    try:
+        result = subprocess.run(
+            [ffprobe_binary, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=s=x:p=0", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        parts = result.stdout.strip().split("x")
+        if len(parts) == 2:
+            w, h = int(parts[0]), int(parts[1])
+            LOGGER.info("Video resolution: %dx%d", w, h)
+            return w, h
+    except Exception:
+        pass
+    return 0, 0
 
 
 def get_video_duration(video_path: Path, ffprobe_binary: str = "ffprobe") -> float:

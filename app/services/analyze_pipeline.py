@@ -46,6 +46,7 @@ from app.services.youtube_proxy import (
     download_youtube_sync,
     extract_audio,
     get_video_duration,
+    get_video_resolution,
     is_youtube_url,
 )
 
@@ -125,6 +126,9 @@ async def run_analyze_pipeline(
                 youtube_strategy_used = "download_success"
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
                 LOGGER.info("Pipeline: YouTube video downloaded to %s", local_video_path)
+                # Log resolution for diagnostic purposes
+                vid_w, vid_h = get_video_resolution(local_video_path)
+                LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
             except Exception as exc:
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
                 youtube_strategy_used = "all_failed"

@@ -36,9 +36,11 @@ _YT_TIMESTAMP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Format string — prefer highest quality muxed MP4 for jersey OCR accuracy
-# Priority: muxed 720p mp4 (safe for OpenCV) → muxed best mp4 → merged 1080p → format 18 fallback
-_ANDROID_FORMAT = "best[height<=720][ext=mp4]/best[ext=mp4]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/18/best"
+# Format string — prefer highest quality for jersey OCR accuracy
+# DASH streams (bestvideo+bestaudio) are 720p/1080p; muxed formats are usually 360p
+_HQ_FORMAT = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
+# Fallback for android client (muxed only, usually 360p)
+_ANDROID_FORMAT = "best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
 
 
 def is_youtube_url(url: str) -> bool:
@@ -113,17 +115,19 @@ def _yt_dlp_download(
     end_time: float = 0,
     timeout: int = 180,
     strategy_name: str = "",
+    format_override: str | None = None,
 ) -> bool:
     """Run yt-dlp subprocess with given client. Returns True on success."""
     if output_path.exists():
         output_path.unlink()
 
+    fmt = format_override or _ANDROID_FORMAT
     cmd = [
         yt_dlp_binary,
         "--no-check-certificate",
         "--extractor-args", f"youtube:player_client={client}",
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "--format", _ANDROID_FORMAT,
+        "--format", fmt,
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--socket-timeout", "30",
@@ -139,7 +143,7 @@ def _yt_dlp_download(
 
     cmd.append(url)
 
-    LOGGER.info("%s: running yt-dlp client=%s", strategy_name, client)
+    LOGGER.info("%s: running yt-dlp client=%s format=%s", strategy_name, client, fmt[:60])
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
     if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
@@ -159,6 +163,7 @@ def _yt_dlp_python_download(
     start_time: float = 0,
     end_time: float = 0,
     strategy_name: str = "Strategy 4",
+    format_override: str | None = None,
 ) -> bool:
     """Use yt-dlp as Python library (no subprocess). Returns True on success."""
     try:
@@ -167,8 +172,9 @@ def _yt_dlp_python_download(
         if output_path.exists():
             output_path.unlink()
 
+        fmt = format_override or _ANDROID_FORMAT
         ydl_opts = {
-            "format": _ANDROID_FORMAT,
+            "format": fmt,
             "merge_output_format": "mp4",
             "outtmpl": str(output_path),
             "extractor_args": {"youtube": {"player_client": [client]}},
@@ -292,17 +298,18 @@ def download_youtube_sync(
 
     strategy_errors: list[str] = []
 
-    # ── Strategy 1: Render server proxy ──
-    with httpx.Client(timeout=httpx.Timeout(90)) as client:
-        if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 1"):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 1 (render server)", elapsed)
-            if start_time > 0 or end_time > 0:
-                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-            return output_path
-    strategy_errors.append("1=render_server_failed")
+    # ── Strategy 1: yt-dlp web client with DASH (720p/1080p) ──
+    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                        client="web", start_time=start_time, end_time=end_time,
+                        strategy_name="Strategy 1", format_override=_HQ_FORMAT):
+        elapsed = round(time.perf_counter() - dl_start, 1)
+        LOGGER.info("Sync downloaded in %ss via Strategy 1 (yt-dlp web HQ)", elapsed)
+        if start_time > 0 or end_time > 0:
+            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+        return output_path
+    strategy_errors.append("1=yt-dlp_web_hq_failed")
 
-    # ── Strategy 2: yt-dlp android client (PROVEN WORKING) ──
+    # ── Strategy 2: yt-dlp android client (muxed, usually 360p) ──
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android", start_time=start_time, end_time=end_time,
                         strategy_name="Strategy 2"):
@@ -313,27 +320,27 @@ def download_youtube_sync(
         return output_path
     strategy_errors.append("2=yt-dlp_android_failed")
 
-    # ── Strategy 3: yt-dlp android+web combo ──
-    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                        client="android,web", start_time=start_time, end_time=end_time,
-                        strategy_name="Strategy 3"):
-        elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 3 (yt-dlp android+web)", elapsed)
-        if start_time > 0 or end_time > 0:
-            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-        return output_path
-    strategy_errors.append("3=yt-dlp_android+web_failed")
-
-    # ── Strategy 4: yt-dlp Python library with android client ──
-    if _yt_dlp_python_download(url, output_path, client="android",
+    # ── Strategy 3: yt-dlp Python library with web client ──
+    if _yt_dlp_python_download(url, output_path, client="web",
                                start_time=start_time, end_time=end_time,
-                               strategy_name="Strategy 4"):
+                               strategy_name="Strategy 3",
+                               format_override=_HQ_FORMAT):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 4 (Python lib android)", elapsed)
+        LOGGER.info("Sync downloaded in %ss via Strategy 3 (Python lib web HQ)", elapsed)
         if start_time > 0 or end_time > 0:
             output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
         return output_path
-    strategy_errors.append("4=python_lib_android_failed")
+    strategy_errors.append("3=python_lib_web_failed")
+
+    # ── Strategy 4: Render server proxy (may serve lower quality) ──
+    with httpx.Client(timeout=httpx.Timeout(90)) as client:
+        if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 4"):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 4 (render server)", elapsed)
+            if start_time > 0 or end_time > 0:
+                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            return output_path
+    strategy_errors.append("4=render_server_failed")
 
     # ── Strategy 5: Render server /extract-frames (last resort) ──
     if RENDER_SERVER_URL:

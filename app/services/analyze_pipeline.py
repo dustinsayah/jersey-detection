@@ -464,10 +464,10 @@ async def run_analyze_pipeline(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 90s, max 200 crops, early exit after 50 zero-match crops
-        _V5_TIME_LIMIT = 90  # seconds
-        _V5_MAX_CROPS = 200
-        _V5_EARLY_EXIT_AFTER = 50  # consecutive zero-match crops before giving up
+        # Guardrails: max 120s, max 500 crops, early exit after 150 zero-match crops
+        _V5_TIME_LIMIT = 120  # seconds
+        _V5_MAX_CROPS = 500
+        _V5_EARLY_EXIT_AFTER = 150  # consecutive zero-match crops before giving up
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
@@ -481,9 +481,9 @@ async def run_analyze_pipeline(
             roboflow_detector.load()
 
             if ocr_frames:
-                # Sample every 2nd frame to balance coverage and performance
-                sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
-                LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
+                # Process every frame for maximum detection coverage
+                sampled_frames = ocr_frames
+                LOGGER.info("Pipeline: v5 OCR layer running on %d frames", len(sampled_frames))
                 _v5_break = False
                 for t, frame in sampled_frames:
                     if _v5_break:
@@ -496,7 +496,7 @@ async def run_analyze_pipeline(
                     players = roboflow_detector.detect_players_v5(frame, conf=0.20)
                     v5_players_found += len(players) if players else 0
                     if players:
-                        for player in players[:5]:  # Max 5 players per frame
+                        for player in players[:8]:  # Max 8 players per frame
                             if v5_total_crops >= _V5_MAX_CROPS:
                                 v5_exit_reason = f"crop_limit ({_V5_MAX_CROPS})"
                                 _v5_break = True
@@ -1008,11 +1008,13 @@ async def run_analyze_pipeline(
 
             # Relaxed temporal consensus — 2 confirmations in 3s window
             # Aggressive mode (low quality or dark jerseys) → even more relaxed
-            if resolved_quality == "aggressive" or _is_dark_jersey:
+            # Also relax when few detections (<10) to avoid filtering them all out
+            _few_detections = len(all_layer_dets) < 10
+            if resolved_quality == "aggressive" or _is_dark_jersey or _few_detections:
                 tc_instance = TemporalConsensus(
                     min_confirmations=1,
-                    time_window=3.0,
-                    confidence_threshold=0.2,
+                    time_window=4.0,
+                    confidence_threshold=0.15,
                 )
             else:
                 tc_instance = TemporalConsensus(
@@ -1109,6 +1111,40 @@ async def run_analyze_pipeline(
                 "after jersey number filter + temporal consensus.",
                 total_raw,
             )
+
+        # ── Motion supplement: if we have SOME detections (1-5), add high-motion
+        # frames as supplementary points to create more clips.  The player IS in
+        # the video (confirmed by OCR), so motion peaks are likely their plays.
+        if 1 <= len(detection_points) <= 5 and _frame_timestamps:
+            _existing_ts = {dp.timestamp for dp in detection_points}
+            _motion_thresh = 40  # only strong motion
+            _supplement_count = 0
+            for t in _frame_timestamps:
+                if t in _existing_ts:
+                    continue
+                # Skip if within 3s of an existing detection (would merge anyway)
+                if any(abs(t - ets) < 3.0 for ets in _existing_ts):
+                    continue
+                motion = motion_scores.get(t, 0)
+                in_boundary = _in_audio_boundary(audio_result, t)
+                if motion > _motion_thresh or (in_boundary and motion > 25):
+                    pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
+                    conf = motion / 100.0 * 0.5  # Lower confidence than direct OCR
+                    if in_boundary:
+                        conf = min(0.8, conf + 0.1)
+                    detection_points.append(DetectionPoint(
+                        timestamp=t,
+                        confidence=conf,
+                        jersey_visible=True,  # Inferred from OCR match elsewhere
+                        jersey_number=jersey_number,
+                        motion_score=motion,
+                        pose_action=pose.get("action", "standing"),
+                        crowd_energy=_get_crowd_energy(audio_result, t),
+                    ))
+                    _supplement_count += 1
+            if _supplement_count:
+                LOGGER.info("Pipeline: motion supplement added %d high-motion points "
+                            "(total detection_points now %d)", _supplement_count, len(detection_points))
 
         # If jersey detection found nothing, generate detection points from motion/audio
         if not detection_points and _frame_timestamps:

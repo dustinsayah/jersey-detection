@@ -464,10 +464,10 @@ async def run_analyze_pipeline(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 120s, max 500 crops, early exit after 150 zero-match crops
-        _V5_TIME_LIMIT = 120  # seconds
-        _V5_MAX_CROPS = 500
-        _V5_EARLY_EXIT_AFTER = 150  # consecutive zero-match crops before giving up
+        # Guardrails: max 90s, max 300 crops, early exit after 100 zero-match crops
+        _V5_TIME_LIMIT = 90  # seconds
+        _V5_MAX_CROPS = 300
+        _V5_EARLY_EXIT_AFTER = 100  # consecutive zero-match crops before giving up
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
@@ -481,9 +481,9 @@ async def run_analyze_pipeline(
             roboflow_detector.load()
 
             if ocr_frames:
-                # Process every frame for maximum detection coverage
-                sampled_frames = ocr_frames
-                LOGGER.info("Pipeline: v5 OCR layer running on %d frames", len(sampled_frames))
+                # Sample every 2nd frame for memory safety
+                sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
+                LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
                 _v5_break = False
                 for t, frame in sampled_frames:
                     if _v5_break:
@@ -496,7 +496,7 @@ async def run_analyze_pipeline(
                     players = roboflow_detector.detect_players_v5(frame, conf=0.20)
                     v5_players_found += len(players) if players else 0
                     if players:
-                        for player in players[:8]:  # Max 8 players per frame
+                        for player in players[:5]:  # Max 5 players per frame
                             if v5_total_crops >= _V5_MAX_CROPS:
                                 v5_exit_reason = f"crop_limit ({_V5_MAX_CROPS})"
                                 _v5_break = True

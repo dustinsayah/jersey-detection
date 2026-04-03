@@ -464,27 +464,49 @@ async def run_analyze_pipeline(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
+        # Guardrails: max 60s, max 100 crops, early exit after 30 zero-match crops
+        _V5_TIME_LIMIT = 60  # seconds
+        _V5_MAX_CROPS = 100
+        _V5_EARLY_EXIT_AFTER = 30  # consecutive zero-match crops before giving up
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
         v5_crop_dims: list[str] = []
+        v5_total_crops = 0
+        v5_consecutive_misses = 0
+        v5_exit_reason = ""
         t0 = time.perf_counter()
         try:
             from app.services.roboflow_detector import roboflow_detector
             roboflow_detector.load()
 
             if ocr_frames:
-                LOGGER.info("Pipeline: v5 OCR layer (PRIMARY) running on %d live frames", len(ocr_frames))
-                for t, frame in ocr_frames:
-                    # First: detect players in the frame
+                # Sample every 3rd frame to reduce work
+                sampled_frames = ocr_frames[::3] if len(ocr_frames) > 20 else ocr_frames
+                LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
+                _v5_break = False
+                for t, frame in sampled_frames:
+                    if _v5_break:
+                        break
+                    # Time limit check
+                    if time.perf_counter() - t0 > _V5_TIME_LIMIT:
+                        v5_exit_reason = f"time_limit ({_V5_TIME_LIMIT}s)"
+                        LOGGER.info("Pipeline: v5 OCR hit time limit (%ds), moving on", _V5_TIME_LIMIT)
+                        break
                     players = roboflow_detector.detect_players_v5(frame, conf=0.20)
                     v5_players_found += len(players) if players else 0
                     if players:
-                        # Run OCR on each player crop (much better than full frame)
-                        for player in players:
+                        for player in players[:5]:  # Max 5 players per frame
+                            if v5_total_crops >= _V5_MAX_CROPS:
+                                v5_exit_reason = f"crop_limit ({_V5_MAX_CROPS})"
+                                _v5_break = True
+                                break
+                            if v5_consecutive_misses >= _V5_EARLY_EXIT_AFTER:
+                                v5_exit_reason = f"early_exit ({_V5_EARLY_EXIT_AFTER} consecutive misses)"
+                                _v5_break = True
+                                break
                             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
                             h, w = frame.shape[:2]
-                            # Pad crop by 25% — gives more context for digit detection
                             pad_x = int((x2 - x1) * 0.25)
                             pad_y = int((y2 - y1) * 0.25)
                             cx1 = max(0, x1 - pad_x)
@@ -496,19 +518,18 @@ async def run_analyze_pipeline(
                                 continue
                             ch, cw = crop.shape[:2]
                             v5_crop_dims.append(f"{cw}x{ch}")
+                            v5_total_crops += 1
                             dets = roboflow_detector.detect_jersey_v5(
                                 crop, jersey_number=jersey_number, conf=ocr_conf,
                                 skip_preprocess=True,
                             )
-                            v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                            if dets:
+                                v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                                v5_consecutive_misses = 0
+                            else:
+                                v5_consecutive_misses += 1
                     else:
                         v5_no_player_frames += 1
-                        # Fallback: run OCR on full frame if no players found
-                        dets = roboflow_detector.detect_jersey_v5(
-                            frame, jersey_number=jersey_number, conf=ocr_conf,
-                            skip_preprocess=True,
-                        )
-                        v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
                 if v5_ocr_detections:
                     phases_used.append("v5_ocr_detection")
             layer_timings["v5_ocr_detection"] = {
@@ -517,104 +538,128 @@ async def run_analyze_pipeline(
                 "detections": len(v5_ocr_detections),
                 "players_found": v5_players_found,
                 "no_player_frames": v5_no_player_frames,
+                "crops_processed": v5_total_crops,
+                "exit_reason": v5_exit_reason or "completed",
                 "crop_dimensions_sample": v5_crop_dims[:10],
             }
-            LOGGER.info("Pipeline: v5 OCR (PRIMARY) found %d detections, %d players, crop dims: %s",
-                        len(v5_ocr_detections), v5_players_found, v5_crop_dims[:5])
+            LOGGER.info("Pipeline: v5 OCR found %d detections, %d crops processed, exit: %s",
+                        len(v5_ocr_detections), v5_total_crops, v5_exit_reason or "completed")
         except Exception as exc:
             layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)
 
-        # ── Step 7.5b: v3 OCR pipeline (secondary confirmation) ───────
+        # ── Step 7.5b: v3 OCR pipeline (secondary — skip if v5 found enough) ──
+        _V3_TIME_LIMIT = 45  # seconds
         v3_ocr_detections: list[dict] = []
         t0 = time.perf_counter()
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.load()
+        if len(v5_ocr_detections) >= 3:
+            LOGGER.info("Pipeline: skipping v3 OCR — v5 already found %d detections", len(v5_ocr_detections))
+            layer_timings["v3_ocr_detection"] = {"elapsed_ms": 0, "status": "skipped_v5_sufficient", "detections": 0}
+        else:
+            try:
+                from app.services.roboflow_detector import roboflow_detector
+                roboflow_detector.load()
 
-            LOGGER.info("Pipeline: v3 OCR layer (secondary) running for sport=%s", sport)
-            for t, frame in ocr_frames:
-                dets = roboflow_detector.detect_with_player_crops(
-                    frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
-                )
-                v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
-                v3_ocr_detections.extend({**d, "timestamp": t} for d in v3_only)
-            if v3_ocr_detections:
-                phases_used.append("v3_ocr_detection")
-            layer_timings["v3_ocr_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if v3_ocr_detections else "no_detections",
-                "detections": len(v3_ocr_detections),
-            }
-            LOGGER.info("Pipeline: v3 OCR (secondary) found %d detections", len(v3_ocr_detections))
-        except Exception as exc:
-            layer_timings["v3_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: v3 OCR layer failed (non-fatal): %s", exc)
-
-        # ── Step 7.5c: v2 universal OCR (tertiary — 0.995 mAP50) ──────
-        universal_v2_detections: list[dict] = []
-        t0 = time.perf_counter()
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.load()
-
-            if roboflow_detector.jersey_number_universal_v1_model is not None:
-                LOGGER.info("Pipeline: Universal v2 layer (tertiary) running (conf=%.2f)", ocr_conf)
-                for t, frame in ocr_frames:
-                    dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=ocr_conf)
-                    universal_v2_detections.extend({**d, "timestamp": t} for d in dets)
-                if universal_v2_detections:
-                    phases_used.append("universal_v2_ocr")
-            layer_timings["universal_v2_ocr"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if universal_v2_detections else "no_detections",
-                "detections": len(universal_v2_detections),
-            }
-            LOGGER.info("Pipeline: Universal v2 found %d detections", len(universal_v2_detections))
-        except Exception as exc:
-            layer_timings["universal_v2_ocr"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: Universal v2 layer failed (non-fatal): %s", exc)
-
-        # ── Step 7.5d: v2 sport-specific + v1 legacy (fallback) ──────
-        v2_sport_detections: list[dict] = []
-        v3_primary_detections: list[dict] = []
-        t0 = time.perf_counter()
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.load()
-
-            LOGGER.info("Pipeline: v2 sport-specific + v1 fallback layer running")
-            for t, frame in ocr_frames:
-                dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-                dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-                dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=ocr_conf)
-                v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
-
-            # v3 primary standalone (runs on crops)
-            if roboflow_detector.jersey_ocr_v3_primary_model is not None:
-                for t, frame in ocr_frames:
-                    dets = roboflow_detector.detect_with_v3_primary(
+                sampled = ocr_frames[::3] if len(ocr_frames) > 20 else ocr_frames
+                LOGGER.info("Pipeline: v3 OCR layer running on %d/%d frames for sport=%s", len(sampled), len(ocr_frames), sport)
+                for t, frame in sampled:
+                    if time.perf_counter() - t0 > _V3_TIME_LIMIT:
+                        LOGGER.info("Pipeline: v3 OCR hit time limit (%ds)", _V3_TIME_LIMIT)
+                        break
+                    dets = roboflow_detector.detect_with_player_crops(
                         frame, jersey_number=jersey_number, sport=sport, conf=ocr_conf,
                     )
-                    v3_primary_detections.extend({**d, "timestamp": t} for d in dets)
+                    v3_only = [d for d in dets if d.get("layer", "").startswith("v3_")]
+                    v3_ocr_detections.extend({**d, "timestamp": t} for d in v3_only)
+                if v3_ocr_detections:
+                    phases_used.append("v3_ocr_detection")
+                layer_timings["v3_ocr_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if v3_ocr_detections else "no_detections",
+                    "detections": len(v3_ocr_detections),
+                }
+                LOGGER.info("Pipeline: v3 OCR (secondary) found %d detections", len(v3_ocr_detections))
+            except Exception as exc:
+                layer_timings["v3_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+                LOGGER.warning("Pipeline: v3 OCR layer failed (non-fatal): %s", exc)
 
-            if v2_sport_detections:
-                phases_used.append("v2_sport_detection")
-            if v3_primary_detections:
-                phases_used.append("v3_primary_standalone")
-            layer_timings["v2_sport_detection"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "success" if (v2_sport_detections or v3_primary_detections) else "no_detections",
-                "v2_sport_detections": len(v2_sport_detections),
-                "v3_primary_detections": len(v3_primary_detections),
-            }
-            LOGGER.info("Pipeline: v2/v1/v3-primary found %d + %d detections",
-                        len(v2_sport_detections), len(v3_primary_detections))
-        except Exception as exc:
-            layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
-            LOGGER.warning("Pipeline: v2/v1 layer failed (non-fatal): %s", exc)
+        # ── Step 7.5c: v2 universal OCR (tertiary — skip if prior layers found enough) ──
+        _PRIOR_DETECTIONS = len(v5_ocr_detections) + len(v3_ocr_detections)
+        universal_v2_detections: list[dict] = []
+        t0 = time.perf_counter()
+        if _PRIOR_DETECTIONS >= 3:
+            LOGGER.info("Pipeline: skipping v2/v1 layers — prior layers found %d detections", _PRIOR_DETECTIONS)
+            layer_timings["universal_v2_ocr"] = {"elapsed_ms": 0, "status": "skipped_sufficient", "detections": 0}
+            v2_sport_detections: list[dict] = []
+            v3_primary_detections: list[dict] = []
+            layer_timings["v2_sport_detection"] = {"elapsed_ms": 0, "status": "skipped_sufficient"}
+        else:
+            _V2_TIME_LIMIT = 30
+            try:
+                from app.services.roboflow_detector import roboflow_detector
+                roboflow_detector.load()
+
+                if roboflow_detector.jersey_number_universal_v1_model is not None:
+                    sampled = ocr_frames[::4] if len(ocr_frames) > 15 else ocr_frames
+                    LOGGER.info("Pipeline: Universal v2 layer running on %d frames (conf=%.2f)", len(sampled), ocr_conf)
+                    for t, frame in sampled:
+                        if time.perf_counter() - t0 > _V2_TIME_LIMIT:
+                            break
+                        dets = roboflow_detector._run_universal_ocr(frame, jersey_number, conf=ocr_conf)
+                        universal_v2_detections.extend({**d, "timestamp": t} for d in dets)
+                    if universal_v2_detections:
+                        phases_used.append("universal_v2_ocr")
+                layer_timings["universal_v2_ocr"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if universal_v2_detections else "no_detections",
+                    "detections": len(universal_v2_detections),
+                }
+                LOGGER.info("Pipeline: Universal v2 found %d detections", len(universal_v2_detections))
+            except Exception as exc:
+                layer_timings["universal_v2_ocr"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+                LOGGER.warning("Pipeline: Universal v2 layer failed (non-fatal): %s", exc)
+
+            # ── Step 7.5d: v2 sport-specific + v1 legacy (fallback — 30s limit) ──
+            v2_sport_detections = []
+            v3_primary_detections = []
+            t0 = time.perf_counter()
+            try:
+                from app.services.roboflow_detector import roboflow_detector
+                roboflow_detector.load()
+
+                sampled = ocr_frames[::4] if len(ocr_frames) > 15 else ocr_frames
+                LOGGER.info("Pipeline: v2 sport-specific + v1 fallback running on %d frames", len(sampled))
+                for t, frame in sampled:
+                    if time.perf_counter() - t0 > _V2_TIME_LIMIT:
+                        break
+                    dets = roboflow_detector._run_sport_specific_v2(frame, jersey_number, sport, conf=ocr_conf)
+                    v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+                    dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=ocr_conf)
+                    v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+                    dets = roboflow_detector.detect_football_tracker(frame, jersey_number, conf=ocr_conf)
+                    v2_sport_detections.extend({**d, "timestamp": t} for d in dets)
+
+                if v2_sport_detections:
+                    phases_used.append("v2_sport_detection")
+                layer_timings["v2_sport_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if v2_sport_detections else "no_detections",
+                    "v2_sport_detections": len(v2_sport_detections),
+                }
+                LOGGER.info("Pipeline: v2/v1 found %d detections", len(v2_sport_detections))
+            except Exception as exc:
+                layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
+                LOGGER.warning("Pipeline: v2/v1 layer failed (non-fatal): %s", exc)
+
+        # ── Free Roboflow models before Ali ──
+        import gc as _gc2
+        try:
+            from app.services.roboflow_detector import roboflow_detector
+            roboflow_detector.unload_request_models()
+            _gc2.collect()
+            LOGGER.info("Pipeline: freed Roboflow models before Ali")
+        except Exception:
+            pass
 
         # ── Step 7.5e: Ali ensemble (LAST RESORT — only if <3 detections) ──
         # Count total OCR detections from all trained layers
@@ -1411,6 +1456,24 @@ def _extract_frames(
         return []
 
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration_est = total_frames / video_fps if video_fps > 0 else 0
+
+    # Robust pre-trim detection: if start_sec is beyond 90% of the video
+    # duration, the video was likely pre-trimmed by --download-sections or
+    # the render server.  Reset to scan from the beginning.
+    if start_sec > 0 and video_duration_est > 0 and start_sec > video_duration_est * 0.9:
+        # Video was pre-trimmed (e.g. start=120, end=180, but file is only 60s long)
+        # Compute expected segment duration before resetting start_sec
+        segment_duration = (end_sec - start_sec) if end_sec > start_sec else video_duration_est
+        LOGGER.warning(
+            "_extract_frames: start_sec=%.1f > video_duration=%.1fs — "
+            "video likely pre-trimmed, resetting to start=0 end=%.1f",
+            start_sec, video_duration_est, min(segment_duration, video_duration_est),
+        )
+        start_sec = 0
+        end_sec = min(segment_duration, video_duration_est)
+
     frame_interval = max(1, int(video_fps / fps))
     cap_limit = max_frames if max_frames > 0 else MAX_FRAMES
     frames: list[tuple[float, np.ndarray]] = []
@@ -1450,8 +1513,8 @@ def _extract_frames(
 
     cap.release()
     LOGGER.info(
-        "Extracted %d frames (fps=%d, range=%.1f-%.1f, cap=%d)",
-        len(frames), fps, start_sec, end_sec, cap_limit,
+        "Extracted %d frames (fps=%d, range=%.1f-%.1f, cap=%d, video_dur=%.1f)",
+        len(frames), fps, start_sec, end_sec, cap_limit, video_duration_est,
     )
     return frames
 

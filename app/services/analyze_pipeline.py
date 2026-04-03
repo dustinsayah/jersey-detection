@@ -632,8 +632,10 @@ async def _run_analyze_pipeline_impl(
                         LOGGER.info("Pipeline: v5 OCR hit time limit (%ds), moving on", _V5_TIME_LIMIT)
                         break
                     # For football: validate crop sizes and re-detect within oversized regions
+                    # Football: higher conf to reduce false positives (tiny garbage bboxes)
+                    _player_conf = 0.35 if _is_football else 0.20
                     players = roboflow_detector.detect_players_v5(
-                        frame, conf=0.20,
+                        frame, conf=_player_conf,
                         validate_crop_size=_is_football,
                     )
                     v5_players_found += len(players) if players else 0
@@ -661,6 +663,11 @@ async def _run_analyze_pipeline_impl(
                             if crop.size == 0:
                                 continue
                             ch, cw = crop.shape[:2]
+                            # Skip tiny crops that can't contain readable jersey numbers
+                            if cw < 40 or ch < 60:
+                                LOGGER.debug("Skipping tiny crop %dx%d at frame t=%.1f", cw, ch, t)
+                                v5_crop_dims.append(f"{cw}x{ch}(skip)")
+                                continue
                             v5_crop_dims.append(f"{cw}x{ch}")
                             v5_total_crops += 1
                             dets = roboflow_detector.detect_jersey_v5(
@@ -704,8 +711,10 @@ async def _run_analyze_pipeline_impl(
                 from app.services.roboflow_detector import roboflow_detector
                 roboflow_detector.load()
 
-                sampled = ocr_frames[::3] if len(ocr_frames) > 20 else ocr_frames
-                LOGGER.info("Pipeline: v3 OCR layer running on %d/%d frames for sport=%s", len(sampled), len(ocr_frames), sport)
+                # Football: sample more aggressively (every 2 instead of 3) since v5 player detector struggles
+                _v3_step = 2 if sport.lower() == "football" else 3
+                sampled = ocr_frames[::_v3_step] if len(ocr_frames) > 20 else ocr_frames
+                LOGGER.info("Pipeline: v3 OCR layer running on %d/%d frames for sport=%s (step=%d)", len(sampled), len(ocr_frames), sport, _v3_step)
                 for t, frame in sampled:
                     if time.perf_counter() - t0 > _V3_TIME_LIMIT:
                         LOGGER.info("Pipeline: v3 OCR hit time limit (%ds)", _V3_TIME_LIMIT)

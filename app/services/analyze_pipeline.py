@@ -464,10 +464,10 @@ async def run_analyze_pipeline(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 90s, max 300 crops, early exit after 100 zero-match crops
+        # Guardrails: max 90s, max 200 crops, early exit after 50 zero-match crops
         _V5_TIME_LIMIT = 90  # seconds
-        _V5_MAX_CROPS = 300
-        _V5_EARLY_EXIT_AFTER = 100  # consecutive zero-match crops before giving up
+        _V5_MAX_CROPS = 200
+        _V5_EARLY_EXIT_AFTER = 50  # consecutive zero-match crops before giving up
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0

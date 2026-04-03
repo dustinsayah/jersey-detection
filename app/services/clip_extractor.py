@@ -48,8 +48,10 @@ MIN_CLIP_DURATION = 3.0
 MAX_CLIP_DURATION = 30.0
 
 # Maximum distance between jersey detections to cluster them (seconds)
-DETECTION_CLUSTER_GAP = 5.0
-# Tighter clustering for football: each play is a distinct burst (snap → whistle)
+# Basketball: 3s gap — fast-paced, plays change quickly
+# Football: 2.5s gap — each play is a distinct burst (snap → whistle)
+# Default: 4s for other sports
+DETECTION_CLUSTER_GAP = 3.0
 FOOTBALL_CLUSTER_GAP = 2.5
 
 
@@ -287,6 +289,28 @@ def extract_clips(
             signals=classification.signals or {},
             detection_count=len(cluster),
         ))
+
+    # ── Step 2.5: Touchdown sanity check ─────────────────────────────────
+    # Max 2 touchdowns per 60 seconds of footage — more than that is a
+    # false positive from the rule classifier
+    _SCORING_PLAY_TYPES = {"touchdown", "made_shot", "goal"}
+    scoring_clips = [c for c in clips if c.play_type in _SCORING_PLAY_TYPES]
+    if len(scoring_clips) > 2:
+        # Check time span
+        time_span = max(c.end_time for c in scoring_clips) - min(c.start_time for c in scoring_clips)
+        max_scoring_per_60 = max(2, int(time_span / 60) * 2) if time_span > 0 else 2
+        if len(scoring_clips) > max_scoring_per_60:
+            LOGGER.warning(
+                "Scoring sanity check: %d '%s' clips in %.0fs — capping at %d, "
+                "demoting rest to game_action",
+                len(scoring_clips), scoring_clips[0].play_type, time_span, max_scoring_per_60,
+            )
+            # Keep the top N by score, demote the rest
+            scoring_clips.sort(key=lambda c: c.score, reverse=True)
+            for clip in scoring_clips[max_scoring_per_60:]:
+                clip.play_type = "game_action"
+                clip.play_label = "Game Action"
+                clip.description = "Game Action"
 
     # ── Step 3: Merge overlapping clips ──────────────────────────────────
     clips.sort(key=lambda c: c.start_time)

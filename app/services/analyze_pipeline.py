@@ -900,6 +900,17 @@ async def _run_analyze_pipeline_impl(
                     # v4 outcome models (sport-specific, returns [] if not loaded)
                     v4_dets = roboflow_detector.detect_outcome_v4(frame, sport=sport)
                     if v4_dets:
+                        # Filter low-confidence scoring outcomes (TD/goal must be > 0.6)
+                        _HIGH_STAKES = {"touchdown", "made_shot", "goal"}
+                        v4_dets = [d for d in v4_dets
+                                   if d.get("confidence", 0) >= 0.6
+                                   or d.get("outcome", "") not in _HIGH_STAKES]
+                        for d in v4_dets:
+                            LOGGER.info(
+                                "v4 outcome: %s confidence=%.3f at t=%.1f",
+                                d.get("outcome"), d.get("confidence", 0), t,
+                            )
+                    if v4_dets:
                         best = max(v4_dets, key=lambda d: d.get("confidence", 0))
                         v4_outcomes_by_ts[t] = best["outcome"]
                         v4_outcome_detections.extend(
@@ -1267,10 +1278,12 @@ async def _run_analyze_pipeline_impl(
                 total_raw,
             )
 
-        # ── Motion supplement: if we have SOME detections (1-5), add high-motion
-        # frames as supplementary points to create more clips.  The player IS in
-        # the video (confirmed by OCR), so motion peaks are likely their plays.
-        if 1 <= len(detection_points) <= 5 and _frame_timestamps:
+        # ── Motion supplement: if we have detections but they cluster into few
+        # clips, add high-motion frames as supplementary points.  The player IS
+        # in the video (confirmed by OCR), so motion peaks are likely their plays.
+        # Threshold raised from 5→20 because improved v5 OCR now finds 10-15
+        # detections that all chain into a single cluster at 5s gap.
+        if 1 <= len(detection_points) <= 20 and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
             _motion_thresh = 30  # moderate-to-strong motion (basketball avg ~37)
             _supplement_count = 0

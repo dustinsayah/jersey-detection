@@ -668,7 +668,16 @@ async def _run_analyze_pipeline_impl(
                                 LOGGER.debug("Skipping tiny crop %dx%d at frame t=%.1f", cw, ch, t)
                                 v5_crop_dims.append(f"{cw}x{ch}(skip)")
                                 continue
-                            v5_crop_dims.append(f"{cw}x{ch}")
+                            # Football: force 2x upscale before OCR — jersey numbers are
+                            # typically only 20-30px on a 178px-wide player crop at 720p
+                            if _is_football and max(cw, ch) < 500:
+                                crop = cv2.resize(crop, (cw * 2, ch * 2), interpolation=cv2.INTER_CUBIC)
+                                # Sharpen after upscale
+                                gaussian = cv2.GaussianBlur(crop, (0, 0), 1.5)
+                                crop = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
+                                v5_crop_dims.append(f"{cw}x{ch}→{cw*2}x{ch*2}")
+                            else:
+                                v5_crop_dims.append(f"{cw}x{ch}")
                             v5_total_crops += 1
                             dets = roboflow_detector.detect_jersey_v5(
                                 crop, jersey_number=jersey_number, conf=ocr_conf,
@@ -698,6 +707,44 @@ async def _run_analyze_pipeline_impl(
         except Exception as exc:
             layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)
+
+        # ── Step 7.5a-2: Football full-frame OCR fallback ──────────────────
+        # Football crops struggle at distance — try digit detector on full frames
+        football_ff_detections: list[dict] = []
+        _is_football_sport = sport.lower() == "football"
+        if _is_football_sport and len(v5_ocr_detections) == 0:
+            t0 = time.perf_counter()
+            try:
+                from app.services.roboflow_detector import roboflow_detector
+                roboflow_detector.load()
+                _ff_frames = ocr_frames[::3] if len(ocr_frames) > 20 else ocr_frames
+                LOGGER.info("Pipeline: football full-frame OCR on %d frames", len(_ff_frames))
+                for t, frame in _ff_frames[:30]:  # Max 30 frames
+                    if time.perf_counter() - t0 > 30:
+                        break
+                    # Try full-frame with v5 OCR model
+                    ff_dets = roboflow_detector.detect_jersey_v5(
+                        frame, jersey_number=jersey_number, conf=0.10,
+                        skip_preprocess=False,
+                    )
+                    if ff_dets:
+                        football_ff_detections.extend({**d, "timestamp": t, "layer": "v5_football_fullframe"} for d in ff_dets)
+                    # Also try football digit detector
+                    fd_dets = roboflow_detector.detect_football_digits(frame, jersey_number, conf=0.15)
+                    if fd_dets:
+                        football_ff_detections.extend({**d, "timestamp": t} for d in fd_dets)
+                if football_ff_detections:
+                    v5_ocr_detections.extend(football_ff_detections)
+                    phases_used.append("football_fullframe_ocr")
+                    LOGGER.info("Pipeline: football full-frame OCR found %d detections", len(football_ff_detections))
+                layer_timings["football_fullframe_ocr"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if football_ff_detections else "no_detections",
+                    "detections": len(football_ff_detections),
+                }
+            except Exception as exc:
+                LOGGER.warning("Pipeline: football full-frame OCR failed (non-fatal): %s", exc)
+                layer_timings["football_fullframe_ocr"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
 
         # ── Step 7.5b: v3 OCR pipeline (secondary — skip if v5 found enough) ──
         _V3_TIME_LIMIT = 45  # seconds

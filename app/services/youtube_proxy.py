@@ -1,4 +1,15 @@
-# YouTube download proxy — 5-strategy robust download chain
+# YouTube download proxy — 7-strategy robust download chain
+#
+# Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
+# limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
+# also REQUIRED to unlock any DASH formats. Strategy order:
+#   1. yt-dlp android_vr + DASH H.264 + EJS (720p+ if IP not blocked)
+#   2. yt-dlp android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY set)
+#   3. Render server proxy
+#   4. yt-dlp android muxed (360p fallback)
+#   5. yt-dlp Python lib android_vr + DASH
+#   6. yt-dlp android muxed no-EJS (last resort)
+#   7. Render server /extract-frames
 
 from __future__ import annotations
 
@@ -30,6 +41,12 @@ RENDER_SERVER_URL = os.getenv(
     "https://clipt-render-server-production.up.railway.app",
 ).rstrip("/")
 
+# Optional proxy for yt-dlp — set to residential proxy or Cloudflare WARP SOCKS5
+# e.g. socks5://127.0.0.1:40000 (WARP) or socks5://user:pass@proxy.example.com:1080
+# Read at runtime via function (start.sh sets it dynamically after wireproxy starts)
+def _get_proxy() -> str:
+    return os.getenv("YT_DLP_PROXY", "").strip()
+
 _YT_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/live/)([A-Za-z0-9_-]{11})"
 )
@@ -40,9 +57,19 @@ _YT_TIMESTAMP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Format string — prefer highest quality for jersey OCR accuracy
-# DASH streams (bestvideo+bestaudio) are 720p/1080p; muxed formats are usually 360p
-_HQ_FORMAT = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
+# DASH H.264 format — merges video+audio into MP4, OpenCV-readable
+# Explicitly filter for avc1 (H.264) to avoid VP9/AV1 which OpenCV can't decode
+# Fallback chain: 720p+ H.264 DASH → any 720p+ MP4 DASH → muxed MP4 → itag 18
+_DASH_H264_FORMAT = (
+    "bestvideo[height=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[height>=720][height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[height>=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/"
+    "best[height>=720][ext=mp4]/"
+    "best[ext=mp4]/18/best"
+)
+# Muxed-only format (no DASH merge needed) — safe fallback, usually 360p
+_MUXED_FORMAT = "best[height<=1080][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
 # Fallback for android client (muxed only, usually 360p)
 _ANDROID_FORMAT = "best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
 
@@ -120,6 +147,8 @@ def _yt_dlp_download(
     timeout: int = 180,
     strategy_name: str = "",
     format_override: str | None = None,
+    use_ejs: bool = True,
+    proxy: str = "",
 ) -> bool:
     """Run yt-dlp subprocess with given client. Returns True on success."""
     if output_path.exists():
@@ -138,8 +167,14 @@ def _yt_dlp_download(
         "-o", str(output_path),
     ]
 
-    # Add EJS support if deno is available (helps with some extraction)
-    cmd.extend(["--remote-components", "ejs:github"])
+    # EJS: required for YouTube n-challenge solving (unlocks DASH 720p+ formats)
+    # Needs deno runtime installed (see Dockerfile). Without this, only 360p muxed available.
+    if use_ejs:
+        cmd.extend(["--remote-components", "ejs:github"])
+
+    # Proxy support: route through residential proxy or Cloudflare WARP
+    if proxy:
+        cmd.extend(["--proxy", proxy])
 
     if start_time > 0 or end_time > 0:
         section = f"*{start_time}-{end_time}" if end_time > 0 else f"*{start_time}-inf"
@@ -147,7 +182,8 @@ def _yt_dlp_download(
 
     cmd.append(url)
 
-    LOGGER.info("%s: running yt-dlp client=%s format=%s", strategy_name, client, fmt[:60])
+    LOGGER.info("%s: running yt-dlp client=%s format=%s proxy=%s ejs=%s",
+                strategy_name, client, fmt[:60], bool(proxy), use_ejs)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
     if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
@@ -166,8 +202,9 @@ def _yt_dlp_python_download(
     client: str = "android",
     start_time: float = 0,
     end_time: float = 0,
-    strategy_name: str = "Strategy 4",
+    strategy_name: str = "Strategy 5",
     format_override: str | None = None,
+    proxy: str = "",
 ) -> bool:
     """Use yt-dlp as Python library (no subprocess). Returns True on success."""
     try:
@@ -189,12 +226,15 @@ def _yt_dlp_python_download(
             "noplaylist": True,
         }
 
+        if proxy:
+            ydl_opts["proxy"] = proxy
+
         if (start_time > 0 or end_time > 0):
             ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
                 None, [(start_time, end_time if end_time > 0 else float("inf"))]
             )
 
-        LOGGER.info("%s: yt-dlp Python library (client=%s)", strategy_name, client)
+        LOGGER.info("%s: yt-dlp Python library (client=%s, proxy=%s)", strategy_name, client, bool(proxy))
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -277,11 +317,16 @@ def download_youtube_sync(
     yt_dlp_binary: str = "yt-dlp",
     ffmpeg_binary: str = "ffmpeg",
 ) -> DownloadResult:
-    """Synchronous 5-strategy YouTube download chain.
+    """Synchronous 7-strategy YouTube download chain.
 
-    Returns DownloadResult with trimming metadata so callers know
-    whether the video timestamps start at 0 (was_sectioned=True)
-    or at the original YouTube timestamps (was_sectioned=False).
+    Strategy order optimized for quality (720p+ when possible):
+      1. android_vr + DASH H.264 + EJS (720p+ from non-blocked IPs)
+      2. android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY configured)
+      3. Render server proxy
+      4. android muxed + EJS (360p, solves n-challenge)
+      5. Python lib android_vr + DASH
+      6. android muxed no-EJS (bare fallback)
+      7. Render server /extract-frames
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
@@ -293,7 +338,8 @@ def download_youtube_sync(
         start_time = url_start_seconds
 
     has_time_range = start_time > 0 or end_time > 0
-    LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s", RENDER_SERVER_URL, start_time, end_time)
+    LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s, proxy=%s",
+                RENDER_SERVER_URL, start_time, end_time, bool(_get_proxy()))
     dl_start = time.perf_counter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_sync_"))
     output_path = tmp_dir / "video.mp4"
@@ -308,50 +354,78 @@ def download_youtube_sync(
             requested_end=end_time,
         )
 
-    # ── Strategy 1: yt-dlp android_vr client (best no-token client for quality) ──
+    # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
+    # android_vr client can list 720p/1080p DASH formats when EJS solver works.
+    # DASH H.264 format ensures OpenCV compatibility (no VP9/AV1).
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android_vr", start_time=start_time, end_time=end_time,
-                        strategy_name="Strategy 1", format_override=_HQ_FORMAT):
+                        timeout=120, strategy_name="Strategy 1",
+                        format_override=_DASH_H264_FORMAT, use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 1 (yt-dlp android_vr HQ)", elapsed)
-        # yt-dlp --download-sections already trimmed → timestamps start at 0
+        LOGGER.info("Sync downloaded in %ss via Strategy 1 (android_vr DASH+EJS)", elapsed)
         return _make_result(output_path, sectioned=has_time_range)
-    strategy_errors.append("1=yt-dlp_android_vr_failed")
+    strategy_errors.append("1=android_vr_dash_ejs_failed")
 
-    # ── Strategy 2: yt-dlp android client (muxed fallback) ──
+    # ── Strategy 2: Same as 1 but with proxy (if configured) ──
+    # Residential proxy or Cloudflare WARP bypasses YouTube datacenter IP block.
+    proxy = _get_proxy()
+    if proxy:
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=120, strategy_name="Strategy 2",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=proxy):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 2 (android_vr DASH+EJS+proxy)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range)
+        strategy_errors.append("2=android_vr_dash_proxy_failed")
+    else:
+        strategy_errors.append("2=no_proxy_configured")
+
+    # ── Strategy 3: Render server proxy ──
+    # Render server receives startTime/endTime and returns pre-trimmed video.
+    # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
+    with httpx.Client(timeout=httpx.Timeout(90)) as client:
+        if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range)
+    strategy_errors.append("3=render_server_failed")
+
+    # ── Strategy 4: yt-dlp android muxed + EJS (360p but reliable) ──
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android", start_time=start_time, end_time=end_time,
-                        strategy_name="Strategy 2"):
+                        strategy_name="Strategy 4", format_override=_MUXED_FORMAT,
+                        use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 2 (yt-dlp android)", elapsed)
+        LOGGER.info("Sync downloaded in %ss via Strategy 4 (android muxed+EJS)", elapsed)
         return _make_result(output_path, sectioned=has_time_range)
-    strategy_errors.append("2=yt-dlp_android_failed")
+    strategy_errors.append("4=android_muxed_ejs_failed")
 
-    # ── Strategy 3: yt-dlp Python library with android_vr ──
+    # ── Strategy 5: yt-dlp Python library with android_vr + DASH ──
     if _yt_dlp_python_download(url, output_path, client="android_vr",
                                start_time=start_time, end_time=end_time,
-                               strategy_name="Strategy 3",
-                               format_override=_HQ_FORMAT):
+                               strategy_name="Strategy 5",
+                               format_override=_DASH_H264_FORMAT):
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 3 (Python lib android_vr)", elapsed)
+        LOGGER.info("Sync downloaded in %ss via Strategy 5 (Python lib android_vr)", elapsed)
         return _make_result(output_path, sectioned=has_time_range)
-    strategy_errors.append("3=python_lib_android_vr_failed")
+    strategy_errors.append("5=python_lib_android_vr_failed")
 
-    # ── Strategy 4: Render server proxy (may serve lower quality, does NOT section) ──
-    with httpx.Client(timeout=httpx.Timeout(90)) as client:
-        if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 4"):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 4 (render server)", elapsed)
-            # Render server may return full video — trim it
-            if has_time_range:
-                output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-            return _make_result(output_path, sectioned=False)
-    strategy_errors.append("4=render_server_failed")
+    # ── Strategy 6: yt-dlp android muxed no-EJS (bare minimum) ──
+    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                        client="android", start_time=start_time, end_time=end_time,
+                        strategy_name="Strategy 6", format_override=_ANDROID_FORMAT,
+                        use_ejs=False):
+        elapsed = round(time.perf_counter() - dl_start, 1)
+        LOGGER.info("Sync downloaded in %ss via Strategy 6 (android muxed bare)", elapsed)
+        return _make_result(output_path, sectioned=has_time_range)
+    strategy_errors.append("6=android_muxed_bare_failed")
 
-    # ── Strategy 5: Render server /extract-frames (last resort) ──
+    # ── Strategy 7: Render server /extract-frames (last resort) ──
     if RENDER_SERVER_URL:
         try:
-            LOGGER.info("Strategy 5: render server /extract-frames (last resort)")
+            LOGGER.info("Strategy 7: render server /extract-frames (last resort)")
             with httpx.Client(timeout=httpx.Timeout(120)) as client:
                 payload: dict = {"youtubeUrl": url}
                 if start_time > 0:
@@ -366,10 +440,8 @@ def download_youtube_sync(
                             output_path.unlink()
                         output_path.write_bytes(resp.content)
                         elapsed = round(time.perf_counter() - dl_start, 1)
-                        LOGGER.info("Sync downloaded in %ss via Strategy 5 (extract-frames)", elapsed)
-                        if has_time_range:
-                            output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-                        return _make_result(output_path, sectioned=False)
+                        LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames)", elapsed)
+                        return _make_result(output_path, sectioned=has_time_range)
                     ct = resp.headers.get("content-type", "")
                     if "json" in ct or "text" in ct:
                         data = resp.json()
@@ -381,17 +453,15 @@ def download_youtube_sync(
                                     output_path.unlink()
                                 output_path.write_bytes(dl_resp.content)
                                 elapsed = round(time.perf_counter() - dl_start, 1)
-                                LOGGER.info("Sync downloaded in %ss via Strategy 5 (extract-frames URL)", elapsed)
-                                if has_time_range:
-                                    output_path = _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-                                return _make_result(output_path, sectioned=False)
-                LOGGER.warning("Strategy 5 failed: %d", resp.status_code)
+                                LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames URL)", elapsed)
+                                return _make_result(output_path, sectioned=has_time_range)
+                LOGGER.warning("Strategy 7 failed: %d", resp.status_code)
         except Exception as exc:
-            LOGGER.warning("Strategy 5 failed: %s", exc)
-    strategy_errors.append("5=extract_frames_failed")
+            LOGGER.warning("Strategy 7 failed: %s", exc)
+    strategy_errors.append("7=extract_frames_failed")
 
     raise RuntimeError(
-        f"All 5 YouTube download strategies failed (sync) for: {url} "
+        f"All 7 YouTube download strategies failed (sync) for: {url} "
         f"(original: {original_url}). "
         f"Errors: {', '.join(strategy_errors)}. "
         f"Check Railway logs for per-strategy errors."
@@ -432,8 +502,8 @@ def test_youtube_download_sync(
     start = time.perf_counter()
     strategy_results: list[dict] = []
 
-    # Test Strategy 1: Render server
-    s1_start = time.perf_counter()
+    # Test render server separately for diagnostics
+    s_start = time.perf_counter()
     try:
         with httpx.Client(timeout=httpx.Timeout(60)) as client:
             payload = {"youtubeUrl": url}
@@ -442,46 +512,47 @@ def test_youtube_download_sync(
                 ct = resp.headers.get("content-type", "")
                 data = resp.json() if "json" in ct else {}
                 cloud_url = data.get("cloudinaryUrl", "")
-                if cloud_url:
-                    strategy_results.append({
-                        "strategy": 1, "name": "render_server",
-                        "status": "success", "cloudinaryUrl": cloud_url,
-                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
-                    })
-                else:
-                    strategy_results.append({
-                        "strategy": 1, "name": "render_server",
-                        "status": "no_url",
-                        "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
-                    })
+                strategy_results.append({
+                    "name": "render_server_probe",
+                    "status": "success" if cloud_url else "no_url",
+                    "cloudinaryUrl": cloud_url,
+                    "elapsed_ms": round((time.perf_counter() - s_start) * 1000),
+                })
             else:
                 strategy_results.append({
-                    "strategy": 1, "name": "render_server",
+                    "name": "render_server_probe",
                     "status": f"http_{resp.status_code}",
-                    "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+                    "elapsed_ms": round((time.perf_counter() - s_start) * 1000),
                 })
     except Exception as exc:
         strategy_results.append({
-            "strategy": 1, "name": "render_server",
+            "name": "render_server_probe",
             "status": "error", "error": str(exc)[:200],
-            "elapsed_ms": round((time.perf_counter() - s1_start) * 1000),
+            "elapsed_ms": round((time.perf_counter() - s_start) * 1000),
         })
 
-    # Full download test using sync chain
+    # Full download test using 7-strategy chain
     try:
-        path = download_youtube_sync(
+        dl_result = download_youtube_sync(
             url,
             yt_dlp_binary=yt_dlp_binary,
             ffmpeg_binary=ffmpeg_binary,
         )
         elapsed = round(time.perf_counter() - start, 1)
-        file_size = path.stat().st_size if path.exists() else 0
+        file_size = dl_result.path.stat().st_size if dl_result.path.exists() else 0
+        # Get resolution of downloaded file
+        w, h = get_video_resolution(dl_result.path)
         return {
             "success": True,
             "file_size": file_size,
             "file_size_mb": round(file_size / 1024 / 1024, 2),
+            "resolution": f"{w}x{h}",
+            "width": w,
+            "height": h,
             "elapsed": elapsed,
-            "file_path": str(path),
+            "file_path": str(dl_result.path),
+            "was_sectioned": dl_result.was_sectioned,
+            "proxy_configured": bool(_get_proxy()),
             "render_server_url": RENDER_SERVER_URL,
             "strategy_results": strategy_results,
         }
@@ -491,6 +562,7 @@ def test_youtube_download_sync(
             "success": False,
             "error": str(exc),
             "elapsed": elapsed,
+            "proxy_configured": bool(_get_proxy()),
             "render_server_url": RENDER_SERVER_URL,
             "strategy_results": strategy_results,
         }

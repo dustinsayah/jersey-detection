@@ -664,6 +664,9 @@ async def run_analyze_pipeline(
             LOGGER.info("Pipeline: freed ALL Roboflow models before Ali")
         except Exception:
             pass
+        # Save timestamps BEFORE clearing frame data (needed for motion supplement later)
+        _frame_timestamps = [t for t, _ in frames] if frames else []
+        _frame_count = len(_frame_timestamps)
         # Free ALL frame data (no longer needed — Ali processes its own frames)
         ocr_frames = []
         frames.clear()
@@ -814,11 +817,9 @@ async def run_analyze_pipeline(
             layer_timings["scoreboard_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: scoreboard detection failed (non-fatal): %s", exc)
 
-        # ── Free frame pixel data — all frame-dependent steps are done ──
-        # Keep timestamps but release the heavy numpy arrays
-        _frame_timestamps = [t for t, _ in frames] if frames else []
-        _frame_count = len(_frame_timestamps)
-        # Clear the lists to release numpy memory
+        # ── Free remaining frame pixel data ──
+        # _frame_timestamps already saved before Ali (line ~668)
+        # Clear any remaining references
         if frames:
             frames.clear()
         if live_frames:
@@ -1117,7 +1118,7 @@ async def run_analyze_pipeline(
         # the video (confirmed by OCR), so motion peaks are likely their plays.
         if 1 <= len(detection_points) <= 5 and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
-            _motion_thresh = 40  # only strong motion
+            _motion_thresh = 30  # moderate-to-strong motion (basketball avg ~37)
             _supplement_count = 0
             for t in _frame_timestamps:
                 if t in _existing_ts:

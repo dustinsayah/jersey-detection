@@ -117,21 +117,21 @@ class TestJerseyUpscaler:
 class TestMaybeUpscale:
     """Tests for _maybe_upscale helper in RoboflowDetector."""
 
-    def test_small_crop_gets_upscaled(self) -> None:
+    def test_small_crop_gets_bicubic_upscale(self) -> None:
         from app.services.roboflow_detector import RoboflowDetector
         det = RoboflowDetector()
-        # With no SR model loaded, _maybe_upscale should return original (no upscaler)
+        # With no SR model, small crops (max<=200) get bicubic 2x
         det._jersey_upscaler = None
         crop = np.zeros((32, 32, 3), dtype=np.uint8)
         result = det._maybe_upscale(crop)
-        assert result.shape == (32, 32, 3)  # No upscaler → returns unchanged
+        assert result.shape == (64, 64, 3)  # Bicubic 2x for small crops
 
     def test_large_crop_not_upscaled(self) -> None:
         from app.services.roboflow_detector import RoboflowDetector
         det = RoboflowDetector()
-        crop = np.zeros((200, 200, 3), dtype=np.uint8)
+        crop = np.zeros((201, 201, 3), dtype=np.uint8)
         result = det._maybe_upscale(crop)
-        assert result.shape == (200, 200, 3)  # Large → not upscaled
+        assert result.shape == (201, 201, 3)  # Large → not upscaled
 
 
 class TestPriorityFlip:

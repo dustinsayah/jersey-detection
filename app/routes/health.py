@@ -96,7 +96,10 @@ def _check_phases() -> dict:
         "crowd_obstruction_specialist_v4", "helmet_glare_specialist_v4",
         "low_resolution_specialist_v4", "multi_player_cluster_v4",
     }
-    _all_versioned_keys = _v5_keys | _v1_keys | _v2_baz_keys | _v3_ocr_keys | _v4_outcome_keys
+    _v7_keys = {
+        "football_jersey_ocr_v7", "navy_jersey_specialist_v7", "football_player_crop_v7",
+    }
+    _all_versioned_keys = _v5_keys | _v1_keys | _v2_baz_keys | _v3_ocr_keys | _v4_outcome_keys | _v7_keys
     try:
         from app.services.roboflow_detector import roboflow_detector
         rf_status = roboflow_detector.status()
@@ -129,6 +132,11 @@ def _check_phases() -> dict:
         }
         v4_loaded = sum(1 for k in _v4_outcome_keys if rf_status.get(k) == "loaded")
         phases["roboflow_v4_outcome_summary"] = f"{v4_loaded}/20 loaded"
+        phases["roboflow_models_v7"] = {
+            k: v for k, v in rf_status.items() if k in _v7_keys
+        }
+        v7_loaded = sum(1 for k in _v7_keys if rf_status.get(k) == "loaded")
+        phases["roboflow_v7_football_summary"] = f"{v7_loaded}/3 loaded"
     except Exception:
         phases["roboflow_models_v1"] = {"error": "import_failed"}
 

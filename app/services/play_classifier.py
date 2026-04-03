@@ -116,19 +116,35 @@ def classify_play(
     # Football QB boost: QBs are in every offensive play, so motion/outcome
     # signals are highly reliable even without jersey detection at 360p
     if sport.lower() == "football" and position and position.lower() in ("qb", "quarterback"):
-        if v4_outcome in ("pass_play", "qb_scramble", "completion", "sack", "touchdown"):
+        if v4_outcome in ("pass_play", "qb_scramble"):
+            score = min(100, score + 20)
+            LOGGER.debug("QB outcome boost +20 for v4_outcome=%s", v4_outcome)
+        elif v4_outcome in ("completion", "sack", "touchdown"):
             score = min(100, score + 15)
-            LOGGER.debug("QB position boost +15 for v4_outcome=%s", v4_outcome)
-        if pose_action in ("standing", "throwing"):
+            LOGGER.debug("QB outcome boost +15 for v4_outcome=%s", v4_outcome)
+        if pose_action == "throwing":
+            score = min(100, score + 25)
+            LOGGER.debug("QB pose boost +25 for throwing")
+        elif pose_action == "running":
+            score = min(100, score + 15)
+            LOGGER.debug("QB pose boost +15 for running")
+        elif pose_action == "standing":
+            score = min(100, score + 5)
+            LOGGER.debug("QB pose boost +5 for standing")
+        if crowd_energy > 0.3:
             score = min(100, score + 10)
-            LOGGER.debug("QB pose boost +10 for pose=%s", pose_action)
+            LOGGER.debug("QB crowd boost +10 for crowd_energy=%.2f", crowd_energy)
 
-    # Grade assignment
-    if score >= 90:
+    # Grade assignment — calibrated so without v4 outcome models:
+    #   Elite: top ~10% (scoring plays or QB highlight)
+    #   Strong: next ~10% (clear highlight play)
+    #   Decent: middle ~60% (player involved)
+    #   Cut: bottom ~20% (not involved / dead ball)
+    if score >= 75:
         grade = "Elite"
-    elif score >= 70:
+    elif score >= 55:
         grade = "Strong"
-    elif score >= 50:
+    elif score >= 35:
         grade = "Decent"
     else:
         grade = "Cut"

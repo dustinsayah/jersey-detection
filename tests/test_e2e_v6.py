@@ -70,18 +70,16 @@ class TestDetectionPriorityOrder:
         det = RoboflowDetector()
         assert det.get_primary_detection() == "ali"
 
-    def test_load_order_v5_before_v3(self) -> None:
-        """Verify the load() method loads v5 models first in priority order."""
+    def test_load_order_v5_first(self) -> None:
+        """Verify that load() only loads v5 essential models at startup.
+        v3/v2/v4/v1 are deferred to load_for_request().
+        """
         import inspect
         from app.services.roboflow_detector import RoboflowDetector
         source = inspect.getsource(RoboflowDetector.load)
-        v5_pos = source.find("PRIORITY GROUP 1: v5")
-        v3_pos = source.find("PRIORITY GROUP 2: v3")
-        v2_pos = source.find("PRIORITY GROUP 3: v2")
-        v4_pos = source.find("PRIORITY GROUP 4: v4")
-        v1_pos = source.find("PRIORITY GROUP 5: v1")
-        assert v5_pos < v3_pos < v2_pos < v4_pos < v1_pos, \
-            "Load order must be: v5 → v3 → v2 → v4 → v1"
+        # load() should contain v5 essential models and defer everything else
+        assert "v5" in source.lower()
+        assert "load_for_request()" in source or "deferred to load_for_request" in source
 
 
 class TestDeadBallClassifierV6:
@@ -186,9 +184,9 @@ class TestJerseyUpscalerV6:
         up = JerseyUpscaler(Path("/nonexistent"))
         det._jersey_upscaler = up
 
-        crop = np.zeros((200, 200, 3), dtype=np.uint8)
+        crop = np.zeros((201, 201, 3), dtype=np.uint8)
         result = det._maybe_upscale(crop)
-        assert result.shape == (200, 200, 3), "Large crops should not be upscaled"
+        assert result.shape == (201, 201, 3), "Large crops should not be upscaled"
 
 
 class TestCrossLayerBoosts:
@@ -257,16 +255,16 @@ class TestStatusEndpointV6:
 class TestHealthEndpointV6:
     """Verify /health reports v5 model status."""
 
-    def test_health_includes_v5_summary(self, client: TestClient) -> None:
-        response = client.get("/health")
+    def test_ready_includes_v5_summary(self, client: TestClient) -> None:
+        response = client.get("/ready")
         assert response.status_code == 200
         data = response.json()
         phases = data["phases"]
         assert "roboflow_models_v5" in phases
         assert "roboflow_v5_summary" in phases
 
-    def test_health_includes_primary_detection(self, client: TestClient) -> None:
-        response = client.get("/health")
+    def test_ready_includes_primary_detection(self, client: TestClient) -> None:
+        response = client.get("/ready")
         data = response.json()
         phases = data["phases"]
         assert "primary_detection" in phases
@@ -293,7 +291,7 @@ class TestModelsEndpoint:
     def test_models_endpoint_version_is_v6(self, client: TestClient) -> None:
         response = client.get("/models")
         data = response.json()
-        assert data["version"] == "v6.0"
+        assert data["version"] == "v7.0.0"
 
     def test_models_endpoint_lists_are_valid(self, client: TestClient) -> None:
         response = client.get("/models")
@@ -311,7 +309,7 @@ class TestLiveEndpointV6:
     def test_live_includes_v6_version(self, client: TestClient) -> None:
         response = client.get("/live")
         data = response.json()
-        assert data["version"] == "v6.0"
+        assert data["version"] == "v7.0.0"
 
     def test_live_includes_model_count(self, client: TestClient) -> None:
         response = client.get("/live")

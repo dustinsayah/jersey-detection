@@ -1,10 +1,10 @@
 # Clip boundary detection — merge all signals into ranked clips
 #
-# v4 scoring tiers (with outcome detection):
-#   Elite (>=90): confirmed outcome — made shot, TD, goal
-#   Strong (70-89): highlight play without confirmed outcome
-#   Decent (50-69): player involved but unclear outcome
-#   Cut (<50): player not involved or dead ball
+# v7 scoring tiers (calibrated for pre-v4-model reality):
+#   Elite (>=75): confirmed outcome or QB highlight play
+#   Strong (55-74): highlight play without confirmed outcome
+#   Decent (35-54): player involved but unclear outcome
+#   Cut (<35): player not involved or dead ball
 
 from __future__ import annotations
 
@@ -263,13 +263,13 @@ def extract_clips(
                 outcome_grade = "Elite"
                 outcome_score = max(outcome_score, 90)
 
-        # Re-grade based on v4-boosted score
+        # Re-grade based on v4-boosted score (matches v7 thresholds)
         if outcome_grade != "Elite":
-            if outcome_score >= 90:
+            if outcome_score >= 75:
                 outcome_grade = "Elite"
-            elif outcome_score >= 70:
+            elif outcome_score >= 55:
                 outcome_grade = "Strong"
-            elif outcome_score >= 50:
+            elif outcome_score >= 35:
                 outcome_grade = "Decent"
             else:
                 outcome_grade = "Cut"
@@ -312,36 +312,74 @@ def extract_clips(
                 clip.play_label = "Game Action"
                 clip.description = "Game Action"
 
-    # ── Step 3: Merge overlapping clips ──────────────────────────────────
+    # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
+    # Merge clips that overlap OR are within 2s of each other with similar
+    # motion scores (±15). This prevents consecutive 5s windows with
+    # identical motion scores from appearing as separate clips.
+    PROXIMITY_GAP = 2.0
+    MOTION_SIMILARITY = 15.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []
 
     for clip in clips:
-        if merged and clip.start_time < merged[-1].end_time:
-            # Overlap — keep the higher-scoring one
-            if clip.score > merged[-1].score:
-                # Expand the better clip to cover both
-                merged[-1] = ExtractedClip(
-                    start_time=min(merged[-1].start_time, clip.start_time),
-                    end_time=max(merged[-1].end_time, clip.end_time),
-                    confidence=max(merged[-1].confidence, clip.confidence),
-                    score=max(merged[-1].score, clip.score),
-                    play_type=clip.play_type,
-                    play_label=clip.play_label,
-                    grade=clip.grade,
-                    jersey_visible=merged[-1].jersey_visible or clip.jersey_visible,
-                    jersey_number_seen=clip.jersey_number_seen or merged[-1].jersey_number_seen,
-                    tracking_id=clip.tracking_id or merged[-1].tracking_id,
-                    description=clip.description,
-                    signals=clip.signals,
-                    detection_count=merged[-1].detection_count + clip.detection_count,
-                )
-            else:
-                # Expand existing clip
-                merged[-1].end_time = max(merged[-1].end_time, clip.end_time)
-                merged[-1].detection_count += clip.detection_count
+        if merged:
+            prev = merged[-1]
+            gap = clip.start_time - prev.end_time
+            overlaps = gap < 0
+            # Adjacent: within PROXIMITY_GAP and similar motion
+            prev_motion = prev.signals.get("motion", 0) if prev.signals else 0
+            clip_motion = clip.signals.get("motion", 0) if clip.signals else 0
+            adjacent_similar = (
+                0 <= gap <= PROXIMITY_GAP
+                and abs(prev_motion - clip_motion) <= MOTION_SIMILARITY
+            )
+
+            if overlaps or adjacent_similar:
+                # Merge — keep the higher-scoring one's metadata
+                if clip.score > prev.score:
+                    merged[-1] = ExtractedClip(
+                        start_time=min(prev.start_time, clip.start_time),
+                        end_time=max(prev.end_time, clip.end_time),
+                        confidence=max(prev.confidence, clip.confidence),
+                        score=max(prev.score, clip.score),
+                        play_type=clip.play_type,
+                        play_label=clip.play_label,
+                        grade=clip.grade,
+                        jersey_visible=prev.jersey_visible or clip.jersey_visible,
+                        jersey_number_seen=clip.jersey_number_seen or prev.jersey_number_seen,
+                        tracking_id=clip.tracking_id or prev.tracking_id,
+                        description=clip.description,
+                        signals=clip.signals,
+                        detection_count=prev.detection_count + clip.detection_count,
+                    )
+                else:
+                    merged[-1].end_time = max(prev.end_time, clip.end_time)
+                    merged[-1].detection_count += clip.detection_count
+                    merged[-1].jersey_visible = prev.jersey_visible or clip.jersey_visible
+                continue
+
+        merged.append(clip)
+
+    # ── Step 3.5: Quality gate — require at least one meaningful signal ──
+    # Clips with no jersey, no v4 outcome, low motion, and no audio event
+    # are likely noise from dead ball frames or camera pans.
+    gated: list[ExtractedClip] = []
+    for clip in merged:
+        has_jersey = clip.jersey_visible
+        has_outcome = bool(clip.signals.get("v4_outcome"))
+        has_motion = (clip.signals.get("motion", 0) or 0) > 30
+        has_audio = bool(clip.signals.get("audio"))
+        if has_jersey or has_outcome or has_motion or has_audio:
+            gated.append(clip)
         else:
-            merged.append(clip)
+            LOGGER.debug(
+                "Quality gate: dropped clip %.1f-%.1f (score=%d, no meaningful signal)",
+                clip.start_time, clip.end_time, clip.score,
+            )
+    if gated:
+        merged = gated
+    else:
+        LOGGER.info("Quality gate: all clips filtered — keeping all (fallback)")
 
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)
@@ -351,7 +389,7 @@ def extract_clips(
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
     # Football: rescue aggressively — jersey OCR rarely works on football footage
-    rescue_threshold = 5 if sport.lower() == "football" else 20
+    rescue_threshold = 15 if sport.lower() == "football" else 25
     if not result and merged:
         rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:

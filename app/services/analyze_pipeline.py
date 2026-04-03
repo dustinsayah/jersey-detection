@@ -328,6 +328,7 @@ async def _run_analyze_pipeline_impl(
 
         # ── Step 3: Extract frames for additional analysis ───────────────
         frames: list[tuple[float, np.ndarray]] = []
+        _actual_fps_used = ANALYZE_FPS
         if local_video_path and local_video_path.exists():
             t0 = time.perf_counter()
             try:
@@ -343,6 +344,7 @@ async def _run_analyze_pipeline_impl(
                     "Pipeline: adaptive FPS = %d (duration=%.0fs), max_frames = %d",
                     _use_fps, _effective_duration, _use_max,
                 )
+                _actual_fps_used = _use_fps
                 frames = _extract_frames(
                     local_video_path, fps=_use_fps, sport=sport,
                     start_sec=extract_start, end_sec=extract_end,
@@ -647,8 +649,10 @@ async def _run_analyze_pipeline_impl(
                                 break
                             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
                             h, w = frame.shape[:2]
-                            pad_x = int((x2 - x1) * 0.25)
-                            pad_y = int((y2 - y1) * 0.25)
+                            # Football: tighter padding to avoid oversized crops
+                            _pad_ratio = 0.10 if _is_football else 0.25
+                            pad_x = int((x2 - x1) * _pad_ratio)
+                            pad_y = int((y2 - y1) * _pad_ratio)
                             cx1 = max(0, x1 - pad_x)
                             cy1 = max(0, y1 - pad_y)
                             cx2 = min(w, x2 + pad_x)
@@ -1525,7 +1529,7 @@ async def _run_analyze_pipeline_impl(
             "target_number_found": target_found,
             "frames_with_target": sum(1 for d in all_layer_dets if d.get("number_detected") == jersey_number),
             "wrong_number_filtered": wrong_number_count,
-            "analyze_fps": ANALYZE_FPS,
+            "analyze_fps": _actual_fps_used,
             "frames_extracted": frames_processed,
             "dead_ball_frames_skipped": dead_ball_count,
             "dead_ball_ratio": round(dead_ball_ratio, 2),

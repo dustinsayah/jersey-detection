@@ -135,6 +135,7 @@ exec gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.wo
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/health || exit 1"
+# Railway uses its own healthcheck via railway.toml (healthcheckPath = "/health")
+# Docker HEALTHCHECK removed to avoid conflict with Railway's zero-downtime deploy
 
 CMD ["/app/start.sh"]

@@ -425,30 +425,26 @@ async def run_analyze_pipeline(
 
         # ── Frame preprocessing for dark/navy jerseys ──────────────────
         if _is_dark_jersey and ocr_frames:
-            LOGGER.info("Pipeline: applying dark jersey preprocessing (navy=%s)", _is_navy_jersey)
-            preprocessed: list[tuple[float, np.ndarray]] = []
-            for t, frame in ocr_frames:
-                h, w = frame.shape[:2]
-                # Upscale small frames
-                if w < 1280:
-                    scale = 1280 / w
-                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-                # CLAHE for dark jerseys
-                clip_limit = 5.0 if _is_navy_jersey else 4.0
+            LOGGER.info("Pipeline: applying dark jersey preprocessing in-place (navy=%s)", _is_navy_jersey)
+            # Build gamma LUT once (shared across all frames)
+            gamma = 1.5 if _is_navy_jersey else 1.3
+            inv_gamma = 1.0 / gamma
+            _gamma_table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+            clip_limit = 5.0 if _is_navy_jersey else 4.0
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+            # Process in-place to avoid doubling memory
+            for idx in range(len(ocr_frames)):
+                t, frame = ocr_frames[idx]
+                # CLAHE for dark jerseys (skip upscale at 720p — already sufficient)
                 lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
                 lab[:, :, 0] = clahe.apply(lab[:, :, 0])
                 frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-                # Gamma boost for dark jerseys
-                gamma = 1.5 if _is_navy_jersey else 1.3
-                inv_gamma = 1.0 / gamma
-                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
-                frame = cv2.LUT(frame, table)
+                # Gamma boost
+                frame = cv2.LUT(frame, _gamma_table)
                 # Unsharp mask
                 gaussian = cv2.GaussianBlur(frame, (0, 0), 2.0)
                 frame = cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
-                preprocessed.append((t, frame))
-            ocr_frames = preprocessed
+                ocr_frames[idx] = (t, frame)
 
         # ── Free Ali's models before loading Roboflow ──────────────────
         # Ali's warmup detector (jersey_number_yolo11m.pt + yolo26n-seg.pt +
@@ -680,7 +676,17 @@ async def run_analyze_pipeline(
         total_trained_ocr = len(v5_ocr_detections) + len(v3_ocr_detections) + len(universal_v2_detections) + len(v2_sport_detections) + len(v3_primary_detections)
         t0 = time.perf_counter()
 
-        if total_trained_ocr < 3:
+        # Skip Ali for football — Ali is trained on soccer/basketball jerseys and
+        # consistently returns 0 detections on football footage.  Saves ~2GB RAM.
+        _skip_ali = sport.lower() == "football"
+        if _skip_ali:
+            LOGGER.info("Pipeline: skipping Ali for football (not trained on football jerseys)")
+            ali_status = "skipped_football"
+            layer_timings["ali_jersey_detection"] = {
+                "elapsed_ms": 0, "status": ali_status, "detections": 0,
+                "reason": "Ali not trained on football jerseys",
+            }
+        elif total_trained_ocr < 3:
             LOGGER.info("Pipeline: Ali ensemble (LAST RESORT) — only %d detections from trained layers, running Ali", total_trained_ocr)
             try:
                 if local_video_path and local_video_path.exists():

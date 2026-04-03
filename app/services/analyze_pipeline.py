@@ -1155,10 +1155,11 @@ async def run_analyze_pipeline(
 
         # If jersey detection found nothing, generate detection points from motion/audio
         if not detection_points and _frame_timestamps:
-            # Football at 360p: lower motion threshold since jersey OCR can't help
+            # Football: very low threshold (10) — each motion burst is likely a play
+            # Other sports: moderate threshold (30)
             is_football = sport.lower() == "football"
-            motion_threshold = 20 if is_football else 30
-            LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d)", motion_threshold)
+            motion_threshold = 10 if is_football else 30
+            LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d, sport=%s)", motion_threshold, sport)
             for t in _frame_timestamps:
                 motion = motion_scores.get(t, 0)
                 in_boundary = _in_audio_boundary(audio_result, t)

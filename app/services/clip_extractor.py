@@ -49,6 +49,8 @@ MAX_CLIP_DURATION = 30.0
 
 # Maximum distance between jersey detections to cluster them (seconds)
 DETECTION_CLUSTER_GAP = 5.0
+# Tighter clustering for football: each play is a distinct burst (snap → whistle)
+FOOTBALL_CLUSTER_GAP = 2.5
 
 
 @dataclass
@@ -139,10 +141,11 @@ def extract_clips(
     clusters: list[list[DetectionPoint]] = []
     current_cluster: list[DetectionPoint] = []
 
+    cluster_gap = FOOTBALL_CLUSTER_GAP if sport.lower() == "football" else DETECTION_CLUSTER_GAP
     for det in sorted_dets:
         if not current_cluster:
             current_cluster = [det]
-        elif det.timestamp - current_cluster[-1].timestamp <= DETECTION_CLUSTER_GAP:
+        elif det.timestamp - current_cluster[-1].timestamp <= cluster_gap:
             current_cluster.append(det)
         else:
             clusters.append(current_cluster)
@@ -323,8 +326,8 @@ def extract_clips(
     result = [c for c in merged if c.grade != "Cut"]
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
-    # Football at 360p often can't detect jerseys — rescue more aggressively.
-    rescue_threshold = 15 if sport.lower() == "football" else 20
+    # Football: rescue aggressively — jersey OCR rarely works on football footage
+    rescue_threshold = 5 if sport.lower() == "football" else 20
     if not result and merged:
         rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:

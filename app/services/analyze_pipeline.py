@@ -102,6 +102,25 @@ async def run_analyze_pipeline(
     frames_processed = 0
     youtube_strategy_used: str | None = None
 
+    # ── Pre-request cleanup: free ALL models from previous requests ──
+    # This prevents OOM when back-to-back requests accumulate models in memory.
+    import gc as _gc_pre
+    try:
+        from app.services.roboflow_detector import roboflow_detector
+        for _attr in dir(roboflow_detector):
+            if _attr.endswith("_model") and getattr(roboflow_detector, _attr, None) is not None:
+                setattr(roboflow_detector, _attr, None)
+        roboflow_detector._loaded = False
+    except Exception:
+        pass
+    try:
+        from app.services.detection_detector import clear_detector_cache
+        clear_detector_cache()
+    except Exception:
+        pass
+    _gc_pre.collect()
+    LOGGER.info("Pipeline: pre-request cleanup done")
+
     # Per-layer timing and debug info
     layer_timings: dict[str, dict] = {}
 

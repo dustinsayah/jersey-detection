@@ -651,15 +651,22 @@ async def run_analyze_pipeline(
                 layer_timings["v2_sport_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
                 LOGGER.warning("Pipeline: v2/v1 layer failed (non-fatal): %s", exc)
 
-        # ── Free Roboflow models before Ali ──
+        # ── Free ALL models + OCR frames before Ali ──
         import gc as _gc2
         try:
             from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.unload_request_models()
+            # Unload ALL models (including v5 essentials) to make room for Ali
+            for _attr_name in dir(roboflow_detector):
+                if _attr_name.endswith("_model") and getattr(roboflow_detector, _attr_name, None) is not None:
+                    setattr(roboflow_detector, _attr_name, None)
+            roboflow_detector._loaded = False
             _gc2.collect()
-            LOGGER.info("Pipeline: freed Roboflow models before Ali")
+            LOGGER.info("Pipeline: freed ALL Roboflow models before Ali")
         except Exception:
             pass
+        # Free OCR frames (no longer needed)
+        ocr_frames = []
+        _gc2.collect()
 
         # ── Step 7.5e: Ali ensemble (LAST RESORT — only if <3 detections) ──
         # Count total OCR detections from all trained layers

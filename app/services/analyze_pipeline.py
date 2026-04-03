@@ -664,9 +664,13 @@ async def run_analyze_pipeline(
             LOGGER.info("Pipeline: freed ALL Roboflow models before Ali")
         except Exception:
             pass
-        # Free OCR frames (no longer needed)
+        # Free ALL frame data (no longer needed — Ali processes its own frames)
         ocr_frames = []
+        frames.clear()
+        if live_frames is not frames:
+            live_frames.clear()
         _gc2.collect()
+        LOGGER.info("Pipeline: freed frames + models, RSS before Ali")
 
         # ── Step 7.5e: Ali ensemble (LAST RESORT — only if <3 detections) ──
         # Count total OCR detections from all trained layers

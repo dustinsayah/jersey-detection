@@ -27,6 +27,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 ENV DENO_DIR=/tmp/deno
 
+# wireproxy: lightweight WireGuard SOCKS5 proxy for Cloudflare WARP
+# YouTube blocks sports video downloads from datacenter IPs (Railway).
+# WARP tunnels traffic through Cloudflare's non-datacenter network.
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_${ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin wireproxy && \
+    chmod +x /usr/local/bin/wireproxy && \
+    wireproxy --version || echo "wireproxy install: will retry with amd64" && \
+    if [ ! -x /usr/local/bin/wireproxy ]; then \
+      curl -fsSL "https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz" \
+      | tar xz -C /usr/local/bin wireproxy; \
+    fi
+
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
@@ -57,6 +70,12 @@ RUN python /app/scripts/bootstrap_public_reader.py
 # Keep yt-dlp updated at build time
 RUN pip install --upgrade yt-dlp
 
+# Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
+# This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).
+RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_client=android_vr" \
+    --print "%(id)s" --no-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>/dev/null \
+    || echo "EJS pre-cache: solver will be downloaded on first use"
+
 # Ensure model directory exists for Roboflow trained weights
 # football_digit_detector.pt, football_player_detector.pt,
 # basketball_jersey_ocr.pt, football_jersey_tracker.pt
@@ -67,8 +86,55 @@ COPY app /app/app
 COPY asgi.py /app/asgi.py
 COPY layers /app/layers
 
+# Startup script: WARP proxy + volume models + gunicorn
+RUN printf '#!/bin/bash\nset -e\n\
+\n\
+# ── Link volume models ──\n\
+if [ -d "/data/models" ]; then\n\
+  for f in /data/models/*.pt /data/models/*.pth; do\n\
+    [ -f "$f" ] || continue\n\
+    bn=$(basename "$f")\n\
+    [ -f "/app/app/model/$bn" ] || ln -sf "$f" "/app/app/model/$bn"\n\
+  done\n\
+  echo "Volume models linked"\n\
+fi\n\
+\n\
+# ── Download critical football models if missing (6MB each, non-fatal) ──\n\
+GITHUB_RAW="https://raw.githubusercontent.com/dustinsayah/jersey-detection/main/app/model"\n\
+for model in football_player_detector.pt football_digit_detector.pt football_jersey_tracker.pt; do\n\
+  if [ ! -f "/app/app/model/$model" ]; then\n\
+    echo "Downloading missing model: $model"\n\
+    curl -fsSL "$GITHUB_RAW/$model" -o "/app/app/model/$model" 2>/dev/null \\\n\
+      && echo "Downloaded $model" \\\n\
+      || echo "Failed to download $model (non-fatal)"\n\
+  fi\n\
+done\n\
+echo "Models: $(ls /app/app/model/*.pt /app/app/model/*.pth 2>/dev/null | wc -l)"\n\
+\n\
+# ── Start Cloudflare WARP proxy (non-fatal) ──\n\
+if [ -n "$WARP_WG_CONFIG" ]; then\n\
+  echo "Starting Cloudflare WARP proxy..."\n\
+  echo "$WARP_WG_CONFIG" | base64 -d > /tmp/warp.conf\n\
+  # Append wireproxy SOCKS5 config\n\
+  printf "\\n[Socks5]\\nBindAddress = 127.0.0.1:40000\\n" >> /tmp/warp.conf\n\
+  wireproxy -c /tmp/warp.conf &\n\
+  WARP_PID=$!\n\
+  sleep 2\n\
+  if kill -0 $WARP_PID 2>/dev/null; then\n\
+    echo "WARP proxy running on socks5://127.0.0.1:40000 (PID=$WARP_PID)"\n\
+    export YT_DLP_PROXY="socks5://127.0.0.1:40000"\n\
+  else\n\
+    echo "WARP proxy failed to start (non-fatal)"\n\
+  fi\n\
+else\n\
+  echo "WARP_WG_CONFIG not set, skipping WARP proxy"\n\
+fi\n\
+\n\
+exec gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout ${GUNICORN_TIMEOUT:-1800} asgi:app\n' > /app/start.sh \
+    && chmod +x /app/start.sh
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD sh -c "curl --fail http://127.0.0.1:${PORT:-8000}/health || exit 1"
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout ${GUNICORN_TIMEOUT:-1800} asgi:app"]
+CMD ["/app/start.sh"]

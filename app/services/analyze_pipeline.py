@@ -464,10 +464,10 @@ async def run_analyze_pipeline(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 60s, max 100 crops, early exit after 30 zero-match crops
-        _V5_TIME_LIMIT = 60  # seconds
-        _V5_MAX_CROPS = 100
-        _V5_EARLY_EXIT_AFTER = 30  # consecutive zero-match crops before giving up
+        # Guardrails: max 90s, max 200 crops, early exit after 50 zero-match crops
+        _V5_TIME_LIMIT = 90  # seconds
+        _V5_MAX_CROPS = 200
+        _V5_EARLY_EXIT_AFTER = 50  # consecutive zero-match crops before giving up
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
@@ -481,8 +481,8 @@ async def run_analyze_pipeline(
             roboflow_detector.load()
 
             if ocr_frames:
-                # Sample every 3rd frame to reduce work
-                sampled_frames = ocr_frames[::3] if len(ocr_frames) > 20 else ocr_frames
+                # Sample every 2nd frame to balance coverage and performance
+                sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
                 LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
                 _v5_break = False
                 for t, frame in sampled_frames:

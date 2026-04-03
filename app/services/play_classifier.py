@@ -104,6 +104,7 @@ def classify_play(
         tracking_continuity=tracking_continuity,
         crowd_energy=crowd_energy,
         v4_outcome=v4_outcome,
+        sport=sport,
     )
 
     # Bonus for high-priority play types
@@ -159,6 +160,7 @@ def _compute_score(
     tracking_continuity: float,
     crowd_energy: float,
     v4_outcome: str = "",
+    sport: str = "basketball",
 ) -> int:
     """Compute weighted final score from all signals."""
     # Jersey: 0-1 → 0-100
@@ -201,16 +203,27 @@ def _compute_score(
     # When dead ball models aren't loaded, default to 50 (neutral)
     dead_ball_component = 50.0  # neutral default
 
+    # Football OCR compensation: when jersey OCR returns 0 (all football
+    # OCR models fail), redistribute jersey weight to motion + audio so
+    # football clips can still score in the 50-70 range based on game signals.
+    weights = dict(WEIGHTS)
+    if sport.lower() == "football" and jersey_confidence < 0.01:
+        jersey_weight_to_redistribute = weights["jersey"]  # 0.30
+        weights["jersey"] = 0.0
+        weights["motion"] += jersey_weight_to_redistribute * 0.50   # +0.15
+        weights["audio"] += jersey_weight_to_redistribute * 0.30    # +0.09
+        weights["pose"] += jersey_weight_to_redistribute * 0.20     # +0.06
+
     # Weighted sum
     total = (
-        WEIGHTS["jersey"] * jersey_component
-        + WEIGHTS["motion"] * motion_component
-        + WEIGHTS["audio"] * audio_component
-        + WEIGHTS["pose"] * pose_component
-        + WEIGHTS["tracking"] * tracking_component
-        + WEIGHTS["crowd"] * crowd_component
-        + WEIGHTS["outcome"] * outcome_component
-        + WEIGHTS["dead_ball"] * dead_ball_component
+        weights["jersey"] * jersey_component
+        + weights["motion"] * motion_component
+        + weights["audio"] * audio_component
+        + weights["pose"] * pose_component
+        + weights["tracking"] * tracking_component
+        + weights["crowd"] * crowd_component
+        + weights["outcome"] * outcome_component
+        + weights["dead_ball"] * dead_ball_component
     )
 
     return min(100, max(0, round(total)))

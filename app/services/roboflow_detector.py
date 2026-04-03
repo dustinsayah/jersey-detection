@@ -404,6 +404,10 @@ class RoboflowDetector:
         # Priority 3: Sport-specific v3 OCR fallback (football gets extra OCR layer)
         if sl == "football":
             to_load.append("football_ocr_v3")
+            # Football-specific player detectors — trained on individual players
+            # (v5 player_detector produces formation-sized crops for football)
+            to_load.append("football_player_detector")
+            to_load.append("football_digit_detector")
 
         # Priority 4: Dark jersey specialist (helps with dark/navy jerseys)
         if is_dark or is_navy_jersey:
@@ -1427,31 +1431,138 @@ class RoboflowDetector:
         self._track_model_call("jersey_ocr_universal_v5", len(dets))
         return dets
 
+    @staticmethod
+    def _is_valid_player_crop(crop_w: int, crop_h: int, frame_w: int, frame_h: int) -> bool:
+        """Check if a player crop represents an individual player, not a formation.
+
+        At 720p (1280×720):
+          - An individual player crop should be roughly 60-250px wide, 100-400px tall.
+          - Formation-sized crops (>300px wide or >50% of frame area) are rejected.
+        Scales proportionally for other resolutions.
+        """
+        # Reject tiny crops that can't contain a jersey number
+        if crop_w < 30 or crop_h < 40:
+            return False
+        # Reject crops wider than ~25% of frame (formation, not individual)
+        if crop_w > frame_w * 0.25:
+            return False
+        # Reject crops taller than ~60% of frame
+        if crop_h > frame_h * 0.6:
+            return False
+        # Reject crops that are very wide relative to height (sideline banner, scoreboard)
+        aspect = crop_w / max(crop_h, 1)
+        if aspect > 2.5:
+            return False
+        return True
+
+    def _redetect_individuals_in_region(
+        self,
+        region: np.ndarray,
+        conf: float = 0.25,
+    ) -> list[dict]:
+        """Use football_player_detector (v1) to find individual players within an oversized region.
+
+        Fallback for when player_detector_v5 returns formation-sized bounding boxes.
+        Returns list of player dicts with bbox coordinates relative to the region.
+        """
+        players: list[dict] = []
+        # Try v1 football player detector first (trained on individual players)
+        if self.football_player_model is not None:
+            try:
+                results = self.football_player_model(region, conf=conf, verbose=False)[0]
+                for box in results.boxes:
+                    name = self.football_player_model.names[int(box.cls)]
+                    if "player" in name.lower() or "person" in name.lower():
+                        players.append({
+                            "bbox": box.xyxy[0].tolist(),
+                            "confidence": float(box.conf),
+                            "class": name,
+                            "layer": "v1_football_player_redetect",
+                        })
+                if players:
+                    logger.info("Re-detection: found %d individual players in oversized region", len(players))
+                    return players
+            except Exception as e:
+                logger.debug("football_player redetect error: %s", e)
+
+        # Fallback: simple grid subdivision of the oversized region
+        # Split into vertical strips roughly 150px wide
+        h, w = region.shape[:2]
+        strip_w = min(200, w // 2)
+        if strip_w < 60:
+            return []
+        for x_start in range(0, w - strip_w // 2, strip_w):
+            x_end = min(w, x_start + strip_w)
+            players.append({
+                "bbox": [float(x_start), 0.0, float(x_end), float(h)],
+                "confidence": 0.3,
+                "class": "player_grid",
+                "layer": "grid_subdivision",
+            })
+        logger.info("Re-detection: grid subdivision created %d strips from %dx%d region", len(players), w, h)
+        return players
+
     def detect_players_v5(
         self,
         frame: np.ndarray,
         conf: float = 0.3,
+        validate_crop_size: bool = False,
     ) -> list[dict]:
-        """Run player_detector_v5 on a frame. Returns [] if model not loaded."""
+        """Run player_detector_v5 on a frame. Returns [] if model not loaded.
+
+        Args:
+            validate_crop_size: If True, filter out formation-sized crops and
+                attempt re-detection of individual players within oversized regions.
+        """
         self.load()
         if self.player_detector_v5_model is None:
             return []
         self._last_used["player_detector_v5_model"] = time.time()
 
+        frame_h, frame_w = frame.shape[:2]
         players: list[dict] = []
+        oversized_regions: list[dict] = []
         try:
             results = self.player_detector_v5_model(frame, conf=conf, verbose=False)[0]
             for box in results.boxes:
                 name = self.player_detector_v5_model.names[int(box.cls)]
                 if "player" in name.lower() or "person" in name.lower():
-                    players.append({
-                        "bbox": box.xyxy[0].tolist(),
+                    bbox = box.xyxy[0].tolist()
+                    crop_w = int(bbox[2] - bbox[0])
+                    crop_h = int(bbox[3] - bbox[1])
+                    player = {
+                        "bbox": bbox,
                         "confidence": float(box.conf),
                         "class": name,
                         "layer": "v5_player_detector",
-                    })
+                    }
+                    if validate_crop_size and not self._is_valid_player_crop(crop_w, crop_h, frame_w, frame_h):
+                        logger.info(
+                            "v5 player: oversized crop %dx%d (frame %dx%d) — queueing for re-detection",
+                            crop_w, crop_h, frame_w, frame_h,
+                        )
+                        oversized_regions.append(player)
+                    else:
+                        players.append(player)
         except Exception as e:
             logger.debug("v5 player detector error: %s", e)
+
+        # Re-detect individuals within oversized regions
+        if validate_crop_size and oversized_regions:
+            for region_info in oversized_regions:
+                x1, y1, x2, y2 = [int(c) for c in region_info["bbox"]]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame_w, x2), min(frame_h, y2)
+                region = frame[y1:y2, x1:x2]
+                if region.size == 0:
+                    continue
+                sub_players = self._redetect_individuals_in_region(region, conf=0.2)
+                for sp in sub_players:
+                    # Translate sub-player bbox back to full frame coordinates
+                    sb = sp["bbox"]
+                    sp["bbox"] = [sb[0] + x1, sb[1] + y1, sb[2] + x1, sb[3] + y1]
+                    players.append(sp)
+
         return players
 
     def classify_outcome_v5(

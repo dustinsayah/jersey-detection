@@ -67,6 +67,60 @@ ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
 # Hard cap on total frames to prevent OOM on long videos
 MAX_FRAMES = int(os.getenv("MAX_FRAMES", "150"))
 
+# ── Blocker 3: Request semaphore — only 1 concurrent analyze request ──
+import asyncio as _asyncio
+_REQUEST_SEMAPHORE = _asyncio.Semaphore(1)
+# Memory threshold (MB) — if RSS exceeds this before a request, force full cleanup
+_MEMORY_THRESHOLD_MB = 5000
+
+
+def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple[int, int]:
+    """Return (fps, max_frames) based on video duration.
+
+    Strategy:
+      - Short clips (<120s): 2 fps, 150 frames → full coverage
+      - Medium clips (120-600s): 1 fps, 300 frames → every second for 5 min
+      - Long videos (600-1800s): 0.5 fps, 450 frames → every 2s for 15 min
+      - Full games (>1800s): 0.33 fps, 600 frames → every 3s for 30 min
+    """
+    if video_duration <= 120:
+        return 2, 150
+    elif video_duration <= 600:
+        return 1, 300
+    elif video_duration <= 1800:
+        # ~30 min video: sample every 2s
+        return 1, 450  # will use vid_stride in frame extraction
+    else:
+        # Full game (>30 min): aggressive skip
+        return 1, 600
+
+
+def _force_cleanup_memory():
+    """Force cleanup of ALL loaded models and caches to reclaim memory.
+
+    Called when RSS exceeds threshold between requests.
+    """
+    import gc
+    LOGGER.info("Pipeline: force memory cleanup starting")
+    try:
+        from app.services.roboflow_detector import roboflow_detector
+        for attr in dir(roboflow_detector):
+            if attr.endswith("_model") and getattr(roboflow_detector, attr, None) is not None:
+                setattr(roboflow_detector, attr, None)
+        roboflow_detector._loaded = False
+        if roboflow_detector._jersey_upscaler is not None:
+            roboflow_detector._jersey_upscaler = None
+    except Exception:
+        pass
+    try:
+        from app.services.detection_detector import clear_detector_cache
+        clear_detector_cache()
+    except Exception:
+        pass
+    # Delete any lingering YOLO Results references
+    gc.collect()
+    LOGGER.info("Pipeline: force memory cleanup done")
+
 
 async def run_analyze_pipeline(
     *,
@@ -83,7 +137,7 @@ async def run_analyze_pipeline(
     enable_pose: bool = True,
     quality_mode: str = "auto",
 ) -> dict[str, Any]:
-    """Run the full analysis pipeline.
+    """Run the full analysis pipeline with single-request concurrency.
 
     Steps:
     1. Acquire video (YouTube download or direct path)
@@ -95,6 +149,40 @@ async def run_analyze_pipeline(
     7. Classify play types
     8. Extract and rank clips
     """
+    # ── Blocker 3: Semaphore — only 1 analyze request at a time ──
+    async with _REQUEST_SEMAPHORE:
+        return await _run_analyze_pipeline_impl(
+            video_url=video_url,
+            video_path=video_path,
+            jersey_number=jersey_number,
+            jersey_color=jersey_color,
+            sport=sport,
+            position=position,
+            time_range_start=time_range_start,
+            time_range_end=time_range_end,
+            enable_audio=enable_audio,
+            enable_tracking=enable_tracking,
+            enable_pose=enable_pose,
+            quality_mode=quality_mode,
+        )
+
+
+async def _run_analyze_pipeline_impl(
+    *,
+    video_url: str | None = None,
+    video_path: str | None = None,
+    jersey_number: int = 0,
+    jersey_color: str = "white",
+    sport: str = "basketball",
+    position: str | None = None,
+    time_range_start: float = 0,
+    time_range_end: float = 0,
+    enable_audio: bool = True,
+    enable_tracking: bool = True,
+    enable_pose: bool = True,
+    quality_mode: str = "auto",
+) -> dict[str, Any]:
+    """Internal pipeline implementation (called under semaphore)."""
     start_time = time.perf_counter()
     phases_used: list[str] = []
     local_video_path: Path | None = None
@@ -105,12 +193,23 @@ async def run_analyze_pipeline(
     # ── Pre-request cleanup: free ALL models from previous requests ──
     # This prevents OOM when back-to-back requests accumulate models in memory.
     import gc as _gc_pre
+    # Check RSS before cleanup
+    _pre_rss = 0.0
+    try:
+        import psutil as _ps
+        _pre_rss = _ps.Process().memory_info().rss / 1024 / 1024
+        LOGGER.info("Pipeline: pre-request RSS = %.0fMB (threshold=%dMB)", _pre_rss, _MEMORY_THRESHOLD_MB)
+    except Exception:
+        pass
+    # Always clean up between requests
     try:
         from app.services.roboflow_detector import roboflow_detector
         for _attr in dir(roboflow_detector):
             if _attr.endswith("_model") and getattr(roboflow_detector, _attr, None) is not None:
                 setattr(roboflow_detector, _attr, None)
         roboflow_detector._loaded = False
+        if roboflow_detector._jersey_upscaler is not None:
+            roboflow_detector._jersey_upscaler = None
     except Exception:
         pass
     try:
@@ -119,7 +218,13 @@ async def run_analyze_pipeline(
     except Exception:
         pass
     _gc_pre.collect()
-    LOGGER.info("Pipeline: pre-request cleanup done")
+    # Check RSS after cleanup
+    try:
+        _post_rss = _ps.Process().memory_info().rss / 1024 / 1024
+        LOGGER.info("Pipeline: pre-request cleanup done (RSS: %.0fMB → %.0fMB, freed %.0fMB)",
+                     _pre_rss, _post_rss, _pre_rss - _post_rss)
+    except Exception:
+        LOGGER.info("Pipeline: pre-request cleanup done")
 
     # Per-layer timing and debug info
     layer_timings: dict[str, dict] = {}
@@ -226,9 +331,22 @@ async def run_analyze_pipeline(
         if local_video_path and local_video_path.exists():
             t0 = time.perf_counter()
             try:
+                # Adaptive FPS: lower sampling rate for longer videos
+                _effective_duration = video_duration
+                if time_range_end > time_range_start:
+                    _effective_duration = time_range_end - time_range_start
+                _adaptive_fps, _adaptive_max = _get_adaptive_fps(_effective_duration, sport)
+                # Use env override if set, otherwise adaptive
+                _use_fps = ANALYZE_FPS if os.getenv("ANALYZE_FPS") else _adaptive_fps
+                _use_max = int(os.getenv("MAX_FRAMES", "0")) or _adaptive_max
+                LOGGER.info(
+                    "Pipeline: adaptive FPS = %d (duration=%.0fs), max_frames = %d",
+                    _use_fps, _effective_duration, _use_max,
+                )
                 frames = _extract_frames(
-                    local_video_path, fps=ANALYZE_FPS, sport=sport,
+                    local_video_path, fps=_use_fps, sport=sport,
                     start_sec=extract_start, end_sec=extract_end,
+                    max_frames=_use_max,
                 )
                 frames_processed = len(frames)
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
@@ -500,6 +618,9 @@ async def run_analyze_pipeline(
                 sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
                 LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
                 _v5_break = False
+                _is_football = sport.lower() == "football"
+                _v5_oversized_skipped = 0
+                _v5_redetected = 0
                 for t, frame in sampled_frames:
                     if _v5_break:
                         break
@@ -508,7 +629,11 @@ async def run_analyze_pipeline(
                         v5_exit_reason = f"time_limit ({_V5_TIME_LIMIT}s)"
                         LOGGER.info("Pipeline: v5 OCR hit time limit (%ds), moving on", _V5_TIME_LIMIT)
                         break
-                    players = roboflow_detector.detect_players_v5(frame, conf=0.20)
+                    # For football: validate crop sizes and re-detect within oversized regions
+                    players = roboflow_detector.detect_players_v5(
+                        frame, conf=0.20,
+                        validate_crop_size=_is_football,
+                    )
                     v5_players_found += len(players) if players else 0
                     if players:
                         for player in players[:5]:  # Max 5 players per frame
@@ -1439,12 +1564,32 @@ async def run_analyze_pipeline(
         }
 
     finally:
-        # Unload request-specific models to free memory
+        # ── Post-request cleanup (Blocker 3) ──
+        # Unload ALL models (not just request-specific) to free memory
+        # for the next request. Models are re-loaded per-request anyway.
+        import gc as _gc_post
         try:
             from app.services.roboflow_detector import roboflow_detector
-            roboflow_detector.unload_request_models()
+            for _attr in dir(roboflow_detector):
+                if _attr.endswith("_model") and getattr(roboflow_detector, _attr, None) is not None:
+                    setattr(roboflow_detector, _attr, None)
+            roboflow_detector._loaded = False
+            if roboflow_detector._jersey_upscaler is not None:
+                roboflow_detector._jersey_upscaler = None
         except Exception:
             pass
+        try:
+            from app.services.detection_detector import clear_detector_cache
+            clear_detector_cache()
+        except Exception:
+            pass
+        _gc_post.collect()
+        try:
+            import psutil as _ps_post
+            _rss_after = _ps_post.Process().memory_info().rss / 1024 / 1024
+            LOGGER.info("Pipeline: post-request cleanup done (RSS=%.0fMB)", _rss_after)
+        except Exception:
+            LOGGER.info("Pipeline: post-request cleanup done")
         # Cleanup temp files
         if tmp_dir and tmp_dir.exists():
             try:

@@ -81,9 +81,9 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
       - Short clips (<120s): 2 fps, 150 frames → full coverage
       - Medium clips (120-600s): 1 fps, 200 frames → every second for ~3 min
       - Long videos (600-1800s): 1 fps, 300 frames → one per second, 5 min
-      - Full games (1800-3600s): 1 fps, 400 frames → every ~5-9s over 30-60 min
-      - Long games (3600-7200s): 1 fps, 500 frames → every ~7-14s over 1-2 hrs
-      - Extra long (>7200s): 1 fps, 600 frames → every ~12s+ over 2+ hrs
+      - Full games (1800-3600s): 1 fps, 750 frames → every ~2.5-5s over 30-60 min
+      - Long games (3600-7200s): 1 fps, 1000 frames → every ~3.5-7s over 1-2 hrs
+      - Extra long (>7200s): 1 fps, 1200 frames → every ~6s+ over 2+ hrs
     """
     if video_duration <= 120:
         return 2, 150
@@ -92,11 +92,11 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
     elif video_duration <= 1800:
         return 1, 300
     elif video_duration <= 3600:
-        return 1, 400
+        return 1, 750
     elif video_duration <= 7200:
-        return 1, 500
+        return 1, 1000
     else:
-        return 1, 600
+        return 1, 1200
 
 
 def _force_cleanup_memory():
@@ -607,9 +607,9 @@ async def _run_analyze_pipeline_impl(
         # after consecutive FRAMES with zero detections.
         _is_full_game = video_duration > 1800
         _V5_TIME_LIMIT = 180 if _is_full_game else 90  # seconds — full games need more time
-        # Scale crop limit: 200 for short videos, up to 800 for full games.
-        # At ~120ms/crop, 800 crops ≈ 96s — within the 180s time limit for full games.
-        _V5_MAX_CROPS = min(800 if _is_full_game else 500, max(200, frames_processed))
+        # Scale crop limit: 200 for short videos, up to 1200 for full games.
+        # At ~120ms/crop, 1200 crops ≈ 144s — within the 180s time limit for full games.
+        _V5_MAX_CROPS = min(1200 if _is_full_game else 500, max(200, frames_processed))
         # Full games + football: more patient early exit
         if sport.lower() == "football":
             _V5_EARLY_EXIT_FRAMES = 200

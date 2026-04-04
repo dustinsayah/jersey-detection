@@ -67,8 +67,8 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://tfhub.
 COPY scripts /app/scripts
 RUN python /app/scripts/bootstrap_public_reader.py
 
-# Keep yt-dlp updated at build time — install nightly for latest YouTube fixes
-RUN pip install --upgrade "yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" \
+# Keep yt-dlp updated at build time — try nightly, fall back to stable
+RUN pip install --upgrade --pre yt-dlp \
     || pip install --upgrade yt-dlp
 
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
@@ -113,10 +113,10 @@ done\n\
 echo "Models: $(ls /app/app/model/*.pt /app/app/model/*.pth 2>/dev/null | wc -l)"\n\
 \n\
 # ── Update yt-dlp at runtime (YouTube changes API frequently) ──\n\
-echo "Updating yt-dlp to latest nightly..."\n\
-pip install --upgrade "yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" 2>/dev/null \\\n\
-  && echo "yt-dlp nightly installed: $(yt-dlp --version)" \\\n\
-  || (pip install --upgrade yt-dlp 2>/dev/null && echo "yt-dlp stable: $(yt-dlp --version)" || echo "yt-dlp update failed")\n\
+echo "Updating yt-dlp..."\n\
+pip install --upgrade --pre yt-dlp 2>/dev/null \\\n\
+  && echo "yt-dlp updated: $(yt-dlp --version)" \\\n\
+  || echo "yt-dlp update failed (using build version: $(yt-dlp --version))"\n\
 \n\
 # ── Start Cloudflare WARP proxy (non-fatal) ──\n\
 if [ -n "$WARP_WG_CONFIG" ]; then\n\

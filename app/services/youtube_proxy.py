@@ -358,6 +358,16 @@ def download_youtube_sync(
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
     _dl_timeout = 600 if _is_long_video else 300
 
+    # Overall timeout: don't let the entire chain exceed this (prevents 1400s hangs)
+    _TOTAL_TIMEOUT = 600 if _is_long_video else 300
+
+    def _total_expired() -> bool:
+        elapsed = time.perf_counter() - dl_start
+        if elapsed > _TOTAL_TIMEOUT:
+            LOGGER.warning("youtube_proxy_sync: total timeout %.0fs > %ds, aborting remaining strategies", elapsed, _TOTAL_TIMEOUT)
+            return True
+        return False
+
     # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
     # android_vr client can list 720p/1080p DASH formats when EJS solver works.
     # DASH H.264 format ensures OpenCV compatibility (no VP9/AV1).
@@ -373,7 +383,7 @@ def download_youtube_sync(
     # ── Strategy 2: Same as 1 but with proxy (if configured) ──
     # Residential proxy or Cloudflare WARP bypasses YouTube datacenter IP block.
     proxy = _get_proxy()
-    if proxy:
+    if proxy and not _total_expired():
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_dl_timeout, strategy_name="Strategy 2",
@@ -389,6 +399,18 @@ def download_youtube_sync(
     # ── Strategy 3: Render server proxy ──
     # Render server receives startTime/endTime and returns pre-trimmed video.
     # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
+    if _total_expired():
+        strategy_errors.append("3=total_timeout_skip")
+        strategy_errors.append("4=total_timeout_skip")
+        strategy_errors.append("5=total_timeout_skip")
+        strategy_errors.append("6=total_timeout_skip")
+        strategy_errors.append("7=total_timeout_skip")
+        raise RuntimeError(
+            f"All 7 YouTube download strategies failed (sync) for: {url} "
+            f"(original: {original_url}). "
+            f"Errors: {', '.join(strategy_errors)}. "
+            f"Check Railway logs for per-strategy errors."
+        )
     with httpx.Client(timeout=httpx.Timeout(300 if _is_long_video else 180)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
@@ -397,6 +419,17 @@ def download_youtube_sync(
     strategy_errors.append("3=render_server_failed")
 
     # ── Strategy 4: yt-dlp android muxed + EJS (360p but reliable) ──
+    if _total_expired():
+        strategy_errors.append("4=total_timeout_skip")
+        strategy_errors.append("5=total_timeout_skip")
+        strategy_errors.append("6=total_timeout_skip")
+        strategy_errors.append("7=total_timeout_skip")
+        raise RuntimeError(
+            f"All 7 YouTube download strategies failed (sync) for: {url} "
+            f"(original: {original_url}). "
+            f"Errors: {', '.join(strategy_errors)}. "
+            f"Check Railway logs for per-strategy errors."
+        )
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android", start_time=start_time, end_time=end_time,
                         strategy_name="Strategy 4", format_override=_MUXED_FORMAT,
@@ -407,6 +440,13 @@ def download_youtube_sync(
     strategy_errors.append("4=android_muxed_ejs_failed")
 
     # ── Strategy 5: yt-dlp Python library with android_vr + DASH ──
+    if _total_expired():
+        strategy_errors.extend(["5=timeout_skip", "6=timeout_skip", "7=timeout_skip"])
+        raise RuntimeError(
+            f"All 7 YouTube download strategies failed (sync) for: {url} "
+            f"(original: {original_url}). Errors: {', '.join(strategy_errors)}. "
+            f"Check Railway logs for per-strategy errors."
+        )
     if _yt_dlp_python_download(url, output_path, client="android_vr",
                                start_time=start_time, end_time=end_time,
                                strategy_name="Strategy 5",

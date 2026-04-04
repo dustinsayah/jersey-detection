@@ -356,10 +356,10 @@ def download_youtube_sync(
 
     # Detect full game (long video) — increase timeout for strategies 1-2
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
-    _dl_timeout = 600 if _is_long_video else 300
+    _dl_timeout = 600 if _is_long_video else 90  # 90s per-strategy for short clips
 
     # Overall timeout: don't let the entire chain exceed this (prevents 1400s hangs)
-    _TOTAL_TIMEOUT = 600 if _is_long_video else 300
+    _TOTAL_TIMEOUT = 600 if _is_long_video else 240
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start
@@ -411,7 +411,7 @@ def download_youtube_sync(
             f"Errors: {', '.join(strategy_errors)}. "
             f"Check Railway logs for per-strategy errors."
         )
-    with httpx.Client(timeout=httpx.Timeout(300 if _is_long_video else 180)) as client:
+    with httpx.Client(timeout=httpx.Timeout(300 if _is_long_video else 60)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)

@@ -640,7 +640,6 @@ async def _run_analyze_pipeline_impl(
                         break
                     dets = roboflow_detector.detect_football_jersey_v7(
                         frame, jersey_number, conf=ocr_conf,
-                        is_dark_jersey=_is_dark_jersey,
                     )
                     if dets:
                         for d in dets:

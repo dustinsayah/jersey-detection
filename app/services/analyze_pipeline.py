@@ -603,14 +603,20 @@ async def _run_analyze_pipeline_impl(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 90s, crop limit scales with frame count, early exit
-        # after 50 consecutive FRAMES with zero detections.
-        _V5_TIME_LIMIT = 90  # seconds
-        # Scale crop limit: 200 for short videos, up to 500 for full games.
-        # At ~120ms/crop, 500 crops ≈ 60s — well within the 90s time limit.
-        _V5_MAX_CROPS = min(500, max(200, frames_processed))
-        # Football: more patient (200 frames) — navy jerseys at distance are hard
-        _V5_EARLY_EXIT_FRAMES = 200 if sport.lower() == "football" else 50
+        # Guardrails: time limit, crop limit scales with frame count, early exit
+        # after consecutive FRAMES with zero detections.
+        _is_full_game = video_duration > 1800
+        _V5_TIME_LIMIT = 180 if _is_full_game else 90  # seconds — full games need more time
+        # Scale crop limit: 200 for short videos, up to 800 for full games.
+        # At ~120ms/crop, 800 crops ≈ 96s — within the 180s time limit for full games.
+        _V5_MAX_CROPS = min(800 if _is_full_game else 500, max(200, frames_processed))
+        # Full games + football: more patient early exit
+        if sport.lower() == "football":
+            _V5_EARLY_EXIT_FRAMES = 200
+        elif _is_full_game:
+            _V5_EARLY_EXIT_FRAMES = 100  # basketball full game: 100 frame patience
+        else:
+            _V5_EARLY_EXIT_FRAMES = 50
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0

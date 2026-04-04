@@ -359,7 +359,7 @@ def download_youtube_sync(
     # DASH H.264 format ensures OpenCV compatibility (no VP9/AV1).
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android_vr", start_time=start_time, end_time=end_time,
-                        timeout=120, strategy_name="Strategy 1",
+                        timeout=300, strategy_name="Strategy 1",
                         format_override=_DASH_H264_FORMAT, use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 1 (android_vr DASH+EJS)", elapsed)
@@ -372,7 +372,7 @@ def download_youtube_sync(
     if proxy:
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=120, strategy_name="Strategy 2",
+                            timeout=300, strategy_name="Strategy 2",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
                             proxy=proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
@@ -385,7 +385,7 @@ def download_youtube_sync(
     # ── Strategy 3: Render server proxy ──
     # Render server receives startTime/endTime and returns pre-trimmed video.
     # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
-    with httpx.Client(timeout=httpx.Timeout(90)) as client:
+    with httpx.Client(timeout=httpx.Timeout(180)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)

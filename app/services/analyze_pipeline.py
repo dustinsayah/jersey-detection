@@ -64,8 +64,8 @@ FOOTBALL_MAX_CLIP = 12.0
 # Configurable via ANALYZE_FPS env var.
 ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
 
-# Hard cap on total frames to prevent OOM on long videos
-MAX_FRAMES = int(os.getenv("MAX_FRAMES", "150"))
+# Hard cap on total frames — 0 means use adaptive cap from _get_adaptive_fps()
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "0"))
 
 # ── Blocker 3: Request semaphore — only 1 concurrent analyze request ──
 import asyncio as _asyncio
@@ -77,21 +77,25 @@ _MEMORY_THRESHOLD_MB = 5000
 def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple[int, int]:
     """Return (fps, max_frames) based on video duration.
 
-    Strategy:
+    Strategy — more frames for longer videos to avoid missing plays:
       - Short clips (<120s): 2 fps, 150 frames → full coverage
-      - Medium clips (120-600s): 1 fps, 300 frames → every second for 5 min
-      - Long videos (600-1800s): 0.5 fps, 450 frames → every 2s for 15 min
-      - Full games (>1800s): 0.33 fps, 600 frames → every 3s for 30 min
+      - Medium clips (120-600s): 1 fps, 200 frames → every second for ~3 min
+      - Long videos (600-1800s): 1 fps, 300 frames → one per second, 5 min
+      - Full games (1800-3600s): 1 fps, 400 frames → every ~5-9s over 30-60 min
+      - Long games (3600-7200s): 1 fps, 500 frames → every ~7-14s over 1-2 hrs
+      - Extra long (>7200s): 1 fps, 600 frames → every ~12s+ over 2+ hrs
     """
     if video_duration <= 120:
         return 2, 150
     elif video_duration <= 600:
-        return 1, 300
+        return 1, 200
     elif video_duration <= 1800:
-        # ~30 min video: sample every 2s
-        return 1, 450  # will use vid_stride in frame extraction
+        return 1, 300
+    elif video_duration <= 3600:
+        return 1, 400
+    elif video_duration <= 7200:
+        return 1, 500
     else:
-        # Full game (>30 min): aggressive skip
         return 1, 600
 
 
@@ -599,16 +603,18 @@ async def _run_analyze_pipeline_impl(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 90s, max 200 crops, early exit after 50 zero-match crops
+        # Guardrails: max 90s, max 200 crops, early exit after 50 consecutive
+        # FRAMES with zero detections (not crops — a single frame with 5 crop
+        # misses should not count as 5 misses).
         _V5_TIME_LIMIT = 90  # seconds
         _V5_MAX_CROPS = 200
-        _V5_EARLY_EXIT_AFTER = 50  # consecutive zero-match crops before giving up
+        _V5_EARLY_EXIT_FRAMES = 50  # consecutive frames with 0 detections
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
         v5_crop_dims: list[str] = []
         v5_total_crops = 0
-        v5_consecutive_misses = 0
+        v5_consecutive_frame_misses = 0
         v5_exit_reason = ""
         t0 = time.perf_counter()
         try:
@@ -619,13 +625,10 @@ async def _run_analyze_pipeline_impl(
                 # Sample every 2nd frame for memory safety
                 sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
                 LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
-                _v5_break = False
                 _is_football = sport.lower() == "football"
                 _v5_oversized_skipped = 0
                 _v5_redetected = 0
                 for t, frame in sampled_frames:
-                    if _v5_break:
-                        break
                     # Time limit check
                     if time.perf_counter() - t0 > _V5_TIME_LIMIT:
                         v5_exit_reason = f"time_limit ({_V5_TIME_LIMIT}s)"
@@ -639,15 +642,15 @@ async def _run_analyze_pipeline_impl(
                         validate_crop_size=_is_football,
                     )
                     v5_players_found += len(players) if players else 0
+
+                    _frame_had_detection = False
+                    _frame_hit_crop_limit = False
+
                     if players:
                         for player in players[:5]:  # Max 5 players per frame
                             if v5_total_crops >= _V5_MAX_CROPS:
                                 v5_exit_reason = f"crop_limit ({_V5_MAX_CROPS})"
-                                _v5_break = True
-                                break
-                            if v5_consecutive_misses >= _V5_EARLY_EXIT_AFTER:
-                                v5_exit_reason = f"early_exit ({_V5_EARLY_EXIT_AFTER} consecutive misses)"
-                                _v5_break = True
+                                _frame_hit_crop_limit = True
                                 break
                             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
                             h, w = frame.shape[:2]
@@ -685,11 +688,24 @@ async def _run_analyze_pipeline_impl(
                             )
                             if dets:
                                 v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
-                                v5_consecutive_misses = 0
-                            else:
-                                v5_consecutive_misses += 1
+                                _frame_had_detection = True
                     else:
                         v5_no_player_frames += 1
+
+                    if _frame_hit_crop_limit:
+                        break
+
+                    # Frame-based early exit: count consecutive FRAMES with zero
+                    # detections.  A single frame with 5 crop misses = 1 miss,
+                    # not 5.  Resets whenever ANY crop in a frame produces a hit.
+                    if _frame_had_detection:
+                        v5_consecutive_frame_misses = 0
+                    else:
+                        v5_consecutive_frame_misses += 1
+                        if v5_consecutive_frame_misses >= _V5_EARLY_EXIT_FRAMES:
+                            v5_exit_reason = f"early_exit ({_V5_EARLY_EXIT_FRAMES} consecutive frame misses)"
+                            LOGGER.info("Pipeline: v5 OCR early exit after %d consecutive frame misses", _V5_EARLY_EXIT_FRAMES)
+                            break
                 if v5_ocr_detections:
                     phases_used.append("v5_ocr_detection")
             layer_timings["v5_ocr_detection"] = {
@@ -699,11 +715,12 @@ async def _run_analyze_pipeline_impl(
                 "players_found": v5_players_found,
                 "no_player_frames": v5_no_player_frames,
                 "crops_processed": v5_total_crops,
+                "consecutive_frame_misses": v5_consecutive_frame_misses,
                 "exit_reason": v5_exit_reason or "completed",
                 "crop_dimensions_sample": v5_crop_dims[:10],
             }
-            LOGGER.info("Pipeline: v5 OCR found %d detections, %d crops processed, exit: %s",
-                        len(v5_ocr_detections), v5_total_crops, v5_exit_reason or "completed")
+            LOGGER.info("Pipeline: v5 OCR found %d detections, %d crops processed, %d frame misses, exit: %s",
+                        len(v5_ocr_detections), v5_total_crops, v5_consecutive_frame_misses, v5_exit_reason or "completed")
         except Exception as exc:
             layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)

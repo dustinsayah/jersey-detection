@@ -113,6 +113,13 @@ def classify_play(
     elif matched_rule and matched_rule.priority >= 6:
         score = min(100, score + 5)
 
+    # Jersey confirmation bonus: when jersey is confidently detected AND
+    # there's meaningful motion, the clip clearly shows the player in action.
+    # Force Strong minimum so these clips don't get stuck in Decent.
+    if jersey_confidence >= 0.4 and motion_score > 50:
+        score = max(score, 55)
+        LOGGER.debug("Jersey confirmation bonus: jersey=%.2f motion=%.1f → floor 55", jersey_confidence, motion_score)
+
     # Football QB boost: QBs are in every offensive play, so motion/outcome
     # signals are highly reliable even without jersey detection at 360p
     if sport.lower() == "football" and position and position.lower() in ("qb", "quarterback"):

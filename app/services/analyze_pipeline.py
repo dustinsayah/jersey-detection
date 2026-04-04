@@ -349,11 +349,21 @@ async def _run_analyze_pipeline_impl(
                     _use_fps, _effective_duration, _use_max,
                 )
                 _actual_fps_used = _use_fps
-                frames = _extract_frames(
-                    local_video_path, fps=_use_fps, sport=sport,
-                    start_sec=extract_start, end_sec=extract_end,
-                    max_frames=_use_max,
-                )
+                # Full games (>30 min): use smart motion-based sampling
+                if _effective_duration > 1800:
+                    LOGGER.info("Pipeline: using smart motion-based sampling for full game")
+                    frames = _smart_sample_frames(
+                        local_video_path,
+                        target_frames=_use_max,
+                        start_sec=extract_start,
+                        end_sec=extract_end,
+                    )
+                else:
+                    frames = _extract_frames(
+                        local_video_path, fps=_use_fps, sport=sport,
+                        start_sec=extract_start, end_sec=extract_end,
+                        max_frames=_use_max,
+                    )
                 frames_processed = len(frames)
                 layer_timings["frame_extraction"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success", "frames": frames_processed}
                 LOGGER.info("Pipeline: extracted %d frames", len(frames))
@@ -608,6 +618,58 @@ async def _run_analyze_pipeline_impl(
             LOGGER.info("Pipeline: freed Ali detector cache before Roboflow loading")
         except Exception:
             pass
+
+        # ── Step 7.4: v7 football-specialist OCR (runs BEFORE v5 for football) ──
+        v7_football_detections: list[dict] = []
+        v7_navy_detections = 0
+        v7_player_crops = 0
+        if sport.lower() == "football" and ocr_frames:
+            t0 = time.perf_counter()
+            try:
+                _v7_time_limit = 120 if _is_full_game else 60  # seconds
+                _v7_max_frames = min(200, len(ocr_frames))
+                _v7_sample = ocr_frames[::max(1, len(ocr_frames) // _v7_max_frames)][:_v7_max_frames]
+                _v7_count = 0
+                _v7_navy_count = 0
+                _v7_crops = 0
+
+                for ts, frame in _v7_sample:
+                    if time.perf_counter() - t0 > _v7_time_limit:
+                        LOGGER.info("Pipeline: v7 football OCR hit time limit (%ds)", _v7_time_limit)
+                        break
+                    dets = roboflow_detector.detect_football_jersey_v7(
+                        frame, jersey_number, conf=ocr_conf,
+                        is_dark_jersey=_is_dark_jersey,
+                    )
+                    if dets:
+                        for d in dets:
+                            d["timestamp"] = ts
+                            v7_football_detections.append(d)
+                            _v7_count += 1
+                            if "v7_navy" in d.get("layer", ""):
+                                _v7_navy_count += 1
+                    _v7_crops += 1  # count frames processed
+
+                v7_navy_detections = _v7_navy_count
+                v7_player_crops = _v7_crops
+                LOGGER.info(
+                    "Pipeline: v7 football OCR — %d detections (%d navy) from %d frames in %.1fs",
+                    _v7_count, _v7_navy_count, _v7_crops, time.perf_counter() - t0,
+                )
+                layer_timings["v7_football_ocr"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if _v7_count > 0 else "no_detections",
+                    "detections": _v7_count,
+                    "navy_detections": _v7_navy_count,
+                    "frames_processed": _v7_crops,
+                }
+            except Exception as exc:
+                LOGGER.warning("Pipeline: v7 football OCR failed (non-fatal): %s", exc)
+                layer_timings["v7_football_ocr"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error",
+                    "error": str(exc)[:200],
+                }
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
         # Guardrails: time limit, crop limit scales with frame count, early exit
@@ -1194,6 +1256,13 @@ async def _run_analyze_pipeline_impl(
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v5_ocr_universal"),
             })
+        for det in v7_football_detections:
+            all_layer_dets_raw.append({
+                "timestamp": det.get("timestamp", 0),
+                "confidence": det.get("confidence", 0),
+                "number_detected": det.get("number_detected", jersey_number),
+                "layer": det.get("layer", "v7_football_ocr"),
+            })
 
         # ── Diagnostic: log ALL numbers detected before filtering ─────
         all_numbers_seen = set(
@@ -1678,6 +1747,9 @@ async def _run_analyze_pipeline_impl(
             "v2_sport_detections": len(v2_sport_detections),
             "v3_primary_detections": len(v3_primary_detections),
             "v5_ocr_detections": len(v5_ocr_detections),
+            "v7_football_detections": len(v7_football_detections),
+            "v7_navy_detections": v7_navy_detections,
+            "v7_player_crops": v7_player_crops,
             "v4_outcome_detections": len(v4_outcome_detections),
             "v4_outcomes_found": len(v4_outcomes_by_ts),
             "combined_detections": len(detection_points),
@@ -1836,6 +1908,134 @@ def _run_jersey_detection(
             exc, type(exc).__name__,
         )
         return []
+
+
+def _smart_sample_frames(
+    video_path: Path,
+    target_frames: int = 750,
+    start_sec: float = 0,
+    end_sec: float = 0,
+) -> list[tuple[float, np.ndarray]]:
+    """Two-pass motion-aware frame sampling for full games.
+
+    Pass 1: Quick scan at ~0.2fps to compute motion scores across video.
+    Pass 2: Sample densely (2fps) in high-motion windows, sparsely elsewhere.
+    Returns up to target_frames frames sorted by timestamp.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_dur = total_frames_count / video_fps if video_fps > 0 else 0
+    _start = start_sec
+    _end = end_sec if end_sec > 0 else video_dur
+
+    # Detect pre-trimmed video
+    if _start > 0 and video_dur > 0 and _start > video_dur * 0.9:
+        _end = min(_end - _start, video_dur)
+        _start = 0
+
+    LOGGER.info("Smart sampling: video=%.0fs, range=%.0f-%.0f, target=%d frames",
+                video_dur, _start, _end, target_frames)
+
+    # Pass 1: Quick motion scan (~0.2fps = 1 frame every 5s)
+    scan_interval = max(1, int(video_fps * 5))  # every 5 seconds
+    prev_frame = None
+    motion_windows: list[tuple[float, float]] = []  # (timestamp, motion_score)
+
+    if _start > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(_start * video_fps))
+
+    frame_idx = int(_start * video_fps) if _start > 0 else 0
+    scan_count = 0
+    while scan_count < 2000:  # cap scan at 2000 samples
+        ret, frame = cap.read()
+        if not ret:
+            break
+        ts = frame_idx / video_fps
+        if ts > _end:
+            break
+        if frame_idx % scan_interval == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (320, 180))
+            if prev_frame is not None:
+                diff = cv2.absdiff(small, prev_frame)
+                score = float(diff.mean())
+                motion_windows.append((ts, score))
+            prev_frame = small
+            scan_count += 1
+        frame_idx += 1
+
+    cap.release()
+
+    if not motion_windows:
+        LOGGER.warning("Smart sampling: no motion data, falling back to uniform")
+        return _extract_frames(video_path, fps=1, start_sec=start_sec,
+                               end_sec=end_sec, max_frames=target_frames)
+
+    # Sort by motion score to find high-action windows
+    sorted_windows = sorted(motion_windows, key=lambda x: x[1], reverse=True)
+    avg_motion = sum(m for _, m in motion_windows) / len(motion_windows)
+    high_motion_thresh = max(avg_motion * 1.5, 5.0)
+
+    # Select top windows with motion above threshold
+    high_motion_times = sorted(
+        [ts for ts, score in sorted_windows if score >= high_motion_thresh]
+    )
+
+    # Deduplicate: merge windows within 10s of each other
+    dense_ranges: list[tuple[float, float]] = []
+    for ts in high_motion_times:
+        if dense_ranges and ts - dense_ranges[-1][1] < 10:
+            dense_ranges[-1] = (dense_ranges[-1][0], ts + 5)  # extend range
+        else:
+            dense_ranges.append((max(_start, ts - 5), ts + 5))
+
+    LOGGER.info("Smart sampling: %d motion windows, %d high-motion ranges (thresh=%.1f, avg=%.1f)",
+                len(motion_windows), len(dense_ranges), high_motion_thresh, avg_motion)
+
+    # Pass 2: Extract frames — dense (2fps) in high-motion, sparse (0.2fps) elsewhere
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+
+    dense_frame_interval = max(1, int(video_fps / 2))  # 2fps in action
+    sparse_frame_interval = max(1, int(video_fps * 5))  # 0.2fps elsewhere
+    frames: list[tuple[float, np.ndarray]] = []
+
+    if _start > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(_start * video_fps))
+
+    frame_idx = int(_start * video_fps) if _start > 0 else 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        ts = frame_idx / video_fps
+        if ts > _end:
+            break
+
+        # Determine if this timestamp is in a high-motion range
+        in_dense = any(r[0] <= ts <= r[1] for r in dense_ranges)
+        interval = dense_frame_interval if in_dense else sparse_frame_interval
+
+        if frame_idx % interval == 0:
+            h, w = frame.shape[:2]
+            if w < 1280:
+                scale = min(2.0, 1280 / w)
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            frames.append((ts, frame))
+            if len(frames) >= target_frames:
+                break
+
+        frame_idx += 1
+
+    cap.release()
+    LOGGER.info("Smart sampling: extracted %d frames (%d dense ranges, %d total motion windows)",
+                len(frames), len(dense_ranges), len(motion_windows))
+    return frames
 
 
 def _extract_frames(

@@ -163,7 +163,7 @@ def _yt_dlp_download(
         "--format", fmt,
         "--merge-output-format", "mp4",
         "--no-playlist",
-        "--socket-timeout", "30",
+        "--socket-timeout", "60",
         "-o", str(output_path),
     ]
 
@@ -354,12 +354,16 @@ def download_youtube_sync(
             requested_end=end_time,
         )
 
+    # Detect full game (long video) — increase timeout for strategies 1-2
+    _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
+    _dl_timeout = 600 if _is_long_video else 300
+
     # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
     # android_vr client can list 720p/1080p DASH formats when EJS solver works.
     # DASH H.264 format ensures OpenCV compatibility (no VP9/AV1).
     if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                         client="android_vr", start_time=start_time, end_time=end_time,
-                        timeout=300, strategy_name="Strategy 1",
+                        timeout=_dl_timeout, strategy_name="Strategy 1",
                         format_override=_DASH_H264_FORMAT, use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 1 (android_vr DASH+EJS)", elapsed)
@@ -372,7 +376,7 @@ def download_youtube_sync(
     if proxy:
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=300, strategy_name="Strategy 2",
+                            timeout=_dl_timeout, strategy_name="Strategy 2",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
                             proxy=proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
@@ -385,7 +389,7 @@ def download_youtube_sync(
     # ── Strategy 3: Render server proxy ──
     # Render server receives startTime/endTime and returns pre-trimmed video.
     # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
-    with httpx.Client(timeout=httpx.Timeout(180)) as client:
+    with httpx.Client(timeout=httpx.Timeout(300 if _is_long_video else 180)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)

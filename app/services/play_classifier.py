@@ -143,6 +143,33 @@ def classify_play(
             score = min(100, score + 10)
             LOGGER.debug("QB crowd boost +10 for crowd_energy=%.2f", crowd_energy)
 
+    # Basketball position-aware boosts
+    if sport.lower() == "basketball":
+        if v4_outcome in ("made_shot", "fast_break"):
+            score = min(100, score + 20)
+            LOGGER.debug("Basketball outcome boost +20 for v4_outcome=%s", v4_outcome)
+        elif v4_outcome in ("drive", "assist"):
+            score = min(100, score + 15)
+            LOGGER.debug("Basketball outcome boost +15 for v4_outcome=%s", v4_outcome)
+        elif v4_outcome in ("rebound",):
+            score = min(100, score + 10)
+            LOGGER.debug("Basketball outcome boost +10 for v4_outcome=%s", v4_outcome)
+        if pose_action == "jumping" and motion_score > 60:
+            score = min(100, score + 10)
+            LOGGER.debug("Basketball jumping+motion boost +10")
+
+    # Position-appropriate action without OCR: still valuable clip
+    # If jersey wasn't detected but high-confidence action matches position role
+    if jersey_confidence < 0.1 and motion_score > 40:
+        if sport.lower() == "football" and position and position.lower() in ("qb", "quarterback"):
+            if v4_outcome in ("pass_play", "qb_scramble", "touchdown", "completion", "sack"):
+                score = max(score, 40)  # floor at Decent
+                LOGGER.debug("Position-action floor 40 for QB without OCR: v4=%s", v4_outcome)
+        elif sport.lower() == "basketball":
+            if v4_outcome in ("made_shot", "fast_break", "drive"):
+                score = max(score, 40)
+                LOGGER.debug("Position-action floor 40 for basketball without OCR: v4=%s", v4_outcome)
+
     # Grade assignment — calibrated so without v4 outcome models:
     #   Elite: top ~10% (scoring plays or QB highlight)
     #   Strong: next ~10% (clear highlight play)

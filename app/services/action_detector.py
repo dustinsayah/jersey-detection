@@ -58,26 +58,46 @@ def detect_actions_basketball(
                     action_type="dunk", confidence=0.5,
                     timestamp=ts, zone=zone, ball_involved=ball_visible,
                 )
+            elif zone == "unknown":
+                # Zone unavailable (frames freed for memory) — still detect shot from pose
+                detected = DetectedAction(
+                    action_type="shot_attempt", confidence=0.5,
+                    timestamp=ts, zone=zone, ball_involved=ball_visible,
+                )
 
-        # Drive: fast lateral movement toward paint
-        elif motion > 50 and zone in ("three_point", "midrange", "transition"):
+        # Drive: fast lateral movement
+        elif motion > 50 and action == "running":
             detected = DetectedAction(
                 action_type="drive", confidence=0.55,
                 timestamp=ts, zone=zone, ball_involved=ball_visible,
             )
 
+        # Fast break: very high motion
+        elif motion > 70 and action in ("running", "jumping"):
+            detected = DetectedAction(
+                action_type="fast_break", confidence=0.5,
+                timestamp=ts, zone=zone, ball_involved=ball_visible,
+            )
+
         # Rebound: jumping near basket after potential shot
-        elif action == "jumping" and zone == "paint":
+        elif action == "jumping" and (zone == "paint" or (zone == "unknown" and motion > 30)):
             detected = DetectedAction(
                 action_type="rebound", confidence=0.5,
                 timestamp=ts, zone=zone, ball_involved=ball_visible,
             )
 
         # Pass: arm extended
-        elif action == "throwing" and intensity < 0.5 and ball_visible:
+        elif action == "throwing" and intensity < 0.5:
             detected = DetectedAction(
                 action_type="pass", confidence=0.45,
-                timestamp=ts, zone=zone, ball_involved=True,
+                timestamp=ts, zone=zone, ball_involved=ball_visible,
+            )
+
+        # Defensive play: crouching with moderate motion
+        elif action in ("crouching", "defensive_stance") and motion > 20:
+            detected = DetectedAction(
+                action_type="defense", confidence=0.4,
+                timestamp=ts, zone=zone, ball_involved=False,
             )
 
         if detected:

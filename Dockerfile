@@ -111,6 +111,10 @@ for model in football_player_detector.pt football_digit_detector.pt football_jer
 done\n\
 echo "Models: $(ls /app/app/model/*.pt /app/app/model/*.pth 2>/dev/null | wc -l)"\n\
 \n\
+# ── Update yt-dlp at runtime (YouTube changes API frequently) ──\n\
+echo "Updating yt-dlp..."\n\
+pip install --upgrade yt-dlp 2>/dev/null && echo "yt-dlp updated to $(yt-dlp --version)" || echo "yt-dlp update failed (using build version)"\n\
+\n\
 # ── Start Cloudflare WARP proxy (non-fatal) ──\n\
 if [ -n "$WARP_WG_CONFIG" ]; then\n\
   echo "Starting Cloudflare WARP proxy..."\n\

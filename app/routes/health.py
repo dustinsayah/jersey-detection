@@ -161,6 +161,14 @@ def _check_phases() -> dict:
         "game_stats": "ready",
     }
 
+    # yt-dlp version
+    try:
+        import subprocess
+        _ytdlp_ver = subprocess.check_output(["yt-dlp", "--version"], timeout=5, text=True).strip()
+        phases["yt_dlp_version"] = _ytdlp_ver
+    except Exception:
+        phases["yt_dlp_version"] = "unknown"
+
     # Memory usage
     try:
         import psutil
@@ -213,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v7.0.1",
+        "version": "v7.1.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -252,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v7.0.1",
+        "version": "v7.1.0",
     })
 
 
@@ -264,7 +272,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v7.0.1",
+            "version": "v7.1.0",
             "detector_ready": ready,
         },
     )

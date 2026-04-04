@@ -620,6 +620,7 @@ async def _run_analyze_pipeline_impl(
             pass
 
         # ── Step 7.4: v7 football-specialist OCR (runs BEFORE v5 for football) ──
+        _is_full_game = video_duration > 1800
         v7_football_detections: list[dict] = []
         v7_navy_detections = 0
         v7_player_crops = 0
@@ -854,6 +855,11 @@ async def _run_analyze_pipeline_impl(
             }
             LOGGER.info("Pipeline: v5 OCR found %d detections, %d crops processed, %d frame misses, exit: %s",
                         len(v5_ocr_detections), v5_total_crops, v5_consecutive_frame_misses, v5_exit_reason or "completed")
+            # Pipeline-level tracking safety net: ensure v5 models are tracked
+            if v5_players_found > 0:
+                roboflow_detector._track_model_call("player_detector_v5_pipeline", v5_players_found)
+            if v5_ocr_detections:
+                roboflow_detector._track_model_call("jersey_ocr_universal_v5_pipeline", len(v5_ocr_detections))
         except Exception as exc:
             layer_timings["v5_ocr_detection"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)[:200]}
             LOGGER.warning("Pipeline: v5 OCR layer failed (non-fatal): %s", exc)
@@ -1716,8 +1722,9 @@ async def _run_analyze_pipeline_impl(
         try:
             from app.services.roboflow_detector import roboflow_detector
             request_summary = roboflow_detector.get_request_summary()
-        except Exception:
-            pass
+            LOGGER.info("Pipeline: request_summary = %s", request_summary)
+        except Exception as exc:
+            LOGGER.warning("Pipeline: get_request_summary failed: %s", exc)
 
         # Memory info
         memory_rss_mb = 0

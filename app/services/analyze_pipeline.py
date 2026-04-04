@@ -609,7 +609,8 @@ async def _run_analyze_pipeline_impl(
         # Scale crop limit: 200 for short videos, up to 500 for full games.
         # At ~120ms/crop, 500 crops ≈ 60s — well within the 90s time limit.
         _V5_MAX_CROPS = min(500, max(200, frames_processed))
-        _V5_EARLY_EXIT_FRAMES = 50  # consecutive frames with 0 detections
+        # Football: more patient (200 frames) — navy jerseys at distance are hard
+        _V5_EARLY_EXIT_FRAMES = 200 if sport.lower() == "football" else 50
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
         v5_no_player_frames = 0
@@ -672,19 +673,41 @@ async def _run_analyze_pipeline_impl(
                             if crop.size == 0:
                                 continue
                             ch, cw = crop.shape[:2]
-                            # Skip tiny crops that can't contain readable jersey numbers
-                            if cw < 40 or ch < 60:
-                                LOGGER.debug("Skipping tiny crop %dx%d at frame t=%.1f", cw, ch, t)
+                            # Skip truly unusable crops (< 8px wide)
+                            if cw < 8 or ch < 12:
                                 v5_crop_dims.append(f"{cw}x{ch}(skip)")
                                 continue
-                            # Football: force 2x upscale before OCR — jersey numbers are
-                            # typically only 20-30px on a 178px-wide player crop at 720p
-                            if _is_football and max(cw, ch) < 500:
-                                crop = cv2.resize(crop, (cw * 2, ch * 2), interpolation=cv2.INTER_CUBIC)
+
+                            # ── Navy/dark jersey CLAHE enhancement (before upscale) ──
+                            # For dark jerseys, enhance contrast first to preserve
+                            # digit edges through the upscale process
+                            _is_dark = jersey_color.lower() in (
+                                "navy", "dark", "black", "dark blue", "dark green",
+                                "maroon", "dark red", "purple",
+                            )
+                            if _is_dark and min(cw, ch) >= 8:
+                                _lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+                                _tile = (4, 4) if max(cw, ch) < 50 else (8, 8)
+                                _clahe = cv2.createCLAHE(clipLimit=6.0, tileGridSize=_tile)
+                                _lab[:, :, 0] = _clahe.apply(_lab[:, :, 0])
+                                crop = cv2.cvtColor(_lab, cv2.COLOR_LAB2BGR)
+
+                            # ── Adaptive upscale: more aggressive for smaller crops ──
+                            if cw < 50:
+                                _scale = 8  # Tiny crops: 9px → 72px
+                            elif cw < 100:
+                                _scale = 4  # Small crops: 80px → 320px
+                            elif _is_football and max(cw, ch) < 500:
+                                _scale = 2  # Football medium crops
+                            else:
+                                _scale = 1
+
+                            if _scale > 1:
+                                crop = cv2.resize(crop, (cw * _scale, ch * _scale), interpolation=cv2.INTER_CUBIC)
                                 # Sharpen after upscale
                                 gaussian = cv2.GaussianBlur(crop, (0, 0), 1.5)
                                 crop = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
-                                v5_crop_dims.append(f"{cw}x{ch}→{cw*2}x{ch*2}")
+                                v5_crop_dims.append(f"{cw}x{ch}→{cw*_scale}x{ch*_scale}")
                             else:
                                 v5_crop_dims.append(f"{cw}x{ch}")
                             v5_total_crops += 1
@@ -697,6 +720,35 @@ async def _run_analyze_pipeline_impl(
                                 _frame_had_detection = True
                     else:
                         v5_no_player_frames += 1
+
+                    # ── Football grid scan fallback ──
+                    # When player crops fail for football (distant camera),
+                    # try OCR on 3x3 grid sections of the full frame
+                    if _is_football and not _frame_had_detection and v5_consecutive_frame_misses > 10:
+                        fh, fw = frame.shape[:2]
+                        for row in range(3):
+                            for col in range(3):
+                                if v5_total_crops >= _V5_MAX_CROPS:
+                                    break
+                                gx1 = int(col * fw / 3 * 0.8)
+                                gy1 = int(row * fh / 3 * 0.8)
+                                gx2 = int(min(fw, gx1 + fw / 3 * 1.2))
+                                gy2 = int(min(fh, gy1 + fh / 3 * 1.2))
+                                region = frame[gy1:gy2, gx1:gx2]
+                                if region.size == 0:
+                                    continue
+                                rh, rw = region.shape[:2]
+                                # Upscale region 2x for OCR
+                                region_up = cv2.resize(region, (rw * 2, rh * 2), interpolation=cv2.INTER_CUBIC)
+                                v5_total_crops += 1
+                                v5_crop_dims.append(f"grid_{rw}x{rh}→{rw*2}x{rh*2}")
+                                grid_dets = roboflow_detector.detect_jersey_v5(
+                                    region_up, jersey_number=jersey_number, conf=ocr_conf,
+                                    skip_preprocess=True,
+                                )
+                                if grid_dets:
+                                    v5_ocr_detections.extend({**d, "timestamp": t} for d in grid_dets)
+                                    _frame_had_detection = True
 
                     if _frame_hit_crop_limit:
                         break

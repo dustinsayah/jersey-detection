@@ -46,6 +46,8 @@ _DEFAULT_EXPAND = (2.0, 4.0)
 # Minimum clip duration
 MIN_CLIP_DURATION = 3.0
 MAX_CLIP_DURATION = 30.0
+# Shorter clips for full-game analysis (>1800s videos)
+FULL_GAME_MAX_CLIP_DURATION = 15.0
 
 # Maximum distance between jersey detections to cluster them (seconds)
 # Basketball: 3s gap — fast-paced, plays change quickly
@@ -121,22 +123,26 @@ def extract_clips(
             energy_lookup[second] = max(energy_lookup.get(second, 0), pt.energy)
 
     # ── Step 0: Jitter filter — remove isolated 1-frame false positives ──
+    # Full-game mode: wider neighbor window because frames are 8+ seconds
+    # apart at 1fps.  Also lower confidence bypass (v5 OCR averages 0.4-0.45).
+    _is_full_game = video_duration > 1800
+    _jitter_window = 10.0 if _is_full_game else 2.0
+    _jitter_conf_bypass = 0.3 if _is_full_game else 0.5
     sorted_dets = sorted(detections, key=lambda d: d.timestamp)
     if len(sorted_dets) >= 3:
         filtered_dets: list[DetectionPoint] = []
         for det in sorted_dets:
-            # Count detections within 2 seconds of this one (was 1s)
             neighbors = sum(
                 1 for d in sorted_dets
-                if d is not det and abs(d.timestamp - det.timestamp) <= 2.0
+                if d is not det and abs(d.timestamp - det.timestamp) <= _jitter_window
             )
-            # Keep if: has a neighbor OR moderate-high confidence (was 0.85)
-            if neighbors >= 1 or det.confidence > 0.5:
+            if neighbors >= 1 or det.confidence > _jitter_conf_bypass:
                 filtered_dets.append(det)
         if filtered_dets:
             jitter_removed = len(sorted_dets) - len(filtered_dets)
             if jitter_removed > 0:
-                LOGGER.info("Jitter filter: removed %d isolated detections", jitter_removed)
+                LOGGER.info("Jitter filter: removed %d isolated detections (window=%.0fs, conf_bypass=%.2f)",
+                            jitter_removed, _jitter_window, _jitter_conf_bypass)
             sorted_dets = filtered_dets
 
     # ── Step 1: Find detection clusters ──────────────────────────────────
@@ -219,15 +225,16 @@ def extract_clips(
         start_time = max(0, first_t - expand_before)
         end_time = min(video_duration, last_t + expand_after) if video_duration > 0 else last_t + expand_after
 
-        # Enforce duration limits
+        # Enforce duration limits — shorter clips for full games
+        _max_dur = FULL_GAME_MAX_CLIP_DURATION if _is_full_game else MAX_CLIP_DURATION
         duration = end_time - start_time
         if duration < MIN_CLIP_DURATION:
             # Expand symmetrically
             needed = MIN_CLIP_DURATION - duration
             start_time = max(0, start_time - needed / 2)
             end_time = start_time + MIN_CLIP_DURATION
-        elif duration > MAX_CLIP_DURATION:
-            end_time = start_time + MAX_CLIP_DURATION
+        elif duration > _max_dur:
+            end_time = start_time + _max_dur
 
         play_duration = end_time - start_time
 
@@ -385,7 +392,11 @@ def extract_clips(
     merged.sort(key=lambda c: c.score, reverse=True)
 
     # Filter out "Cut" grade clips
-    result = [c for c in merged if c.grade != "Cut"]
+    # Full-game mode: lower cut threshold to include more clips
+    if _is_full_game:
+        result = [c for c in merged if c.score >= 25]
+    else:
+        result = [c for c in merged if c.grade != "Cut"]
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
     # Football: rescue aggressively — jersey OCR rarely works on football footage

@@ -44,6 +44,16 @@ RENDER_SERVER_URL = os.getenv(
 # Optional proxy for yt-dlp — set to residential proxy or Cloudflare WARP SOCKS5
 # e.g. socks5://127.0.0.1:40000 (WARP) or socks5://user:pass@proxy.example.com:1080
 # Read at runtime via function (start.sh sets it dynamically after wireproxy starts)
+def _get_cookie_file() -> str:
+    """Return path to YouTube cookies file if it exists."""
+    for path in ["/app/youtube_cookies.txt", "/data/youtube_cookies.txt",
+                 os.getenv("YOUTUBE_COOKIES_FILE", "")]:
+        if path and os.path.isfile(path):
+            LOGGER.info("youtube_proxy: using cookies from %s", path)
+            return path
+    return ""
+
+
 def _get_proxy() -> str:
     return os.getenv("YT_DLP_PROXY", "").strip()
 
@@ -167,6 +177,11 @@ def _yt_dlp_download(
         "-o", str(output_path),
     ]
 
+    # Cookie support: use YouTube cookies to bypass login/geo restrictions
+    cookie_file = _get_cookie_file()
+    if cookie_file:
+        cmd.extend(["--cookies", cookie_file])
+
     # EJS: required for YouTube n-challenge solving (unlocks DASH 720p+ formats)
     # Needs deno runtime installed (see Dockerfile). Without this, only 360p muxed available.
     if use_ejs:
@@ -228,6 +243,10 @@ def _yt_dlp_python_download(
 
         if proxy:
             ydl_opts["proxy"] = proxy
+
+        cookie_file = _get_cookie_file()
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
 
         if (start_time > 0 or end_time > 0):
             ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(

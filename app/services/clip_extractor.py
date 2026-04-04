@@ -149,7 +149,13 @@ def extract_clips(
     clusters: list[list[DetectionPoint]] = []
     current_cluster: list[DetectionPoint] = []
 
-    cluster_gap = FOOTBALL_CLUSTER_GAP if sport.lower() == "football" else DETECTION_CLUSTER_GAP
+    # Full-game mode: wider cluster gap because frames are 1fps (8-10s apart)
+    if _is_full_game:
+        cluster_gap = 8.0  # Wider gap for sparse frames
+    elif sport.lower() == "football":
+        cluster_gap = FOOTBALL_CLUSTER_GAP
+    else:
+        cluster_gap = DETECTION_CLUSTER_GAP
     for det in sorted_dets:
         if not current_cluster:
             current_cluster = [det]
@@ -392,9 +398,9 @@ def extract_clips(
     merged.sort(key=lambda c: c.score, reverse=True)
 
     # Filter out "Cut" grade clips
-    # Full-game mode: lower cut threshold to include more clips
+    # Full-game mode: lower cut threshold to include more clips (target 20+)
     if _is_full_game:
-        result = [c for c in merged if c.score >= 25]
+        result = [c for c in merged if c.score >= 20]
     else:
         result = [c for c in merged if c.grade != "Cut"]
 

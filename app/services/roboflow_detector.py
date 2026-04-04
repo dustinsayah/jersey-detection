@@ -720,9 +720,11 @@ class RoboflowDetector:
                             "layer": "roboflow_digit",
                         }
                     )
+            self._track_model_call("football_digit_detector", len(dets))
             return dets
         except Exception as e:
             logger.error("digit detect error: %s", e)
+            self._track_model_call("football_digit_detector", 0)
             return []
 
     def detect_football_players(
@@ -747,9 +749,11 @@ class RoboflowDetector:
                             "layer": "roboflow_player",
                         }
                     )
+            self._track_model_call("football_player_detector", len(players))
             return players
         except Exception as e:
             logger.error("player detect error: %s", e)
+            self._track_model_call("football_player_detector", 0)
             return []
 
     def detect_basketball_jerseys(
@@ -776,9 +780,11 @@ class RoboflowDetector:
                             "layer": "roboflow_basketball_jersey",
                         }
                     )
+            self._track_model_call("basketball_jersey_ocr", len(dets))
             return dets
         except Exception as e:
             logger.error("basketball jersey detect error: %s", e)
+            self._track_model_call("basketball_jersey_ocr", 0)
             return []
 
     def detect_football_tracker(
@@ -807,9 +813,11 @@ class RoboflowDetector:
                             "layer": "roboflow_tracker",
                         }
                     )
+            self._track_model_call("football_jersey_tracker", len(dets))
             return dets
         except Exception as e:
             logger.error("tracker detect error: %s", e)
+            self._track_model_call("football_jersey_tracker", 0)
             return []
 
     def _run_v3_ocr_on_crop(
@@ -1025,6 +1033,7 @@ class RoboflowDetector:
                         })
             except Exception as e:
                 logger.debug("%s error: %s", layer_name, e)
+            self._track_model_call(layer_name, sum(1 for d in dets if d.get("layer") == layer_name))
         return dets
 
     def detect_with_player_crops(
@@ -1067,8 +1076,10 @@ class RoboflowDetector:
                             "class": name,
                             "layer": "v3_player_isolator",
                         })
+                self._track_model_call("player_isolator_v3", len(players))
             except Exception as e:
                 logger.debug("player_isolator_v3 error: %s", e)
+                self._track_model_call("player_isolator_v3", 0)
 
         if not players:
             players = self.detect_football_players(frame, conf=0.25)
@@ -1403,6 +1414,7 @@ class RoboflowDetector:
             top_class = probs.top1
             top_conf = probs.top1conf.item()
             class_name = self.dead_ball_classifier_v5_model.names[top_class]
+            self._track_model_call("dead_ball_classifier_v5", 1)
             if top_conf >= conf:
                 return class_name  # "live_play" or "dead_ball"
             return None
@@ -1427,6 +1439,7 @@ class RoboflowDetector:
                         "confidence": box.conf.item(),
                         "layer": "scoreboard_v5",
                     })
+            self._track_model_call("scoreboard_detector_v5", len(dets))
             return dets
         except Exception as exc:
             logger.warning("Scoreboard detection failed: %s", exc)
@@ -1737,6 +1750,7 @@ class RoboflowDetector:
                     sp["bbox"] = [sb[0] + x1, sb[1] + y1, sb[2] + x1, sb[3] + y1]
                     players.append(sp)
 
+        self._track_model_call("player_detector_v5", len(players))
         return players
 
     def classify_outcome_v5(
@@ -1772,12 +1786,17 @@ class RoboflowDetector:
                 top_conf = float(results.probs.top1conf)
                 if top_conf >= conf:
                     class_name = model.names[top_class]
-                    return class_name.lower().replace(" ", "_")
+                    outcome = class_name.lower().replace(" ", "_")
+                    self._track_model_call(f"outcome_cls_{sport.lower()}_v5", 1)
+                    return outcome
             elif results.boxes and len(results.boxes) > 0:
                 # Detection model output
                 best = max(results.boxes, key=lambda b: float(b.conf))
                 class_name = model.names[int(best.cls)]
-                return class_name.lower().replace(" ", "_")
+                outcome = class_name.lower().replace(" ", "_")
+                self._track_model_call(f"outcome_cls_{sport.lower()}_v5", 1)
+                return outcome
+            self._track_model_call(f"outcome_cls_{sport.lower()}_v5", 0)
         except Exception as e:
             logger.debug("v5 classifier (%s) error: %s", sport, e)
         return None

@@ -1388,12 +1388,15 @@ async def _run_analyze_pipeline_impl(
             # Relaxed temporal consensus — 2 confirmations in 3s window
             # Aggressive mode (low quality or dark jerseys) → even more relaxed
             # Also relax when few detections (<10) to avoid filtering them all out
+            # Full games (>1800s): always relaxed — frames are sparse (1fps),
+            # requiring 2 confirmations in 3s is too aggressive
             _few_detections = len(all_layer_dets) < 10
-            if resolved_quality == "aggressive" or _is_dark_jersey or _few_detections:
+            _is_full_game_tc = video_duration > 1800
+            if resolved_quality == "aggressive" or _is_dark_jersey or _few_detections or _is_full_game_tc:
                 tc_instance = TemporalConsensus(
                     min_confirmations=1,
-                    time_window=4.0,
-                    confidence_threshold=0.15,
+                    time_window=5.0 if _is_full_game_tc else 4.0,
+                    confidence_threshold=0.12 if _is_full_game_tc else 0.15,
                 )
             else:
                 tc_instance = TemporalConsensus(
@@ -1496,15 +1499,17 @@ async def _run_analyze_pipeline_impl(
         # in the video (confirmed by OCR), so motion peaks are likely their plays.
         # Threshold raised from 5→20 because improved v5 OCR now finds 10-15
         # detections that all chain into a single cluster at 5s gap.
-        if 1 <= len(detection_points) <= 20 and _frame_timestamps:
+        _supplement_limit = 60 if video_duration > 1800 else 20  # full games need more supplement
+        if 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
             _motion_thresh = 30  # moderate-to-strong motion (basketball avg ~37)
             _supplement_count = 0
             for t in _frame_timestamps:
                 if t in _existing_ts:
                     continue
-                # Skip if within 3s of an existing detection (would merge anyway)
-                if any(abs(t - ets) < 3.0 for ets in _existing_ts):
+                # Skip if near an existing detection (would merge anyway)
+                _skip_gap = 1.5 if video_duration > 1800 else 3.0
+                if any(abs(t - ets) < _skip_gap for ets in _existing_ts):
                     continue
                 motion = motion_scores.get(t, 0)
                 in_boundary = _in_audio_boundary(audio_result, t)

@@ -113,10 +113,11 @@ def classify_play(
     elif matched_rule and matched_rule.priority >= 6:
         score = min(100, score + 5)
 
-    # Jersey confirmation bonus: when jersey is confidently detected AND
-    # there's meaningful motion, the clip clearly shows the player in action.
-    # Force Strong minimum so these clips don't get stuck in Decent.
-    if jersey_confidence >= 0.4 and motion_score > 50:
+    # Jersey confirmation bonus: when jersey is detected with ANY confidence
+    # AND there's meaningful motion, the clip shows the player in action.
+    # v5 OCR returns ~0.3-0.5 for confirmed numbers — threshold at 0.2 to
+    # include all real OCR hits (false positives are filtered by temporal consensus).
+    if jersey_confidence >= 0.2 and motion_score > 50:
         score = max(score, 55)
         LOGGER.debug("Jersey confirmation bonus: jersey=%.2f motion=%.1f → floor 55", jersey_confidence, motion_score)
 

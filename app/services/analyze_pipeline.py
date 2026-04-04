@@ -603,11 +603,12 @@ async def _run_analyze_pipeline_impl(
             pass
 
         # ── Step 7.5a: v5 player detection → v5 OCR on crops (PRIMARY) ──
-        # Guardrails: max 90s, max 200 crops, early exit after 50 consecutive
-        # FRAMES with zero detections (not crops — a single frame with 5 crop
-        # misses should not count as 5 misses).
+        # Guardrails: max 90s, crop limit scales with frame count, early exit
+        # after 50 consecutive FRAMES with zero detections.
         _V5_TIME_LIMIT = 90  # seconds
-        _V5_MAX_CROPS = 200
+        # Scale crop limit: 200 for short videos, up to 500 for full games.
+        # At ~120ms/crop, 500 crops ≈ 60s — well within the 90s time limit.
+        _V5_MAX_CROPS = min(500, max(200, frames_processed))
         _V5_EARLY_EXIT_FRAMES = 50  # consecutive frames with 0 detections
         v5_ocr_detections: list[dict] = []
         v5_players_found = 0
@@ -622,8 +623,13 @@ async def _run_analyze_pipeline_impl(
             roboflow_detector.load()
 
             if ocr_frames:
-                # Sample every 2nd frame for memory safety
-                sampled_frames = ocr_frames[::2] if len(ocr_frames) > 30 else ocr_frames
+                # Sample frames: every 2nd for short, every 3rd for long videos
+                if len(ocr_frames) > 200:
+                    sampled_frames = ocr_frames[::3]  # 500→167 frames
+                elif len(ocr_frames) > 30:
+                    sampled_frames = ocr_frames[::2]
+                else:
+                    sampled_frames = ocr_frames
                 LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
                 _is_football = sport.lower() == "football"
                 _v5_oversized_skipped = 0
@@ -647,7 +653,7 @@ async def _run_analyze_pipeline_impl(
                     _frame_hit_crop_limit = False
 
                     if players:
-                        for player in players[:5]:  # Max 5 players per frame
+                        for player in players[:3]:  # Max 3 players per frame (better coverage)
                             if v5_total_crops >= _V5_MAX_CROPS:
                                 v5_exit_reason = f"crop_limit ({_V5_MAX_CROPS})"
                                 _frame_hit_crop_limit = True

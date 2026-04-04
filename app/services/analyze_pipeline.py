@@ -1726,6 +1726,33 @@ async def _run_analyze_pipeline_impl(
         except Exception as exc:
             LOGGER.warning("Pipeline: get_request_summary failed: %s", exc)
 
+        # Fallback: build models_called from layer_timings when detector tracking is empty
+        if not request_summary.get("models_called"):
+            _mc: list[str] = []
+            _dpm: dict[str, int] = {}
+            _layer_model_map = {
+                "dead_ball_filter": ("dead_ball_classifier_v5", "dead_frames"),
+                "v5_ocr_detection": ("jersey_ocr_universal_v5", "detections"),
+                "v7_football_ocr": ("football_jersey_ocr_v7", "detections"),
+                "v3_ocr_detection": ("v3_ocr", "detections"),
+                "universal_v2_ocr": ("universal_v2_ocr", "detections"),
+                "v2_sport_detection": ("v2_sport_detector", "v2_sport_detections"),
+                "ali_jersey_detection": ("ali_ensemble", "detections"),
+                "v4_outcome_detection": ("v4_outcome_classifier", "detections"),
+                "football_fullframe_ocr": ("football_fullframe_ocr", "detections"),
+            }
+            # Add player_detector_v5 if v5 OCR ran
+            if layer_timings.get("v5_ocr_detection", {}).get("players_found", 0) > 0:
+                _mc.append("player_detector_v5")
+                _dpm["player_detector_v5"] = layer_timings["v5_ocr_detection"]["players_found"]
+            for layer_key, (model_name, count_key) in _layer_model_map.items():
+                lt = layer_timings.get(layer_key, {})
+                if lt.get("status") in ("success", "no_detections", "no_model_or_no_detections", "no_model_or_no_outcomes"):
+                    _mc.append(model_name)
+                    _dpm[model_name] = lt.get(count_key, 0)
+            request_summary = {"models_called": _mc, "detections_per_model": _dpm}
+            LOGGER.info("Pipeline: built models_called from layer_timings: %s", _mc)
+
         # Memory info
         memory_rss_mb = 0
         try:

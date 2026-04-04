@@ -81,9 +81,9 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
       - Short clips (<120s): 2 fps, 150 frames → full coverage
       - Medium clips (120-600s): 1 fps, 200 frames → every second for ~3 min
       - Long videos (600-1800s): 1 fps, 300 frames → one per second, 5 min
-      - Full games (1800-3600s): 1 fps, 750 frames → every ~2.5-5s over 30-60 min
-      - Long games (3600-7200s): 1 fps, 1000 frames → every ~3.5-7s over 1-2 hrs
-      - Extra long (>7200s): 1 fps, 1200 frames → every ~6s+ over 2+ hrs
+      - Full games (1800-3600s): 1 fps, 600 frames → every ~3-6s over 30-60 min
+      - Long games (3600-7200s): 1 fps, 750 frames → every ~5-10s over 1-2 hrs
+      - Extra long (>7200s): 1 fps, 900 frames → every ~8s+ over 2+ hrs
     """
     if video_duration <= 120:
         return 2, 150
@@ -92,11 +92,11 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
     elif video_duration <= 1800:
         return 1, 300
     elif video_duration <= 3600:
-        return 1, 750
+        return 1, 600
     elif video_duration <= 7200:
-        return 1, 1000
+        return 1, 750
     else:
-        return 1, 1200
+        return 1, 900
 
 
 def _force_cleanup_memory():
@@ -373,7 +373,13 @@ async def _run_analyze_pipeline_impl(
                 roboflow_detector.load()
 
                 _live: list[tuple[float, np.ndarray]] = []
-                for ts, frame in frames:
+                # Full games: sample every 4th frame for dead ball (saves ~75% time)
+                _db_step = 4 if video_duration > 1800 else 1
+                for idx, (ts, frame) in enumerate(frames):
+                    if idx % _db_step != 0:
+                        # Skip dead ball check — assume live for unsampled frames
+                        _live.append((ts, frame))
+                        continue
                     db_result = roboflow_detector.classify_dead_ball(frame)
                     if db_result:
                         dead_ball_by_ts[ts] = db_result
@@ -382,7 +388,8 @@ async def _run_analyze_pipeline_impl(
                     else:
                         _live.append((ts, frame))
 
-                dead_ball_ratio = dead_ball_count / len(frames) if frames else 0.0
+                _db_sampled = len(frames) // _db_step + (1 if len(frames) % _db_step else 0)
+                dead_ball_ratio = dead_ball_count / _db_sampled if _db_sampled else 0.0
                 live_ratio = len(_live) / len(frames) if frames else 1.0
 
                 # Safety: if dead ball ratio > 50% OR less than 30% of frames survive,

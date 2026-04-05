@@ -408,9 +408,10 @@ def download_youtube_sync(
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
     _dl_timeout = 600 if _is_long_video else 90  # 90s per-strategy for short clips
 
-    # Overall timeout: don't let the entire chain exceed this (prevents 1400s hangs)
-    # Must be large enough to allow multiple strategy attempts (each ~90-180s).
-    _TOTAL_TIMEOUT = 900 if _is_long_video else 600
+    # Overall timeout: don't let the entire chain exceed this.
+    # Long videos (full game): 1500s total to allow Decodo 900s + fallbacks.
+    # Short clips: 600s allows ~4 strategy attempts of ~120s each.
+    _TOTAL_TIMEOUT = 1500 if _is_long_video else 600
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start
@@ -429,9 +430,10 @@ def download_youtube_sync(
     # issues). Strategy 0 tries with sections first; Strategy 0a retries WITHOUT
     # sections (downloads full video) and trims with ffmpeg -c copy afterward.
     decodo_proxy = _get_decodo_proxy()
-    # Per-strategy Decodo timeout: 120s for short clips, 600s for long videos.
+    # Per-strategy Decodo timeout: 120s for short clips, 900s for long videos.
+    # Full game at 720p ~= 1-2GB through residential proxy, needs ~500-1000s.
     # Must be less than _TOTAL_TIMEOUT to leave room for fallback strategies.
-    _decodo_timeout = 600 if _is_long_video else 120
+    _decodo_timeout = 900 if _is_long_video else 120
     if decodo_proxy and not _total_expired():
         # 0: Decodo DASH+EJS with --download-sections (ideal: fast + 720p)
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,

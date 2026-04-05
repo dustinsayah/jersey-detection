@@ -23,16 +23,16 @@ _OUTCOME_SCORE_BOOSTS = {
     "made_shot": 25,        # basketball_made_shot_v4 + basketball_hoop_detector_v4
     "touchdown": 30,        # football_touchdown_detector_v4
     "goal": 30,             # lacrosse_goal_detector_v4
-    "pass_play": 20,        # football — confirmed offensive play, QB involved
-    "completion": 15,       # football_completion_detector_v4
-    "sack": 15,             # football_sack_detector_v4
+    "pass_play": 25,        # football — confirmed offensive play, QB involved
+    "completion": 20,       # football_completion_detector_v4
+    "sack": 25,             # football_sack_detector_v4
     "rebound": 10,          # basketball_rebound_v4
     "ground_ball": 10,      # lacrosse_ground_ball_v4
     "drive": 10,            # basketball_dribble_drive_v4
-    "qb_scramble": 20,      # football_qb_scramble_v4 (boosted for QB plays)
+    "qb_scramble": 25,      # football_qb_scramble_v4 (boosted for QB plays)
     "crowd_energy": 10,     # crowd_energy_detector_v4 (all sports)
     "score_change": 20,     # scoreboard_detector_v5 (score change detected)
-    "reception_yac": 15,    # football_reception_yac_v4
+    "reception_yac": 20,    # football_reception_yac_v4
 }
 
 # Clip boundary expansion — sport-specific defaults (seconds)
@@ -276,13 +276,18 @@ def extract_clips(
                 outcome_grade = "Elite"
                 outcome_score = max(outcome_score, 90)
 
-        # Re-grade based on v4-boosted score (matches v7 thresholds)
+        # Re-grade based on v4-boosted score
+        # Football: lower thresholds (45/25) because jersey OCR rarely works
+        # at 360p, so clips rely on motion/audio/pose signals which score lower
+        _is_football = sport.lower() == "football"
+        _strong_threshold = 45 if _is_football else 55
+        _decent_threshold = 25 if _is_football else 35
         if outcome_grade != "Elite":
             if outcome_score >= 75:
                 outcome_grade = "Elite"
-            elif outcome_score >= 55:
+            elif outcome_score >= _strong_threshold:
                 outcome_grade = "Strong"
-            elif outcome_score >= 35:
+            elif outcome_score >= _decent_threshold:
                 outcome_grade = "Decent"
             else:
                 outcome_grade = "Cut"
@@ -397,16 +402,40 @@ def extract_clips(
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)
 
-    # Filter out "Cut" grade clips
+    # Filter out low-quality clips
     # Full-game mode: lower cut threshold to include more clips (target 20+)
+    # Football: keep more clips — lower threshold + ensure at least 15 returned
+    _is_football = sport.lower() == "football"
+    _FOOTBALL_MIN_CLIPS = 15  # Target minimum for football
     if _is_full_game:
         result = [c for c in merged if c.score >= 20]
+    elif _is_football:
+        # Football: keep clips with score >= 15 (lower than other sports)
+        result = [c for c in merged if c.score >= 15]
+        # Promote low-score football clips to "Decent" grade
+        for clip in result:
+            if clip.grade == "Cut":
+                clip.grade = "Decent"
     else:
         result = [c for c in merged if c.grade != "Cut"]
 
+    # ── Football clip target: ensure at least 15 clips ──────────────────
+    # If football has fewer clips than target, pull in top remaining clips
+    if _is_football and len(result) < _FOOTBALL_MIN_CLIPS and len(merged) > len(result):
+        remaining = [c for c in merged if c not in result]
+        remaining.sort(key=lambda c: c.score, reverse=True)
+        needed = _FOOTBALL_MIN_CLIPS - len(result)
+        for clip in remaining[:needed]:
+            clip.grade = "Decent"
+            result.append(clip)
+        result.sort(key=lambda c: c.score, reverse=True)
+        LOGGER.info(
+            "Football clip target: added %d clips to reach %d (target=%d)",
+            min(needed, len(remaining)), len(result), _FOOTBALL_MIN_CLIPS,
+        )
+
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
-    # Football: rescue aggressively — jersey OCR rarely works on football footage
-    rescue_threshold = 15 if sport.lower() == "football" else 25
+    rescue_threshold = 15 if _is_football else 25
     if not result and merged:
         rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:

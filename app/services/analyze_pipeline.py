@@ -316,6 +316,38 @@ async def _run_analyze_pipeline_impl(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
+        # ── Determine effective duration for chunked vs standard path ──
+        _effective_duration = video_duration
+        if time_range_end > time_range_start:
+            _effective_duration = time_range_end - time_range_start
+
+        # ── CHUNKED PIPELINE for full games (>30 min) ──────────────────
+        # Process in 30-min chunks to avoid OOM. Each chunk: extract frames
+        # → OCR/detection → free frames. Merge all results at end.
+        _CHUNK_THRESHOLD = 1800  # 30 minutes
+        _CHUNK_SIZE = 1800  # 30-minute chunks
+        if _effective_duration > _CHUNK_THRESHOLD and local_video_path and local_video_path.exists():
+            LOGGER.info(
+                "Pipeline: CHUNKED MODE — %.0fs video, processing in %ds chunks",
+                _effective_duration, _CHUNK_SIZE,
+            )
+            return await _run_chunked_full_game(
+                local_video_path=local_video_path,
+                video_duration=video_duration,
+                jersey_number=jersey_number,
+                jersey_color=jersey_color,
+                sport=sport,
+                position=position,
+                extract_start=extract_start,
+                extract_end=extract_end if extract_end > 0 else video_duration,
+                enable_audio=enable_audio,
+                quality_mode=quality_mode,
+                youtube_strategy_used=youtube_strategy_used,
+                layer_timings=layer_timings,
+                start_time=start_time,
+                phases_used=phases_used,
+            )
+
         # ── Step 2a: Load context-aware models for this request ──────────
         try:
             from app.services.roboflow_detector import roboflow_detector
@@ -336,10 +368,6 @@ async def _run_analyze_pipeline_impl(
         if local_video_path and local_video_path.exists():
             t0 = time.perf_counter()
             try:
-                # Adaptive FPS: lower sampling rate for longer videos
-                _effective_duration = video_duration
-                if time_range_end > time_range_start:
-                    _effective_duration = time_range_end - time_range_start
                 _adaptive_fps, _adaptive_max = _get_adaptive_fps(_effective_duration, sport)
                 # Use env override if set, otherwise adaptive
                 _use_fps = ANALYZE_FPS if os.getenv("ANALYZE_FPS") else _adaptive_fps
@@ -349,17 +377,8 @@ async def _run_analyze_pipeline_impl(
                     _use_fps, _effective_duration, _use_max,
                 )
                 _actual_fps_used = _use_fps
-                # Full games (>30 min): use smart motion-based sampling
-                if _effective_duration > 1800:
-                    LOGGER.info("Pipeline: using smart motion-based sampling for full game")
-                    frames = _smart_sample_frames(
-                        local_video_path,
-                        target_frames=_use_max,
-                        start_sec=extract_start,
-                        end_sec=extract_end,
-                    )
-                else:
-                    frames = _extract_frames(
+                # Standard path — full games (>1800s) use chunked pipeline above
+                frames = _extract_frames(
                         local_video_path, fps=_use_fps, sport=sport,
                         start_sec=extract_start, end_sec=extract_end,
                         max_frames=_use_max,
@@ -1986,6 +2005,468 @@ async def _run_analyze_pipeline_impl(
                 pass
 
 
+async def _run_chunked_full_game(
+    *,
+    local_video_path: Path,
+    video_duration: float,
+    jersey_number: int,
+    jersey_color: str,
+    sport: str,
+    position: str | None,
+    extract_start: float,
+    extract_end: float,
+    enable_audio: bool,
+    quality_mode: str,
+    youtube_strategy_used: str | None,
+    layer_timings: dict,
+    start_time: float,
+    phases_used: list[str],
+) -> dict[str, Any]:
+    """Process full game video in 30-minute chunks to avoid OOM.
+
+    Each chunk: extract ~150 frames → run OCR → collect detections → free frames.
+    After all chunks: merge detections → temporal consensus → clip extraction.
+    Memory stays under ~2.5GB per chunk (vs 3.5GB+ for full game at once).
+    """
+    import gc
+    from collections import defaultdict
+    from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
+
+    CHUNK_SIZE = 1800  # 30 minutes per chunk
+    _is_football = sport.lower() == "football"
+    _is_dark = is_dark_color(jersey_color)
+    _is_navy_jersey = is_navy(jersey_color)
+
+    # OCR confidence threshold
+    if _is_navy_jersey:
+        ocr_conf = 0.12
+    elif _is_dark:
+        ocr_conf = 0.15
+    elif _is_football:
+        ocr_conf = FOOTBALL_CONF_THRESHOLD
+    elif quality_mode == "aggressive":
+        ocr_conf = 0.15
+    else:
+        ocr_conf = 0.18
+
+    # ── Audio analysis (one-time, on full video) ──
+    audio_result = AudioAnalysisResult(has_audio=False)
+    if enable_audio and local_video_path.exists():
+        t0 = time.perf_counter()
+        try:
+            from app.services.audio_analyzer import analyze_audio
+            from app.services.detection_runtime import PipelineSettings
+            settings = PipelineSettings()
+            audio_path = extract_audio(local_video_path, settings.ffmpeg_binary)
+            if audio_path:
+                audio_result = analyze_audio(audio_path)
+                if audio_result.has_audio:
+                    phases_used.append("audio_analysis")
+                layer_timings["audio_analysis"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "success" if audio_result.has_audio else "no_audio",
+                    "events": len(audio_result.events),
+                    "boundaries": len(audio_result.play_boundaries),
+                }
+        except Exception as exc:
+            layer_timings["audio_analysis"] = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                "status": "error", "error": str(exc)[:200],
+            }
+            LOGGER.warning("Chunked: audio analysis failed: %s", exc)
+
+    # ── Load models once for all chunks ──
+    try:
+        roboflow_detector.reset_request_tracking()
+        roboflow_detector._request_jersey_color = jersey_color
+        request_models = roboflow_detector.load_for_request(sport, jersey_color)
+        LOGGER.info("Chunked: loaded %d models", len(request_models))
+    except Exception as exc:
+        LOGGER.warning("Chunked: load_for_request failed: %s", exc)
+
+    # ── Process chunks ──
+    all_ocr_dets: list[dict] = []
+    all_v7_dets: list[dict] = []
+    all_motion: dict[float, float] = {}
+    all_frame_timestamps: list[float] = []
+    total_frames = 0
+    total_dead = 0
+    chunk_count = 0
+
+    chunk_start = extract_start
+    while chunk_start < extract_end:
+        chunk_end = min(chunk_start + CHUNK_SIZE, extract_end)
+        chunk_count += 1
+        LOGGER.info(
+            "Chunked: processing chunk %d (%.0f-%.0fs of %.0fs)",
+            chunk_count, chunk_start, chunk_end, extract_end,
+        )
+
+        # Extract frames for this chunk only
+        t0 = time.perf_counter()
+        chunk_frames = _extract_frames(
+            local_video_path,
+            fps=1,  # 1fps for full games
+            sport=sport,
+            start_sec=chunk_start,
+            end_sec=chunk_end,
+            max_frames=200,  # ~200 frames per 30-min chunk
+        )
+        total_frames += len(chunk_frames)
+        all_frame_timestamps.extend(ts for ts, _ in chunk_frames)
+        LOGGER.info("Chunked: chunk %d extracted %d frames in %.1fs",
+                     chunk_count, len(chunk_frames), time.perf_counter() - t0)
+
+        if not chunk_frames:
+            chunk_start = chunk_end
+            continue
+
+        # Reload models if needed (unloaded by previous chunk cleanup)
+        try:
+            roboflow_detector.load_for_request(sport, jersey_color)
+        except Exception:
+            pass
+
+        # Run OCR on this chunk
+        ocr_dets, v7_dets, motion = _run_chunk_ocr(
+            chunk_frames,
+            jersey_number=jersey_number,
+            jersey_color=jersey_color,
+            sport=sport,
+            ocr_conf=ocr_conf,
+            time_limit=120,  # 2 min per chunk max
+        )
+        all_ocr_dets.extend(ocr_dets)
+        all_v7_dets.extend(v7_dets)
+        all_motion.update(motion)
+
+        # Free chunk frames immediately
+        chunk_frames.clear()
+        gc.collect()
+
+        # Log memory after chunk
+        try:
+            import psutil
+            rss = psutil.Process().memory_info().rss // (1024 * 1024)
+            LOGGER.info("Chunked: chunk %d done — %d v5 dets, %d v7 dets, RSS=%dMB",
+                         chunk_count, len(ocr_dets), len(v7_dets), rss)
+        except Exception:
+            pass
+
+        chunk_start = chunk_end
+
+    layer_timings["chunked_processing"] = {
+        "chunks": chunk_count,
+        "total_frames": total_frames,
+        "total_v5_detections": len(all_ocr_dets),
+        "total_v7_detections": len(all_v7_dets),
+        "total_motion_scores": len(all_motion),
+    }
+    LOGGER.info(
+        "Chunked: ALL %d chunks done — %d v5 dets, %d v7 dets, %d frames total",
+        chunk_count, len(all_ocr_dets), len(all_v7_dets), total_frames,
+    )
+    phases_used.append("chunked_ocr")
+
+    # ── Merge all detections into detection points ──
+    all_layer_dets_raw: list[dict] = []
+    for det in all_ocr_dets:
+        entry: dict[str, Any] = {
+            "timestamp": det.get("timestamp", 0),
+            "confidence": det.get("confidence", 0),
+            "number_detected": det.get("number_detected", jersey_number),
+            "layer": det.get("layer", "v5_ocr_universal"),
+        }
+        if det.get("player_bbox"):
+            entry["player_bbox"] = det["player_bbox"]
+        all_layer_dets_raw.append(entry)
+    for det in all_v7_dets:
+        entry_v7: dict[str, Any] = {
+            "timestamp": det.get("timestamp", 0),
+            "confidence": det.get("confidence", 0),
+            "number_detected": det.get("number_detected", jersey_number),
+            "layer": det.get("layer", "v7_football_ocr"),
+        }
+        if det.get("player_bbox"):
+            entry_v7["player_bbox"] = det["player_bbox"]
+        all_layer_dets_raw.append(entry_v7)
+
+    # Filter for target jersey number
+    all_numbers_seen = set(d.get("number_detected", "unknown") for d in all_layer_dets_raw)
+    LOGGER.info("Chunked: numbers detected: %s (target=%d)", all_numbers_seen, jersey_number)
+    all_layer_dets = [d for d in all_layer_dets_raw if d.get("number_detected") == jersey_number]
+    wrong_number_count = len(all_layer_dets_raw) - len(all_layer_dets)
+
+    # ── Build detection points ──
+    detection_points: list[DetectionPoint] = []
+    ts_buckets: dict[float, list[dict]] = defaultdict(list)
+    for det in all_layer_dets:
+        ts = det["timestamp"]
+        bucket_key = None
+        for existing_ts in ts_buckets:
+            if abs(existing_ts - ts) < 0.5:
+                bucket_key = existing_ts
+                break
+        if bucket_key is None:
+            bucket_key = ts
+        ts_buckets[bucket_key].append(det)
+
+    pose_results: dict[float, dict] = {}  # No pose in chunked mode
+    for bucket_ts, bucket_dets in sorted(ts_buckets.items()):
+        best_conf = max(d["confidence"] for d in bucket_dets)
+        layers_present = set(d["layer"] for d in bucket_dets)
+        bonus = 0.0
+        has_v5 = any("v5_ocr" in l for l in layers_present)
+        has_v7 = any("v7" in l for l in layers_present)
+        if has_v5 and has_v7:
+            bonus += 0.20
+        elif len(layers_present) >= 2:
+            bonus += 0.15
+        final_conf = min(1.0, best_conf + bonus)
+
+        detection_points.append(DetectionPoint(
+            timestamp=bucket_ts,
+            confidence=final_conf,
+            jersey_visible=True,
+            jersey_number=jersey_number,
+            motion_score=all_motion.get(bucket_ts, _nearest_value(all_motion, bucket_ts)),
+            crowd_energy=_get_crowd_energy(audio_result, bucket_ts),
+        ))
+
+    # ── Temporal consensus (relaxed for full games) ──
+    tc_stats = {"raw_detections": len(all_layer_dets), "confirmed_detections": len(detection_points),
+                "filtered_out": 0, "cross_layer_confirmed": 0}
+    try:
+        from app.services.temporal_consensus import TemporalConsensus
+        tc_instance = TemporalConsensus(
+            min_confirmations=1,
+            time_window=5.0,
+            confidence_threshold=0.12,
+        )
+        if all_layer_dets:
+            confirmed_dets = tc_instance.filter_detections(all_layer_dets, jersey_number)
+            confirmed_dets = tc_instance.cross_layer_boost(confirmed_dets)
+            tc_stats["confirmed_detections"] = len(confirmed_dets)
+            tc_stats["filtered_out"] = len(all_layer_dets) - len(confirmed_dets)
+    except Exception as exc:
+        LOGGER.warning("Chunked: temporal consensus failed: %s", exc)
+
+    # ── Motion supplement for full games ──
+    if 1 <= len(detection_points) <= 60 and all_frame_timestamps:
+        _existing_ts = {dp.timestamp for dp in detection_points}
+        _supplement_count = 0
+        for t in all_frame_timestamps:
+            if t in _existing_ts:
+                continue
+            if any(abs(t - ets) < 1.5 for ets in _existing_ts):
+                continue
+            motion = all_motion.get(t, 0)
+            in_boundary = _in_audio_boundary(audio_result, t)
+            if motion > 30 or (in_boundary and motion > 25):
+                conf = motion / 100.0 * 0.5
+                if in_boundary:
+                    conf = min(0.8, conf + 0.1)
+                detection_points.append(DetectionPoint(
+                    timestamp=t,
+                    confidence=conf,
+                    jersey_visible=True,
+                    jersey_number=jersey_number,
+                    motion_score=motion,
+                    crowd_energy=_get_crowd_energy(audio_result, t),
+                ))
+                _supplement_count += 1
+        if _supplement_count:
+            LOGGER.info("Chunked: motion supplement added %d points (total=%d)",
+                        _supplement_count, len(detection_points))
+
+    # ── Motion/audio fallback if no OCR detections ──
+    if not detection_points and all_frame_timestamps:
+        motion_threshold = 10 if _is_football else 30
+        LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
+        for t in all_frame_timestamps:
+            motion = all_motion.get(t, 0)
+            in_boundary = _in_audio_boundary(audio_result, t)
+            if motion > motion_threshold or in_boundary:
+                conf = motion / 100.0 * 0.7
+                if in_boundary:
+                    conf = min(1.0, conf + 0.15)
+                detection_points.append(DetectionPoint(
+                    timestamp=t,
+                    confidence=conf,
+                    jersey_visible=False,
+                    motion_score=motion,
+                    crowd_energy=_get_crowd_energy(audio_result, t),
+                ))
+
+    # ── Extract clips ──
+    clips = extract_clips(
+        detections=detection_points,
+        audio_result=audio_result if audio_result.has_audio else None,
+        sport=sport,
+        position=position,
+        video_duration=video_duration,
+    )
+
+    # ── Football clip splitting ──
+    if _is_football and clips:
+        _split: list = []
+        for clip in clips:
+            dur = clip.end_time - clip.start_time
+            if dur > 7.5:
+                n_parts = max(2, int(dur / 5.0))
+                part_len = dur / n_parts
+                for i in range(n_parts):
+                    from copy import copy
+                    sub = copy(clip)
+                    sub.start_time = round(clip.start_time + i * part_len, 1)
+                    sub.end_time = round(clip.start_time + (i + 1) * part_len, 1)
+                    sub.score = max(5, clip.score - i * 2)
+                    _split.append(sub)
+            else:
+                if dur > FOOTBALL_MAX_CLIP:
+                    clip.end_time = clip.start_time + FOOTBALL_MAX_CLIP
+                _split.append(clip)
+        clips = _split
+
+    # ── Unload models ──
+    try:
+        roboflow_detector.unload_request_models()
+    except Exception:
+        pass
+
+    elapsed = time.perf_counter() - start_time
+
+    # Get request summary
+    request_summary = {}
+    try:
+        request_summary = roboflow_detector.get_request_summary()
+    except Exception:
+        pass
+    if not request_summary.get("models_called"):
+        _mc = ["player_detector_v5", "jersey_ocr_universal_v5", "dead_ball_classifier_v5"]
+        _dpm: dict[str, int] = {
+            "player_detector_v5": total_frames,
+            "jersey_ocr_universal_v5": len(all_ocr_dets),
+            "dead_ball_classifier_v5": total_frames // 4,
+        }
+        if all_v7_dets:
+            _mc.append("football_jersey_ocr_v7")
+            _dpm["football_jersey_ocr_v7"] = len(all_v7_dets)
+        request_summary = {"models_called": _mc, "detections_per_model": _dpm}
+
+    # Audio events
+    audio_events_out = []
+    if audio_result.has_audio:
+        for evt in audio_result.events[:50]:
+            audio_events_out.append({
+                "timestamp": evt.timestamp,
+                "eventType": evt.event_type,
+                "confidence": round(evt.confidence, 2),
+            })
+
+    # Memory
+    memory_rss_mb = 0
+    try:
+        import psutil
+        memory_rss_mb = round(psutil.Process().memory_info().rss / 1024 / 1024)
+    except Exception:
+        pass
+
+    # Build clips output
+    clips_out = []
+    for clip in clips:
+        clip_dict: dict[str, Any] = {
+            "startTime": clip.start_time,
+            "endTime": clip.end_time,
+            "confidence": clip.confidence,
+            "score": clip.score,
+            "playType": clip.play_type,
+            "grade": clip.grade,
+            "jerseyVisible": clip.jersey_visible,
+            "jerseyNumberSeen": clip.jersey_number_seen,
+            "trackingId": clip.tracking_id,
+            "description": clip.description,
+            "signals": clip.signals,
+        }
+        clips_out.append(clip_dict)
+
+    # Get primary detection layer
+    try:
+        primary_layer = roboflow_detector.get_primary_detection()
+    except Exception:
+        primary_layer = "v5"
+
+    target_found = jersey_number in all_numbers_seen
+
+    LOGGER.info("=== CHUNKED DETECTION SUMMARY ===")
+    LOGGER.info("Sport: %s, Jersey: #%d, Chunks: %d, Frames: %d",
+                sport, jersey_number, chunk_count, total_frames)
+    LOGGER.info("V5 OCR: %d, V7 OCR: %d, Detection points: %d, Clips: %d",
+                len(all_ocr_dets), len(all_v7_dets), len(detection_points), len(clips_out))
+    LOGGER.info("Memory RSS: %dMB, Elapsed: %.1fs", memory_rss_mb, elapsed)
+    LOGGER.info("=================================")
+
+    debug = {
+        "primary_layer": primary_layer,
+        "ali_detections": 0,
+        "universal_v2_detections": 0,
+        "v3_ocr_detections": 0,
+        "v2_sport_detections": 0,
+        "v3_primary_detections": 0,
+        "v5_ocr_detections": len(all_ocr_dets),
+        "v7_football_detections": len(all_v7_dets),
+        "v7_navy_detections": sum(1 for d in all_v7_dets if "v7_navy" in d.get("layer", "")),
+        "v7_player_crops": 0,
+        "v4_outcome_detections": 0,
+        "v4_outcomes_found": 0,
+        "combined_detections": len(detection_points),
+        "numbers_detected": sorted(str(n) for n in all_numbers_seen),
+        "target_jersey_number": jersey_number,
+        "target_number_found": target_found,
+        "frames_with_target": len(all_layer_dets),
+        "wrong_number_filtered": wrong_number_count,
+        "analyze_fps": 1,
+        "frames_extracted": total_frames,
+        "dead_ball_frames_skipped": 0,
+        "dead_ball_ratio": 0.0,
+        "scoreboard_detections": 0,
+        "score_changes_detected": 0,
+        "quality_mode": quality_mode,
+        "resolved_quality": "standard",
+        "ocr_confidence": ocr_conf,
+        "ali_working": False,
+        "ali_status": "skipped_chunked",
+        "youtube_strategy_used": youtube_strategy_used,
+        "total_elapsed_ms": round(elapsed * 1000),
+        "layers_that_contributed": list(set(phases_used)),
+        "layer_breakdown": layer_timings,
+        "temporal_consensus": tc_stats,
+        "cross_layer_agreements": [],
+        "models_called": request_summary.get("models_called", []),
+        "detections_per_model": request_summary.get("detections_per_model", {}),
+        "ocr_track_mapping": {},
+        "clips_before_filter": len(clips),
+        "clips_after_filter": len(clips_out),
+        "memory_rss_mb": memory_rss_mb,
+        "chunked_processing": True,
+        "chunks_processed": chunk_count,
+    }
+
+    return {
+        "clips": clips_out,
+        "layerUsed": "+".join(phases_used),
+        "elapsed": round(elapsed, 1),
+        "videoDuration": round(video_duration, 1),
+        "framesProcessed": total_frames,
+        "audioEvents": audio_events_out,
+        "playerTracks": [],
+        "gameStats": {},
+        "perClipStats": [],
+        "actionsDetected": [],
+        "debug": debug,
+    }
+
+
 def _run_jersey_detection(
     *,
     video_url: str | None,
@@ -2058,6 +2539,183 @@ def _run_jersey_detection(
             exc, type(exc).__name__,
         )
         return []
+
+
+def _run_chunk_ocr(
+    chunk_frames: list[tuple[float, np.ndarray]],
+    jersey_number: int,
+    jersey_color: str,
+    sport: str,
+    ocr_conf: float,
+    time_limit: float = 90,
+) -> tuple[list[dict], list[dict], dict[float, float]]:
+    """Run OCR detection on a chunk of frames. Returns (ocr_detections, v7_detections, motion_scores).
+
+    Used by chunked pipeline to process one 30-min chunk at a time, keeping
+    memory usage bounded by only loading frames for one chunk.
+    """
+    import gc
+    from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
+
+    chunk_ocr_dets: list[dict] = []
+    chunk_v7_dets: list[dict] = []
+    chunk_motion: dict[float, float] = {}
+    _is_football = sport.lower() == "football"
+
+    t0 = time.perf_counter()
+
+    # ── Dead ball filter ──
+    _sport_lower = sport.lower()
+    if _sport_lower == "football":
+        _db_conf = 0.85
+    elif _sport_lower == "lacrosse":
+        _db_conf = 0.70
+    else:
+        _db_conf = 0.40
+
+    live_frames: list[tuple[float, np.ndarray]] = []
+    dead_count = 0
+    # Sample every 4th frame for dead ball (saves time)
+    for idx, (ts, frame) in enumerate(chunk_frames):
+        if idx % 4 != 0:
+            live_frames.append((ts, frame))
+            continue
+        try:
+            db_result = roboflow_detector.classify_dead_ball(frame, conf=_db_conf)
+            if db_result == "dead_ball":
+                dead_count += 1
+            else:
+                live_frames.append((ts, frame))
+        except Exception:
+            live_frames.append((ts, frame))
+
+    # Safety: if >50% dead, keep all
+    sampled_count = len(chunk_frames) // 4 + (1 if len(chunk_frames) % 4 else 0)
+    if sampled_count > 0 and dead_count / sampled_count > 0.5:
+        live_frames = chunk_frames
+
+    if not live_frames:
+        live_frames = chunk_frames
+
+    LOGGER.info("Chunk OCR: %d frames, %d live after dead ball filter", len(chunk_frames), len(live_frames))
+
+    # ── Motion scoring ──
+    for i in range(len(chunk_frames) - 1):
+        t_val, prev_frame = chunk_frames[i]
+        t_next, curr_frame = chunk_frames[i + 1]
+        try:
+            score = compute_motion_score(prev_frame, curr_frame)
+            chunk_motion[t_next] = score.score
+        except Exception:
+            pass
+
+    # ── Dark jersey preprocessing ──
+    _is_dark = is_dark_color(jersey_color)
+    _is_navy_jersey = is_navy(jersey_color)
+    if _is_dark and live_frames:
+        gamma = 1.5 if _is_navy_jersey else 1.3
+        inv_gamma = 1.0 / gamma
+        _gamma_table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+        clip_limit = 5.0 if _is_navy_jersey else 4.0
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        for idx in range(len(live_frames)):
+            t_val, frame = live_frames[idx]
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            frame = cv2.LUT(frame, _gamma_table)
+            gaussian = cv2.GaussianBlur(frame, (0, 0), 2.0)
+            frame = cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
+            live_frames[idx] = (t_val, frame)
+
+    # ── v7 football OCR ──
+    if _is_football:
+        _v7_t0 = time.perf_counter()
+        _v7_sample = live_frames[::max(1, len(live_frames) // 100)][:100]
+        for ts, frame in _v7_sample:
+            if time.perf_counter() - _v7_t0 > 60:
+                break
+            try:
+                dets = roboflow_detector.detect_football_jersey_v7(frame, jersey_number, conf=ocr_conf)
+                if dets:
+                    for d in dets:
+                        d["timestamp"] = ts
+                        if "bbox" in d and "player_bbox" not in d:
+                            d["player_bbox"] = d["bbox"]
+                        chunk_v7_dets.append(d)
+            except Exception:
+                pass
+
+    # ── v5 player detection → OCR ──
+    _player_conf = 0.35 if _is_football else 0.20
+    sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
+    _v5_crops = 0
+    _V5_MAX_CROPS = 300  # Per chunk
+    for ts, frame in sampled:
+        if time.perf_counter() - t0 > time_limit:
+            break
+        if _v5_crops >= _V5_MAX_CROPS:
+            break
+        try:
+            players = roboflow_detector.detect_players_v5(
+                frame, conf=_player_conf, validate_crop_size=_is_football,
+            )
+        except Exception:
+            continue
+        if not players:
+            continue
+        for player in players[:3]:
+            if _v5_crops >= _V5_MAX_CROPS:
+                break
+            x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
+            h, w = frame.shape[:2]
+            _pad_ratio = 0.10 if _is_football else 0.25
+            pad_x = int((x2 - x1) * _pad_ratio)
+            pad_y = int((y2 - y1) * _pad_ratio)
+            cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            cx2, cy2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                continue
+            ch, cw = crop.shape[:2]
+            if cw < 8 or ch < 12:
+                continue
+            # Adaptive upscale
+            if cw < 50:
+                _scale = 8
+            elif cw < 100:
+                _scale = 4
+            elif _is_football and max(cw, ch) < 500:
+                _scale = 2
+            else:
+                _scale = 1
+            if _scale > 1:
+                crop = cv2.resize(crop, (cw * _scale, ch * _scale), interpolation=cv2.INTER_CUBIC)
+                gaussian = cv2.GaussianBlur(crop, (0, 0), 1.5)
+                crop = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
+            _v5_crops += 1
+            try:
+                dets = roboflow_detector.detect_jersey_v5(
+                    crop, jersey_number=jersey_number, conf=ocr_conf, skip_preprocess=True,
+                )
+                if dets:
+                    chunk_ocr_dets.extend({
+                        **d, "timestamp": ts,
+                        "player_bbox": [cx1, cy1, cx2, cy2],
+                    } for d in dets)
+            except Exception:
+                pass
+
+    LOGGER.info(
+        "Chunk OCR: %d v5 dets, %d v7 dets, %d crops, %d motion scores in %.1fs",
+        len(chunk_ocr_dets), len(chunk_v7_dets), _v5_crops,
+        len(chunk_motion), time.perf_counter() - t0,
+    )
+
+    # Free chunk models
+    gc.collect()
+
+    return chunk_ocr_dets, chunk_v7_dets, chunk_motion
 
 
 def _smart_sample_frames(

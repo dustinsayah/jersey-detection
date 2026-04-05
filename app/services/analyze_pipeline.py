@@ -661,6 +661,9 @@ async def _run_analyze_pipeline_impl(
                     if dets:
                         for d in dets:
                             d["timestamp"] = ts
+                            # Use bbox as player_bbox for OCR-to-track mapping
+                            if "bbox" in d and "player_bbox" not in d:
+                                d["player_bbox"] = d["bbox"]
                             v7_football_detections.append(d)
                             _v7_count += 1
                             if "v7_navy" in d.get("layer", ""):
@@ -808,7 +811,10 @@ async def _run_analyze_pipeline_impl(
                                 skip_preprocess=True,
                             )
                             if dets:
-                                v5_ocr_detections.extend({**d, "timestamp": t} for d in dets)
+                                v5_ocr_detections.extend({
+                                    **d, "timestamp": t,
+                                    "player_bbox": [cx1, cy1, cx2, cy2],
+                                } for d in dets)
                                 _frame_had_detection = True
                     else:
                         v5_no_player_frames += 1
@@ -1272,19 +1278,25 @@ async def _run_analyze_pipeline_impl(
                 "layer": det.get("layer", "v3_ocr_primary_standalone"),
             })
         for det in v5_ocr_detections:
-            all_layer_dets_raw.append({
+            _entry: dict[str, Any] = {
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v5_ocr_universal"),
-            })
+            }
+            if det.get("player_bbox"):
+                _entry["player_bbox"] = det["player_bbox"]
+            all_layer_dets_raw.append(_entry)
         for det in v7_football_detections:
-            all_layer_dets_raw.append({
+            _entry_v7: dict[str, Any] = {
                 "timestamp": det.get("timestamp", 0),
                 "confidence": det.get("confidence", 0),
                 "number_detected": det.get("number_detected", jersey_number),
                 "layer": det.get("layer", "v7_football_ocr"),
-            })
+            }
+            if det.get("player_bbox"):
+                _entry_v7["player_bbox"] = det["player_bbox"]
+            all_layer_dets_raw.append(_entry_v7)
 
         # ── Diagnostic: log ALL numbers detected before filtering ─────
         all_numbers_seen = set(
@@ -1314,6 +1326,88 @@ async def _run_analyze_pipeline_impl(
                 "(kept %d for #%d)",
                 wrong_number_count, len(all_layer_dets), jersey_number,
             )
+
+        # ── OCR-to-Track mapping (BLOCKER 4) ──────────────────────────
+        # Map OCR detections to player tracks via IoU, then apply
+        # temporal voting so each track gets a confirmed jersey number.
+        ocr_track_assignments: dict[int, list[tuple[int, float]]] = {}  # track_id → [(jersey_number, conf), ...]
+        if tracking_result and tracking_result.tracks:
+            _ocr_dets_with_bbox = [
+                d for d in all_layer_dets if d.get("player_bbox")
+            ]
+            if _ocr_dets_with_bbox:
+                for det in _ocr_dets_with_bbox:
+                    det_ts = det.get("timestamp", 0)
+                    det_bbox = det["player_bbox"]  # [x1, y1, x2, y2] in frame space
+                    best_iou = 0.0
+                    best_track_id = None
+                    for track in tracking_result.tracks:
+                        if not track.positions:
+                            continue
+                        # Find track's position closest to this detection's timestamp
+                        # Approximate: frame_index ≈ timestamp * 2 (2fps extraction)
+                        approx_frame = int(det_ts * 2)
+                        # Use last known position if frame doesn't match exactly
+                        pos_idx = min(approx_frame, len(track.positions) - 1)
+                        pos_idx = max(0, pos_idx)
+                        if pos_idx < len(track.positions):
+                            tx1, ty1, tx2, ty2 = track.positions[pos_idx]
+                        else:
+                            tx1, ty1, tx2, ty2 = track.positions[-1]
+                        # Compute IoU
+                        ix1 = max(det_bbox[0], tx1)
+                        iy1 = max(det_bbox[1], ty1)
+                        ix2 = min(det_bbox[2], tx2)
+                        iy2 = min(det_bbox[3], ty2)
+                        if ix2 > ix1 and iy2 > iy1:
+                            inter = (ix2 - ix1) * (iy2 - iy1)
+                            det_area = (det_bbox[2] - det_bbox[0]) * (det_bbox[3] - det_bbox[1])
+                            trk_area = (tx2 - tx1) * (ty2 - ty1)
+                            union = det_area + trk_area - inter
+                            iou = inter / union if union > 0 else 0
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_track_id = track.track_id
+                    if best_track_id is not None and best_iou > 0.1:
+                        if best_track_id not in ocr_track_assignments:
+                            ocr_track_assignments[best_track_id] = []
+                        ocr_track_assignments[best_track_id].append((
+                            det.get("number_detected", 0),
+                            det.get("confidence", 0),
+                        ))
+
+                # Temporal voting: assign majority jersey number to each track
+                for track in tracking_result.tracks:
+                    votes = ocr_track_assignments.get(track.track_id, [])
+                    if not votes:
+                        continue
+                    # Count votes per jersey number, weighted by confidence
+                    from collections import Counter
+                    vote_counts: dict[int, float] = {}
+                    for num, conf in votes:
+                        vote_counts[num] = vote_counts.get(num, 0) + conf
+                    # Winner = highest weighted vote count
+                    winner = max(vote_counts, key=lambda k: vote_counts[k])
+                    track.jersey_number = winner
+                    track.jersey_confidence = vote_counts[winner] / len(votes)
+                    if winner == jersey_number:
+                        track.is_target = True
+                        tracking_result.target_track_id = track.track_id
+
+                _tracks_with_jersey = sum(
+                    1 for t in tracking_result.tracks if t.jersey_number is not None
+                )
+                LOGGER.info(
+                    "Pipeline: OCR→Track mapping: %d OCR dets with bbox, "
+                    "%d tracks assigned jersey numbers, target_track=%s",
+                    len(_ocr_dets_with_bbox), _tracks_with_jersey,
+                    tracking_result.target_track_id,
+                )
+            layer_timings["ocr_track_mapping"] = {
+                "tracks_with_ocr": len(ocr_track_assignments),
+                "total_ocr_votes": sum(len(v) for v in ocr_track_assignments.values()),
+                "target_track_id": tracking_result.target_track_id,
+            }
 
         # Group by timestamp bucket (0.5s window)
         from collections import defaultdict
@@ -1832,6 +1926,7 @@ async def _run_analyze_pipeline_impl(
             "cross_layer_agreements": cross_layer_agreements,
             "models_called": request_summary.get("models_called", []),
             "detections_per_model": request_summary.get("detections_per_model", {}),
+            "ocr_track_mapping": layer_timings.get("ocr_track_mapping", {}),
             "clips_before_filter": len(clips),
             "clips_after_filter": len(clips_out),
             "memory_rss_mb": memory_rss_mb,

@@ -176,8 +176,15 @@ def _yt_dlp_download(
     format_override: str | None = None,
     use_ejs: bool = True,
     proxy: str = "",
+    skip_sections: bool = False,
 ) -> bool:
-    """Run yt-dlp subprocess with given client. Returns True on success."""
+    """Run yt-dlp subprocess with given client. Returns True on success.
+
+    Args:
+        skip_sections: If True, download the full video without --download-sections.
+                       This is needed when DASH+proxy fails with sectioning.
+                       The caller is responsible for trimming afterward.
+    """
     if output_path.exists():
         output_path.unlink()
 
@@ -208,19 +215,23 @@ def _yt_dlp_download(
     if proxy:
         cmd.extend(["--proxy", proxy])
 
-    if start_time > 0 or end_time > 0:
+    if not skip_sections and (start_time > 0 or end_time > 0):
         section = f"*{start_time}-{end_time}" if end_time > 0 else f"*{start_time}-inf"
         cmd.extend(["--download-sections", section, "--force-keyframes-at-cuts"])
 
     cmd.append(url)
 
-    LOGGER.info("%s: running yt-dlp client=%s format=%s proxy=%s ejs=%s",
-                strategy_name, client, fmt[:60], bool(proxy), use_ejs)
+    LOGGER.info("%s: running yt-dlp client=%s format=%s proxy=%s ejs=%s skip_sections=%s",
+                strategy_name, client, fmt[:60], bool(proxy), use_ejs, skip_sections)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
     if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
         file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
         LOGGER.info("%s: SUCCESS — %sMB downloaded (client=%s)", strategy_name, file_mb, client)
+        # If we skipped sections but had a time range, trim with ffmpeg -c copy
+        if skip_sections and (start_time > 0 or end_time > 0):
+            LOGGER.info("%s: post-download trim %.0fs-%.0fs", strategy_name, start_time, end_time)
+            _trim_video(output_path, start_time, end_time, ffmpeg_binary)
         return True
 
     err = result.stderr[:300] if result.stderr else "no stderr"
@@ -414,19 +425,42 @@ def download_youtube_sync(
     # Uses subprocess yt-dlp with EJS (n-challenge solver) for 720p DASH.
     # NOTE: Must use subprocess (_yt_dlp_download) NOT Python library because
     # the Python library doesn't support --remote-components ejs:github.
+    #
+    # IMPORTANT: --download-sections with DASH+proxy often fails (ffmpeg reconnect
+    # issues). Strategy 0 tries with sections first; Strategy 0a retries WITHOUT
+    # sections (downloads full video) and trims with ffmpeg -c copy afterward.
     decodo_proxy = _get_decodo_proxy()
     _decodo_timeout = max(_dl_timeout, 300)  # At least 5min for Decodo (residential proxy can be slower)
     if decodo_proxy and not _total_expired():
+        # 0: Decodo DASH+EJS with --download-sections (ideal: fast + 720p)
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_decodo_timeout,
-                            strategy_name="Strategy 0 (Decodo DASH+EJS)",
+                            strategy_name="Strategy 0 (Decodo DASH+EJS+sections)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy=decodo_proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo DASH+EJS)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs")
-        strategy_errors.append("0=decodo_dash_ejs_failed")
+            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo DASH+EJS+sections)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
+        strategy_errors.append("0=decodo_dash_ejs_sections_failed")
+
+        # 0a: Decodo DASH+EJS WITHOUT sections — download full then trim
+        # This is the critical fallback: --download-sections fails with DASH+proxy
+        # but downloading the full video and trimming afterward usually works.
+        if not _total_expired() and _yt_dlp_download(
+                url, output_path, yt_dlp_binary, ffmpeg_binary,
+                client="android_vr", start_time=start_time, end_time=end_time,
+                timeout=_decodo_timeout,
+                strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
+                format_override=_DASH_H264_FORMAT,
+                use_ejs=True, proxy=decodo_proxy,
+                skip_sections=True):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 0a (Decodo DASH+EJS full+trim)", elapsed)
+            # was_sectioned=False because the full video was downloaded and trimmed
+            return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
+        strategy_errors.append("0a=decodo_dash_ejs_full_failed")
+
         # 0b: Decodo muxed fallback (no EJS needed, 360p) via Python lib
         if not _total_expired() and _yt_dlp_python_download(
                 url, output_path, client="android",
@@ -438,18 +472,6 @@ def download_youtube_sync(
             LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed)", elapsed)
             return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_pylib")
         strategy_errors.append("0b=decodo_muxed_failed")
-        # 0c: Decodo subprocess muxed (different yt-dlp code path)
-        if not _total_expired() and _yt_dlp_download(
-                url, output_path, yt_dlp_binary, ffmpeg_binary,
-                client="android", start_time=start_time, end_time=end_time,
-                timeout=_decodo_timeout,
-                strategy_name="Strategy 0c (Decodo subprocess muxed)",
-                format_override=_MUXED_FORMAT,
-                use_ejs=False, proxy=decodo_proxy):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0c (Decodo subprocess muxed)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_subprocess")
-        strategy_errors.append("0c=decodo_subprocess_muxed_failed")
     else:
         if not decodo_proxy:
             strategy_errors.append("0=no_decodo_configured")

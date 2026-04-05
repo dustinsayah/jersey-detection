@@ -252,9 +252,18 @@ def _yt_dlp_python_download(
     strategy_name: str = "Strategy 5",
     format_override: str | None = None,
     proxy: str = "",
+    timeout: int = 90,
 ) -> bool:
-    """Use yt-dlp as Python library (no subprocess). Returns True on success."""
-    try:
+    """Use yt-dlp as Python library (no subprocess). Returns True on success.
+
+    Args:
+        timeout: Hard timeout in seconds (default 90). Uses a background thread
+                 to enforce the limit since the Python library has no built-in timeout.
+    """
+    import concurrent.futures
+    import threading
+
+    def _do_download() -> bool:
         import yt_dlp
 
         if output_path.exists():
@@ -295,6 +304,14 @@ def _yt_dlp_python_download(
             return True
 
         LOGGER.warning("%s: file missing or too small after download", strategy_name)
+        return False
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_download)
+            return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        LOGGER.warning("%s: TIMED OUT after %ds (Python lib, client=%s)", strategy_name, timeout, client)
         return False
     except Exception as exc:
         LOGGER.warning("%s: FAILED (Python lib, client=%s): %s", strategy_name, client, str(exc)[:200])
@@ -438,7 +455,24 @@ def download_youtube_sync(
     # Full game at 720p ~= 1-2GB through residential proxy, needs ~500-1000s.
     # Must be less than _TOTAL_TIMEOUT to leave room for fallback strategies.
     _decodo_timeout = 900 if _is_long_video else 120
-    if decodo_proxy and not _total_expired():
+
+    # Quick Decodo proxy health check (10s) — skip all Decodo strategies if unreachable.
+    # Saves ~360s when proxy is down instead of timing out 3 strategies.
+    _decodo_healthy = False
+    if decodo_proxy:
+        try:
+            _probe_resp = httpx.get(
+                "https://ip.decodo.com/json",
+                proxy=decodo_proxy,
+                timeout=httpx.Timeout(10),
+            )
+            _decodo_healthy = _probe_resp.status_code == 200
+            LOGGER.info("Decodo proxy health: %s (status=%d)", "OK" if _decodo_healthy else "FAIL", _probe_resp.status_code)
+        except Exception as exc:
+            LOGGER.warning("Decodo proxy health check failed: %s", str(exc)[:100])
+            _decodo_healthy = False
+
+    if decodo_proxy and _decodo_healthy and not _total_expired():
         # 0: Decodo DASH+EJS with --download-sections (ideal: fast + 720p)
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
@@ -482,6 +516,9 @@ def download_youtube_sync(
     else:
         if not decodo_proxy:
             strategy_errors.append("0=no_decodo_configured")
+        elif not _decodo_healthy:
+            strategy_errors.append("0=decodo_proxy_unreachable")
+            LOGGER.warning("Skipping all Decodo strategies — proxy unreachable")
 
     # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
     # android_vr client can list 720p/1080p DASH formats when EJS solver works.

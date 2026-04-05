@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v7.5.1",
+        "version": "v7.5.2",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v7.5.1",
+        "version": "v7.5.2",
     })
 
 
@@ -278,7 +278,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v7.5.1",
+            "version": "v7.5.2",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
         },

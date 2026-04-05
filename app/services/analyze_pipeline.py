@@ -261,7 +261,7 @@ async def _run_analyze_pipeline_impl(
                     extract_start = time_range_start
                     extract_end = time_range_end
                 phases_used.append("youtube_download")
-                youtube_strategy_used = "download_success"
+                youtube_strategy_used = getattr(dl_result, "strategy_used", "download_success")
                 layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
                 LOGGER.info("Pipeline: YouTube video downloaded to %s (sectioned=%s)", local_video_path, dl_result.was_sectioned)
                 # Log resolution for diagnostic purposes — also include in API response

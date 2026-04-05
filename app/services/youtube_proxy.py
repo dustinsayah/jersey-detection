@@ -35,6 +35,7 @@ class DownloadResult:
     was_sectioned: bool = False  # True when --download-sections was used (timestamps start at 0)
     requested_start: float = 0
     requested_end: float = 0
+    strategy_used: str = "unknown"  # Which download strategy succeeded
 
 
 # Render server URL
@@ -383,12 +384,13 @@ def download_youtube_sync(
 
     strategy_errors: list[str] = []
 
-    def _make_result(path: Path, sectioned: bool) -> DownloadResult:
+    def _make_result(path: Path, sectioned: bool, strategy: str = "unknown") -> DownloadResult:
         return DownloadResult(
             path=path,
             was_sectioned=sectioned and has_time_range,
             requested_start=start_time,
             requested_end=end_time,
+            strategy_used=strategy,
         )
 
     # Detect full game (long video) — increase timeout for strategies 1-2
@@ -423,7 +425,7 @@ def download_youtube_sync(
                             use_ejs=True, proxy=decodo_proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo DASH+EJS)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range)
+            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs")
         strategy_errors.append("0=decodo_dash_ejs_failed")
         # 0b: Decodo muxed fallback (no EJS needed, 360p) via Python lib
         if not _total_expired() and _yt_dlp_python_download(
@@ -434,7 +436,7 @@ def download_youtube_sync(
                 proxy=decodo_proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range)
+            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_pylib")
         strategy_errors.append("0b=decodo_muxed_failed")
         # 0c: Decodo subprocess muxed (different yt-dlp code path)
         if not _total_expired() and _yt_dlp_download(
@@ -446,7 +448,7 @@ def download_youtube_sync(
                 use_ejs=False, proxy=decodo_proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 0c (Decodo subprocess muxed)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range)
+            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_subprocess")
         strategy_errors.append("0c=decodo_subprocess_muxed_failed")
     else:
         if not decodo_proxy:
@@ -461,7 +463,7 @@ def download_youtube_sync(
                         format_override=_DASH_H264_FORMAT, use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 1 (android_vr DASH+EJS)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range)
+        return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs")
     strategy_errors.append("1=android_vr_dash_ejs_failed")
 
     # ── Strategy 2: Same as 1 but with proxy (if configured) ──
@@ -475,7 +477,7 @@ def download_youtube_sync(
                             proxy=proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 2 (android_vr DASH+EJS+proxy)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range)
+            return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs_warp")
         strategy_errors.append("2=android_vr_dash_proxy_failed")
     else:
         strategy_errors.append("2=no_proxy_configured")
@@ -499,7 +501,7 @@ def download_youtube_sync(
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range)
+            return _make_result(output_path, sectioned=has_time_range, strategy="render_server")
     strategy_errors.append("3=render_server_failed")
 
     # ── Strategy 4: yt-dlp android muxed + EJS (360p but reliable) ──
@@ -520,7 +522,7 @@ def download_youtube_sync(
                         use_ejs=True):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 4 (android muxed+EJS)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range)
+        return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_ejs")
     strategy_errors.append("4=android_muxed_ejs_failed")
 
     # ── Strategy 5: yt-dlp Python library with android_vr + DASH ──
@@ -537,7 +539,7 @@ def download_youtube_sync(
                                format_override=_DASH_H264_FORMAT):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 5 (Python lib android_vr)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range)
+        return _make_result(output_path, sectioned=has_time_range, strategy="python_lib_android_vr")
     strategy_errors.append("5=python_lib_android_vr_failed")
 
     # ── Strategy 6: yt-dlp android muxed no-EJS (bare minimum) ──
@@ -547,7 +549,7 @@ def download_youtube_sync(
                         use_ejs=False):
         elapsed = round(time.perf_counter() - dl_start, 1)
         LOGGER.info("Sync downloaded in %ss via Strategy 6 (android muxed bare)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range)
+        return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_bare")
     strategy_errors.append("6=android_muxed_bare_failed")
 
     # ── Strategy 7: Render server /extract-frames (last resort) ──
@@ -569,7 +571,7 @@ def download_youtube_sync(
                         output_path.write_bytes(resp.content)
                         elapsed = round(time.perf_counter() - dl_start, 1)
                         LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames)", elapsed)
-                        return _make_result(output_path, sectioned=has_time_range)
+                        return _make_result(output_path, sectioned=has_time_range, strategy="render_extract_frames")
                     ct = resp.headers.get("content-type", "")
                     if "json" in ct or "text" in ct:
                         data = resp.json()
@@ -582,7 +584,7 @@ def download_youtube_sync(
                                 output_path.write_bytes(dl_resp.content)
                                 elapsed = round(time.perf_counter() - dl_start, 1)
                                 LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames URL)", elapsed)
-                                return _make_result(output_path, sectioned=has_time_range)
+                                return _make_result(output_path, sectioned=has_time_range, strategy="render_extract_frames_url")
                 LOGGER.warning("Strategy 7 failed: %d", resp.status_code)
         except Exception as exc:
             LOGGER.warning("Strategy 7 failed: %s", exc)
@@ -680,6 +682,7 @@ def test_youtube_download_sync(
             "elapsed": elapsed,
             "file_path": str(dl_result.path),
             "was_sectioned": dl_result.was_sectioned,
+            "strategy_used": dl_result.strategy_used,
             "proxy_configured": bool(_get_proxy()),
             "decodo_configured": bool(_get_decodo_proxy()),
             "render_server_url": RENDER_SERVER_URL,

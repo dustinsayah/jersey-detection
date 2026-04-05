@@ -396,7 +396,9 @@ def download_youtube_sync(
     _dl_timeout = 600 if _is_long_video else 90  # 90s per-strategy for short clips
 
     # Overall timeout: don't let the entire chain exceed this (prevents 1400s hangs)
-    _TOTAL_TIMEOUT = 600 if _is_long_video else 240
+    # Increased for long videos: Decodo residential proxy adds latency, and
+    # merging DASH video+audio for 2hr+ videos takes significant time.
+    _TOTAL_TIMEOUT = 900 if _is_long_video else 300
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start
@@ -405,21 +407,25 @@ def download_youtube_sync(
             return True
         return False
 
-    # ── Strategy 0: Decodo residential proxy (best success rate) ──────
+    # ── Strategy 0: Decodo residential proxy + EJS (best success rate) ──────
     # Residential proxy routes through real home IPs — YouTube never blocks these.
-    # Uses Python yt-dlp library with android_vr client for 720p DASH.
+    # Uses subprocess yt-dlp with EJS (n-challenge solver) for 720p DASH.
+    # NOTE: Must use subprocess (_yt_dlp_download) NOT Python library because
+    # the Python library doesn't support --remote-components ejs:github.
     decodo_proxy = _get_decodo_proxy()
+    _decodo_timeout = max(_dl_timeout, 300)  # At least 5min for Decodo (residential proxy can be slower)
     if decodo_proxy and not _total_expired():
-        if _yt_dlp_python_download(url, output_path, client="android_vr",
-                                    start_time=start_time, end_time=end_time,
-                                    strategy_name="Strategy 0 (Decodo residential)",
-                                    format_override=_DASH_H264_FORMAT,
-                                    proxy=decodo_proxy):
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_timeout,
+                            strategy_name="Strategy 0 (Decodo DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy):
             elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo residential proxy)", elapsed)
+            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo DASH+EJS)", elapsed)
             return _make_result(output_path, sectioned=has_time_range)
-        strategy_errors.append("0=decodo_residential_failed")
-        # Also try muxed format via Decodo (360p fallback)
+        strategy_errors.append("0=decodo_dash_ejs_failed")
+        # 0b: Decodo muxed fallback (no EJS needed, 360p) via Python lib
         if not _total_expired() and _yt_dlp_python_download(
                 url, output_path, client="android",
                 start_time=start_time, end_time=end_time,
@@ -430,6 +436,18 @@ def download_youtube_sync(
             LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed)", elapsed)
             return _make_result(output_path, sectioned=has_time_range)
         strategy_errors.append("0b=decodo_muxed_failed")
+        # 0c: Decodo subprocess muxed (different yt-dlp code path)
+        if not _total_expired() and _yt_dlp_download(
+                url, output_path, yt_dlp_binary, ffmpeg_binary,
+                client="android", start_time=start_time, end_time=end_time,
+                timeout=_decodo_timeout,
+                strategy_name="Strategy 0c (Decodo subprocess muxed)",
+                format_override=_MUXED_FORMAT,
+                use_ejs=False, proxy=decodo_proxy):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 0c (Decodo subprocess muxed)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range)
+        strategy_errors.append("0c=decodo_subprocess_muxed_failed")
     else:
         if not decodo_proxy:
             strategy_errors.append("0=no_decodo_configured")

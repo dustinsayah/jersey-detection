@@ -223,7 +223,11 @@ def _yt_dlp_download(
 
     LOGGER.info("%s: running yt-dlp client=%s format=%s proxy=%s ejs=%s skip_sections=%s",
                 strategy_name, client, fmt[:60], bool(proxy), use_ejs, skip_sections)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("%s: TIMED OUT after %ds (client=%s)", strategy_name, timeout, client)
+        return False
 
     if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
         file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)

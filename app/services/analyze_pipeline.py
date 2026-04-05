@@ -383,6 +383,16 @@ async def _run_analyze_pipeline_impl(
                 roboflow_detector.load()
 
                 _live: list[tuple[float, np.ndarray]] = []
+                # Sport-specific dead ball confidence thresholds
+                # Classifier was trained primarily on basketball — football field
+                # looks like "dead ball" to it, so require very high confidence.
+                _sport_lower = sport.lower()
+                if _sport_lower == "football":
+                    _db_conf = 0.85  # Very high bar — classifier unreliable on football
+                elif _sport_lower == "lacrosse":
+                    _db_conf = 0.70  # Moderate — outdoor fields similar to football
+                else:
+                    _db_conf = 0.40  # Basketball default — classifier trained on this
                 # Full games: sample every 4th frame for dead ball (saves ~75% time)
                 _db_step = 4 if video_duration > 1800 else 1
                 for idx, (ts, frame) in enumerate(frames):
@@ -390,7 +400,7 @@ async def _run_analyze_pipeline_impl(
                         # Skip dead ball check — assume live for unsampled frames
                         _live.append((ts, frame))
                         continue
-                    db_result = roboflow_detector.classify_dead_ball(frame)
+                    db_result = roboflow_detector.classify_dead_ball(frame, conf=_db_conf)
                     if db_result:
                         dead_ball_by_ts[ts] = db_result
                     if db_result == "dead_ball":
@@ -625,6 +635,13 @@ async def _run_analyze_pipeline_impl(
         v7_navy_detections = 0
         v7_player_crops = 0
         if sport.lower() == "football" and ocr_frames:
+            # Log v7 model availability for diagnostics
+            LOGGER.info(
+                "Pipeline: v7 football model status — ocr=%s, crop=%s, navy=%s",
+                roboflow_detector.football_jersey_ocr_v7_model is not None,
+                roboflow_detector.football_player_crop_v7_model is not None,
+                roboflow_detector.navy_jersey_specialist_v7_model is not None,
+            )
             t0 = time.perf_counter()
             try:
                 _v7_time_limit = 120 if _is_full_game else 60  # seconds

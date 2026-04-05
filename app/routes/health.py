@@ -308,3 +308,29 @@ def ready(request: Request) -> JSONResponse:
             "phases": phases,
         },
     )
+
+
+@router.get("/test-v7")
+def test_v7() -> JSONResponse:
+    """Diagnostic endpoint: check v7 football model availability."""
+    try:
+        from app.services.roboflow_detector import roboflow_detector
+        model_dir = Path("/app/app/model") if Path("/app/app/model").exists() else Path("app/model")
+        v7_files = {
+            "football_jersey_ocr_v7.pt": str(model_dir / "football_jersey_ocr_v7.pt"),
+            "navy_jersey_specialist_v7.pt": str(model_dir / "navy_jersey_specialist_v7.pt"),
+            "football_player_crop_v7.pt": str(model_dir / "football_player_crop_v7.pt"),
+        }
+        return JSONResponse(status_code=200, content={
+            "v7_models_loaded": {
+                "football_jersey_ocr_v7": roboflow_detector.football_jersey_ocr_v7_model is not None,
+                "navy_jersey_specialist_v7": roboflow_detector.navy_jersey_specialist_v7_model is not None,
+                "football_player_crop_v7": roboflow_detector.football_player_crop_v7_model is not None,
+            },
+            "v7_files_on_disk": {
+                name: Path(path).exists() for name, path in v7_files.items()
+            },
+            "note": "v7 models must be trained in Colab and committed to app/model/",
+        })
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})

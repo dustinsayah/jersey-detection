@@ -46,8 +46,8 @@ RENDER_SERVER_URL = os.getenv(
 # Read at runtime via function (start.sh sets it dynamically after wireproxy starts)
 def _get_cookie_file() -> str:
     """Return path to YouTube cookies file if it exists."""
-    for path in ["/app/youtube_cookies.txt", "/data/youtube_cookies.txt",
-                 os.getenv("YOUTUBE_COOKIES_FILE", "")]:
+    for path in ["/app/youtube_cookies.txt", "/app/app/youtube_cookies.txt",
+                 "/data/youtube_cookies.txt", os.getenv("YOUTUBE_COOKIES_FILE", "")]:
         if path and os.path.isfile(path):
             LOGGER.info("youtube_proxy: using cookies from %s", path)
             return path

@@ -76,6 +76,11 @@ env/
 !app/model/basketball_player_detector_v2.pt
 !app/model/lacrosse_detector_v2.pt
 !app/model/basketball_ball_detector.pt
+!app/model/football_jersey_ocr_v7.pt
+!app/model/navy_jersey_specialist_v7.pt.part_aa
+!app/model/navy_jersey_specialist_v7.pt.part_ab
+!app/model/football_player_crop_v7.pt.part_aa
+!app/model/football_player_crop_v7.pt.part_ab
 app/model/public/*
 !app/model/public/.gitkeep
 

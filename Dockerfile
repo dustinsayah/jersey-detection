@@ -112,6 +112,15 @@ for model in football_player_detector.pt football_digit_detector.pt football_jer
 done\n\
 echo "Models: $(ls /app/app/model/*.pt /app/app/model/*.pth 2>/dev/null | wc -l)"\n\
 \n\
+# ── Reassemble split v7 models (>100MB, split for GitHub) ──\n\
+for base in navy_jersey_specialist_v7 football_player_crop_v7; do\n\
+  if [ ! -f "/app/app/model/${base}.pt" ] && [ -f "/app/app/model/${base}.pt.part_aa" ]; then\n\
+    echo "Reassembling ${base}.pt from parts..."\n\
+    cat /app/app/model/${base}.pt.part_* > /app/app/model/${base}.pt\n\
+    echo "Reassembled ${base}.pt ($(du -h /app/app/model/${base}.pt | cut -f1))"\n\
+  fi\n\
+done\n\
+\n\
 # ── Update yt-dlp at runtime (YouTube changes API frequently) ──\n\
 echo "Updating yt-dlp..."\n\
 pip install --upgrade --pre yt-dlp 2>/dev/null \\\n\

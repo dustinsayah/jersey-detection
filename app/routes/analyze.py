@@ -1,14 +1,16 @@
 # POST /analyze — consolidated detection endpoint
 #
 # Uses StreamingResponse with keepalive to prevent Railway proxy timeout.
-# Sends {"keepalive": true, "elapsed": N}\n every 15s while processing,
-# then sends the full result JSON as the final line.
+# Pipeline runs in a SEPARATE THREAD with its own event loop, so the main
+# event loop stays free to yield keepalive lines every 15s.
+# Last line of response is the actual JSON result.
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import threading
 import time
 from typing import Any, AsyncIterator
 
@@ -23,6 +25,9 @@ router = APIRouter()
 
 # Keepalive interval in seconds — must be < Railway's ~300s proxy timeout
 _KEEPALIVE_INTERVAL = 15
+
+# Ensure only 1 pipeline runs at a time (thread-safe, unlike asyncio.Semaphore)
+_PIPELINE_LOCK = threading.Lock()
 
 
 @router.post("/analyze")
@@ -55,50 +60,63 @@ async def analyze(
             content={"error": f"Detection service is not ready: {detail}"},
         )
 
-    async def _stream_with_keepalive() -> AsyncIterator[bytes]:
-        """Run pipeline in background, yield keepalive lines until done."""
-        result_holder: dict[str, Any] = {}
-        error_holder: list[Exception] = []
-        done_event = asyncio.Event()
+    # Capture request params for the pipeline thread
+    pipeline_params = dict(
+        video_url=analyze_request.video_url,
+        video_path=analyze_request.video_path,
+        jersey_number=analyze_request.jersey_number,
+        jersey_color=analyze_request.jersey_color,
+        sport=analyze_request.sport,
+        position=analyze_request.position,
+        time_range_start=analyze_request.time_range_start,
+        time_range_end=analyze_request.time_range_end,
+        enable_audio=analyze_request.enable_audio,
+        enable_tracking=analyze_request.enable_tracking,
+        enable_pose=analyze_request.enable_pose,
+        quality_mode=analyze_request.quality_mode,
+    )
 
-        async def _run_pipeline() -> None:
+    result_holder: dict[str, Any] = {}
+    error_holder: list[Exception] = []
+    pipeline_done = threading.Event()
+
+    def _run_pipeline_in_thread() -> None:
+        """Run the async pipeline in a dedicated thread with its own event loop."""
+        with _PIPELINE_LOCK:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
                 from app.services.analyze_pipeline import run_analyze_pipeline
-
-                result = await run_analyze_pipeline(
-                    video_url=analyze_request.video_url,
-                    video_path=analyze_request.video_path,
-                    jersey_number=analyze_request.jersey_number,
-                    jersey_color=analyze_request.jersey_color,
-                    sport=analyze_request.sport,
-                    position=analyze_request.position,
-                    time_range_start=analyze_request.time_range_start,
-                    time_range_end=analyze_request.time_range_end,
-                    enable_audio=analyze_request.enable_audio,
-                    enable_tracking=analyze_request.enable_tracking,
-                    enable_pose=analyze_request.enable_pose,
-                    quality_mode=analyze_request.quality_mode,
-                )
+                result = loop.run_until_complete(run_analyze_pipeline(**pipeline_params))
                 result_holder["data"] = result
             except Exception as exc:
+                LOGGER.exception("analyze.pipeline_thread_failed")
                 error_holder.append(exc)
             finally:
-                done_event.set()
+                loop.close()
+                pipeline_done.set()
 
-        # Start pipeline as concurrent task
-        pipeline_task = asyncio.create_task(_run_pipeline())
+    async def _stream_with_keepalive() -> AsyncIterator[bytes]:
+        """Yield keepalive lines while pipeline runs in separate thread."""
+        # Start pipeline in separate thread (its own event loop)
+        pipeline_thread = threading.Thread(target=_run_pipeline_in_thread, daemon=True)
+        pipeline_thread.start()
 
-        # Send keepalive lines until pipeline completes
-        while not done_event.is_set():
-            try:
-                await asyncio.wait_for(done_event.wait(), timeout=_KEEPALIVE_INTERVAL)
-            except asyncio.TimeoutError:
+        # Yield keepalive lines using run_in_executor to avoid blocking main event loop
+        main_loop = asyncio.get_event_loop()
+        while not pipeline_done.is_set():
+            finished = await main_loop.run_in_executor(
+                None, pipeline_done.wait, _KEEPALIVE_INTERVAL
+            )
+            if not finished:
                 elapsed = round(time.perf_counter() - started_at, 1)
                 keepalive = json.dumps({"keepalive": True, "elapsed": elapsed})
                 LOGGER.debug("analyze.keepalive elapsed=%.1f", elapsed)
                 yield (keepalive + "\n").encode()
 
         # Pipeline is done — yield final result
+        pipeline_thread.join(timeout=10)
+
         if error_holder:
             LOGGER.exception("analyze.request_failed", exc_info=error_holder[0])
             error_json = json.dumps({"error": "Internal analysis error. See server logs for details."})
@@ -121,7 +139,7 @@ async def analyze(
         _stream_with_keepalive(),
         media_type="application/x-ndjson",
         headers={
-            "X-Accel-Buffering": "no",  # Disable nginx/Railway buffering
+            "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
         },
     )

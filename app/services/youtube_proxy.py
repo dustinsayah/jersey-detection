@@ -1,8 +1,10 @@
-# YouTube download proxy — 7-strategy robust download chain
+# YouTube download proxy — 9-strategy robust download chain
 #
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
 # also REQUIRED to unlock any DASH formats. Strategy order:
+#   0. Decodo residential proxy (DECODO_USERNAME + DECODO_PASSWORD env vars)
+#   0b. Decodo residential proxy muxed fallback
 #   1. yt-dlp android_vr + DASH H.264 + EJS (720p+ if IP not blocked)
 #   2. yt-dlp android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY set)
 #   3. Render server proxy
@@ -40,6 +42,20 @@ RENDER_SERVER_URL = os.getenv(
     "RENDER_SERVER_URL",
     "https://clipt-render-server-production.up.railway.app",
 ).rstrip("/")
+
+# Decodo residential proxy — bypasses YouTube datacenter IP blocks
+# Set DECODO_USERNAME + DECODO_PASSWORD env vars in Railway to enable
+def _get_decodo_proxy() -> str:
+    """Build Decodo residential proxy URL from env vars.
+
+    Returns proxy URL like http://USERNAME:PASSWORD@gate.decodo.com:10001
+    or empty string if not configured.
+    """
+    user = os.getenv("DECODO_USERNAME", "").strip()
+    passwd = os.getenv("DECODO_PASSWORD", "").strip()
+    if user and passwd:
+        return f"http://{user}:{passwd}@gate.decodo.com:10001"
+    return ""
 
 # Optional proxy for yt-dlp — set to residential proxy or Cloudflare WARP SOCKS5
 # e.g. socks5://127.0.0.1:40000 (WARP) or socks5://user:pass@proxy.example.com:1080
@@ -336,9 +352,11 @@ def download_youtube_sync(
     yt_dlp_binary: str = "yt-dlp",
     ffmpeg_binary: str = "ffmpeg",
 ) -> DownloadResult:
-    """Synchronous 7-strategy YouTube download chain.
+    """Synchronous 9-strategy YouTube download chain.
 
     Strategy order optimized for quality (720p+ when possible):
+      0. Decodo residential proxy (DASH, best success rate)
+      0b. Decodo residential proxy (muxed fallback)
       1. android_vr + DASH H.264 + EJS (720p+ from non-blocked IPs)
       2. android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY configured)
       3. Render server proxy
@@ -386,6 +404,35 @@ def download_youtube_sync(
             LOGGER.warning("youtube_proxy_sync: total timeout %.0fs > %ds, aborting remaining strategies", elapsed, _TOTAL_TIMEOUT)
             return True
         return False
+
+    # ── Strategy 0: Decodo residential proxy (best success rate) ──────
+    # Residential proxy routes through real home IPs — YouTube never blocks these.
+    # Uses Python yt-dlp library with android_vr client for 720p DASH.
+    decodo_proxy = _get_decodo_proxy()
+    if decodo_proxy and not _total_expired():
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
+                                    start_time=start_time, end_time=end_time,
+                                    strategy_name="Strategy 0 (Decodo residential)",
+                                    format_override=_DASH_H264_FORMAT,
+                                    proxy=decodo_proxy):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo residential proxy)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range)
+        strategy_errors.append("0=decodo_residential_failed")
+        # Also try muxed format via Decodo (360p fallback)
+        if not _total_expired() and _yt_dlp_python_download(
+                url, output_path, client="android",
+                start_time=start_time, end_time=end_time,
+                strategy_name="Strategy 0b (Decodo muxed)",
+                format_override=_MUXED_FORMAT,
+                proxy=decodo_proxy):
+            elapsed = round(time.perf_counter() - dl_start, 1)
+            LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed)", elapsed)
+            return _make_result(output_path, sectioned=has_time_range)
+        strategy_errors.append("0b=decodo_muxed_failed")
+    else:
+        if not decodo_proxy:
+            strategy_errors.append("0=no_decodo_configured")
 
     # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
     # android_vr client can list 720p/1080p DASH formats when EJS solver works.
@@ -616,6 +663,7 @@ def test_youtube_download_sync(
             "file_path": str(dl_result.path),
             "was_sectioned": dl_result.was_sectioned,
             "proxy_configured": bool(_get_proxy()),
+            "decodo_configured": bool(_get_decodo_proxy()),
             "render_server_url": RENDER_SERVER_URL,
             "strategy_results": strategy_results,
         }
@@ -626,6 +674,7 @@ def test_youtube_download_sync(
             "error": str(exc),
             "elapsed": elapsed,
             "proxy_configured": bool(_get_proxy()),
+            "decodo_configured": bool(_get_decodo_proxy()),
             "render_server_url": RENDER_SERVER_URL,
             "strategy_results": strategy_results,
         }

@@ -452,7 +452,7 @@ def download_youtube_sync(
     _strategy_timeout = 900 if _is_long_video else 120
 
     # Decodo sectioned timeout: only downloads the requested range
-    _decodo_sections_timeout = 900 if _is_long_video else 180
+    _decodo_sections_timeout = 900 if _is_long_video else 120
 
     # Decodo FULL download timeout: downloads the ENTIRE video then trims.
     # Must be generous even for short time ranges since the source video
@@ -522,26 +522,35 @@ def download_youtube_sync(
         Muxed = single pre-merged stream. No DASH video+audio merge needed,
         so no ffmpeg HTTP requests, no reconnection issues. Only 360p but
         reliable through the proxy. Uses subprocess so HTTP_PROXY is set.
+        Try android_vr first, then android client as fallback.
         """
         if not (decodo_proxy and _decodo_healthy):
             return None
-        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=_decodo_sections_timeout,
-                            strategy_name="Strategy 0a (Decodo muxed+EJS+sections)",
-                            format_override=_MUXED_FORMAT,
-                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
-            if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_ejs_sectioned")
+        # Try android_vr first (usually better quality options)
+        for _client in ["android_vr", "android"]:
+            if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                                client=_client, start_time=start_time, end_time=end_time,
+                                timeout=_decodo_sections_timeout,
+                                strategy_name=f"Strategy 0a (Decodo muxed+EJS+sections {_client})",
+                                format_override=_MUXED_FORMAT,
+                                use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+                if _file_valid():
+                    return _make_result(output_path, sectioned=has_time_range, strategy=f"decodo_muxed_ejs_sectioned_{_client}")
         return None
 
     def _s0b_decodo_full_trim() -> DownloadResult | None:
         """Decodo DASH+EJS full download + ffmpeg trim.
 
         Downloads the ENTIRE video (may be 2+ hours) then trims with ffmpeg -c copy.
-        Uses _decodo_full_timeout (600s) to allow enough time for large videos.
+        SKIP for short time ranges — makes no sense to download 2 hours for 60 seconds.
+        Only used for full-game requests where sectioned download fails.
         """
         if not (decodo_proxy and _decodo_healthy):
+            return None
+        # Skip full-download for short clips — wasteful of bandwidth + time
+        _requested_range = (end_time - start_time) if end_time > start_time else 0
+        if _requested_range > 0 and _requested_range < 1800:
+            LOGGER.info("Strategy 0b: SKIP — short range (%.0fs), full download wasteful", _requested_range)
             return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
@@ -557,10 +566,14 @@ def download_youtube_sync(
     def _s0c_decodo_muxed_pylib() -> DownloadResult | None:
         """Decodo muxed fallback (360p) via Python lib, full download + trim.
 
-        Uses _decodo_full_timeout since this downloads the entire video.
-        Muxed format avoids DASH merge issues but is limited to 360p.
+        SKIP for short time ranges — only for full-game requests.
         """
         if not (decodo_proxy and _decodo_healthy):
+            return None
+        # Skip full-download for short clips
+        _requested_range = (end_time - start_time) if end_time > start_time else 0
+        if _requested_range > 0 and _requested_range < 1800:
+            LOGGER.info("Strategy 0c: SKIP — short range (%.0fs)", _requested_range)
             return None
         if _yt_dlp_python_download(url, output_path, client="android",
                                    start_time=0, end_time=0,

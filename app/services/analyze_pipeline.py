@@ -1718,33 +1718,36 @@ async def _run_analyze_pipeline_impl(
         except Exception:
             pass
 
-        # Apply football-specific clip splitting — break long clips into 5s sub-clips
-        # This creates highlight-reel-friendly short clips from continuous plays
-        if sport.lower() == "football" and clips:
+        # Apply sport-specific clip splitting — break long clips into sub-clips
+        # Football: 4s clips (60s/4=15 target), Basketball: 4s, Lacrosse: 5s
+        import math as _math
+        from copy import copy as _copy_clip
+        _CLIP_LEN_BY_SPORT = {"football": 4.0, "basketball": 4.0, "lacrosse": 5.0}
+        _MAX_CLIP_BY_SPORT = {"football": FOOTBALL_MAX_CLIP, "basketball": 12.0, "lacrosse": 15.0}
+        _sport_lower = sport.lower()
+        _target_clip_len = _CLIP_LEN_BY_SPORT.get(_sport_lower, 5.0)
+        _max_clip_dur = _MAX_CLIP_BY_SPORT.get(_sport_lower, 15.0)
+        if clips:
             _split_clips: list = []
-            _FOOTBALL_CLIP_LEN = 5.0  # Each sub-clip is ~5 seconds
             for clip in clips:
                 duration = clip.end_time - clip.start_time
-                if duration > _FOOTBALL_CLIP_LEN * 1.5:  # Only split if significantly longer
-                    # Split into N sub-clips of ~5s each
-                    n_parts = max(2, int(duration / _FOOTBALL_CLIP_LEN))
+                if duration > _target_clip_len * 1.2:  # Split if >20% longer than target
+                    n_parts = max(2, _math.ceil(duration / _target_clip_len))
                     part_len = duration / n_parts
                     for i in range(n_parts):
                         sub_start = round(clip.start_time + i * part_len, 1)
                         sub_end = round(clip.start_time + (i + 1) * part_len, 1)
-                        from copy import copy
-                        sub_clip = copy(clip)
+                        sub_clip = _copy_clip(clip)
                         sub_clip.start_time = sub_start
                         sub_clip.end_time = sub_end
-                        # Adjust score slightly for variety
                         sub_clip.score = max(5, clip.score - i * 2)
                         _split_clips.append(sub_clip)
                 else:
-                    if duration > FOOTBALL_MAX_CLIP:
-                        clip.end_time = clip.start_time + FOOTBALL_MAX_CLIP
+                    if duration > _max_clip_dur:
+                        clip.end_time = clip.start_time + _max_clip_dur
                     _split_clips.append(clip)
             clips = _split_clips
-            LOGGER.info("Pipeline: football clip split → %d clips", len(clips))
+            LOGGER.info("Pipeline: %s clip split → %d clips (target=%.0fs)", _sport_lower, len(clips), _target_clip_len)
 
         # ── Step 9: Stat generation pipeline ───────────────────────────
         stat_result: dict = {"game_stats": {}, "per_clip_stats": [], "actions_detected": []}

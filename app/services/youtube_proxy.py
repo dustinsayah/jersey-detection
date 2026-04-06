@@ -387,18 +387,10 @@ def download_youtube_sync(
     yt_dlp_binary: str = "yt-dlp",
     ffmpeg_binary: str = "ffmpeg",
 ) -> DownloadResult:
-    """Synchronous 9-strategy YouTube download chain.
+    """Synchronous YouTube download chain — bulletproof strategy cascade.
 
-    Strategy order optimized for quality (720p+ when possible):
-      0. Decodo residential proxy (DASH, best success rate)
-      0b. Decodo residential proxy (muxed fallback)
-      1. android_vr + DASH H.264 + EJS (720p+ from non-blocked IPs)
-      2. android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY configured)
-      3. Render server proxy
-      4. android muxed + EJS (360p, solves n-challenge)
-      5. Python lib android_vr + DASH
-      6. android muxed no-EJS (bare fallback)
-      7. Render server /extract-frames
+    Every strategy has its own try/except. Failed strategies NEVER crash the chain.
+    The chain ALWAYS tries all strategies before giving up.
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
@@ -417,6 +409,7 @@ def download_youtube_sync(
     output_path = tmp_dir / "video.mp4"
 
     strategy_errors: list[str] = []
+    _MIN_FILE_SIZE = 100_000  # 0.1MB — reject tiny/corrupt downloads
 
     def _make_result(path: Path, sectioned: bool, strategy: str = "unknown") -> DownloadResult:
         return DownloadResult(
@@ -427,40 +420,31 @@ def download_youtube_sync(
             strategy_used=strategy,
         )
 
-    # Detect full game (long video) — increase timeout for strategies 1-2
+    # Detect full game (long video) — increase timeouts
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
-    _dl_timeout = 600 if _is_long_video else 90  # 90s per-strategy for short clips
 
-    # Overall timeout: don't let the entire chain exceed this.
-    # Long videos (full game): 1500s total to allow Decodo 900s + fallbacks.
-    # Short clips: 600s allows ~4 strategy attempts of ~120s each.
-    _TOTAL_TIMEOUT = 1500 if _is_long_video else 600
+    # Per-strategy timeout: 120s short clips, 900s full games
+    _strategy_timeout = 900 if _is_long_video else 120
+
+    # Decodo-specific timeout: slightly shorter to leave room for fallbacks
+    _decodo_timeout = 900 if _is_long_video else 120
+
+    # Overall timeout: 1500s full games, 900s short clips (allows ~7 strategies at 120s each)
+    _TOTAL_TIMEOUT = 1500 if _is_long_video else 900
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start
         if elapsed > _TOTAL_TIMEOUT:
-            LOGGER.warning("youtube_proxy_sync: total timeout %.0fs > %ds, aborting remaining strategies", elapsed, _TOTAL_TIMEOUT)
+            LOGGER.warning("youtube_proxy_sync: total timeout %.0fs > %ds", elapsed, _TOTAL_TIMEOUT)
             return True
         return False
 
-    # ── Strategy 0: Decodo residential proxy + EJS (best success rate) ──────
-    # Residential proxy routes through real home IPs — YouTube never blocks these.
-    # Uses subprocess yt-dlp with EJS (n-challenge solver) for 720p DASH.
-    # NOTE: Must use subprocess (_yt_dlp_download) NOT Python library because
-    # the Python library doesn't support --remote-components ejs:github.
-    #
-    # IMPORTANT: --download-sections with DASH+proxy often fails (ffmpeg reconnect
-    # issues). Strategy 0 tries with sections first; Strategy 0a retries WITHOUT
-    # sections (downloads full video) and trims with ffmpeg -c copy afterward.
-    decodo_proxy = _get_decodo_proxy()
-    # Per-strategy Decodo timeout: 120s for short clips, 900s for long videos.
-    # Full game at 720p ~= 1-2GB through residential proxy, needs ~500-1000s.
-    # Must be less than _TOTAL_TIMEOUT to leave room for fallback strategies.
-    _decodo_timeout = 900 if _is_long_video else 45
+    def _file_valid() -> bool:
+        """Check output file exists and is large enough."""
+        return output_path.exists() and output_path.stat().st_size > _MIN_FILE_SIZE
 
-    # Quick Decodo proxy health check (15s) — test YouTube reachability through proxy.
-    # Uses youtube.com HEAD request instead of ip.decodo.com to detect YouTube-specific blocks.
-    # Saves ~300s when proxy can't reach YouTube instead of timing out 3 strategies.
+    # ── Decodo proxy setup + health check ────────────────────────────────
+    decodo_proxy = _get_decodo_proxy()
     _decodo_healthy = False
     if decodo_proxy:
         try:
@@ -476,215 +460,205 @@ def download_youtube_sync(
             LOGGER.warning("Decodo YouTube probe failed: %s", str(exc)[:100])
             _decodo_healthy = False
 
-    if decodo_proxy and _decodo_healthy and not _total_expired():
-        # 0: Decodo DASH+EJS with --download-sections (ideal: fast + 720p)
+    proxy = _get_proxy()
+
+    # ── Strategy functions — each returns DownloadResult | None ───────────
+
+    def _s0_decodo_sections() -> DownloadResult | None:
+        """Decodo DASH+EJS with --download-sections (ideal: fast + 720p)."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_decodo_timeout,
                             strategy_name="Strategy 0 (Decodo DASH+EJS+sections)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy=decodo_proxy):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0 (Decodo DASH+EJS+sections)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
-        strategy_errors.append("0=decodo_dash_ejs_sections_failed")
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
+        return None
 
-        # 0a: Decodo DASH+EJS WITHOUT sections — download full then trim
-        # This is the critical fallback: --download-sections fails with DASH+proxy
-        # but downloading the full video and trimming afterward usually works.
-        if not _total_expired() and _yt_dlp_download(
-                url, output_path, yt_dlp_binary, ffmpeg_binary,
-                client="android_vr", start_time=start_time, end_time=end_time,
-                timeout=_decodo_timeout,
-                strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
-                format_override=_DASH_H264_FORMAT,
-                use_ejs=True, proxy=decodo_proxy,
-                skip_sections=True):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0a (Decodo DASH+EJS full+trim)", elapsed)
-            # was_sectioned=False because the full video was downloaded and trimmed
-            return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
-        strategy_errors.append("0a=decodo_dash_ejs_full_failed")
-
-        # 0b: Decodo muxed fallback (no EJS needed, 360p) via Python lib
-        # IMPORTANT: download_ranges fails through Decodo proxy (partial download
-        # gets blocked). Download full video then trim with ffmpeg -c copy.
-        if not _total_expired() and _yt_dlp_python_download(
-                url, output_path, client="android",
-                start_time=0, end_time=0,
-                strategy_name="Strategy 0b (Decodo muxed full+trim)",
-                format_override=_MUXED_FORMAT,
-                proxy=decodo_proxy,
-                timeout=_decodo_timeout):
-            # Trim with ffmpeg if time range was requested
-            if has_time_range:
-                LOGGER.info("Strategy 0b: post-download trim %.0fs-%.0fs", start_time, end_time)
-                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed full+trim)", elapsed)
-            return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib")
-        strategy_errors.append("0b=decodo_muxed_failed")
-    else:
-        if not decodo_proxy:
-            strategy_errors.append("0=no_decodo_configured")
-        elif not _decodo_healthy:
-            strategy_errors.append("0=decodo_proxy_unreachable")
-            LOGGER.warning("Skipping all Decodo strategies — proxy unreachable")
-            # When Decodo is down, try render server FIRST (skip datacenter-blocked strategies)
-            if RENDER_SERVER_URL and not _total_expired():
-                LOGGER.info("Decodo down → trying render server early (before strategies 1-2)")
-                _render_timeout_early = 300 if _is_long_video else 120
-                with httpx.Client(timeout=httpx.Timeout(_render_timeout_early)) as _rs_client:
-                    if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary,
-                                               _rs_client, "Strategy 3-early (Decodo fallback)"):
-                        elapsed = round(time.perf_counter() - dl_start, 1)
-                        LOGGER.info("Sync downloaded in %ss via render server (Decodo fallback)", elapsed)
-                        return _make_result(output_path, sectioned=has_time_range, strategy="render_server_early")
-                strategy_errors.append("3-early=render_server_failed")
-
-    # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
-    # android_vr client can list 720p/1080p DASH formats when EJS solver works.
-    # DASH H.264 format ensures OpenCV compatibility (no VP9/AV1).
-    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                        client="android_vr", start_time=start_time, end_time=end_time,
-                        timeout=_dl_timeout, strategy_name="Strategy 1",
-                        format_override=_DASH_H264_FORMAT, use_ejs=True):
-        elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 1 (android_vr DASH+EJS)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs")
-    strategy_errors.append("1=android_vr_dash_ejs_failed")
-
-    # ── Strategy 2: Same as 1 but with proxy (if configured) ──
-    # Residential proxy or Cloudflare WARP bypasses YouTube datacenter IP block.
-    proxy = _get_proxy()
-    if proxy and not _total_expired():
+    def _s0a_decodo_full_trim() -> DownloadResult | None:
+        """Decodo DASH+EJS full download + ffmpeg trim."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=_dl_timeout, strategy_name="Strategy 2",
+                            timeout=_decodo_timeout,
+                            strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy,
+                            skip_sections=True):
+            if _file_valid():
+                return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
+        return None
+
+    def _s0b_decodo_muxed() -> DownloadResult | None:
+        """Decodo muxed fallback (360p) via Python lib, full download + trim."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_python_download(url, output_path, client="android",
+                                   start_time=0, end_time=0,
+                                   strategy_name="Strategy 0b (Decodo muxed full+trim)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy=decodo_proxy,
+                                   timeout=_decodo_timeout):
+            if has_time_range:
+                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            if _file_valid():
+                return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib")
+        return None
+
+    def _s_render_early() -> DownloadResult | None:
+        """Render server early — used when Decodo is unreachable."""
+        if not (decodo_proxy and not _decodo_healthy):
+            return None
+        if not RENDER_SERVER_URL:
+            return None
+        _render_timeout_early = 300 if _is_long_video else 120
+        with httpx.Client(timeout=httpx.Timeout(_render_timeout_early)) as _rs_client:
+            if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary,
+                                       _rs_client, "Strategy 3-early (Decodo fallback)"):
+                if _file_valid():
+                    return _make_result(output_path, sectioned=has_time_range, strategy="render_server_early")
+        return None
+
+    def _s1_android_vr_dash() -> DownloadResult | None:
+        """android_vr + DASH H.264 + EJS (720p+ from non-blocked IPs)."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout, strategy_name="Strategy 1",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs")
+        return None
+
+    def _s2_android_vr_proxy() -> DownloadResult | None:
+        """android_vr + DASH H.264 + EJS + YT_DLP_PROXY."""
+        if not proxy:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout, strategy_name="Strategy 2",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
                             proxy=proxy):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 2 (android_vr DASH+EJS+proxy)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs_warp")
-        strategy_errors.append("2=android_vr_dash_proxy_failed")
-    else:
-        strategy_errors.append("2=no_proxy_configured")
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs_warp")
+        return None
 
-    # ── Strategy 3: Render server proxy ──
-    # Render server receives startTime/endTime and returns pre-trimmed video.
-    # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
-    # Use 120s timeout (Railway→Railway can be slow through edge proxy).
-    if _total_expired():
-        strategy_errors.append("3=total_timeout_skip")
-        strategy_errors.append("4=total_timeout_skip")
-        strategy_errors.append("5=total_timeout_skip")
-        strategy_errors.append("6=total_timeout_skip")
-        strategy_errors.append("7=total_timeout_skip")
-        raise RuntimeError(
-            f"All 7 YouTube download strategies failed (sync) for: {url} "
-            f"(original: {original_url}). "
-            f"Errors: {', '.join(strategy_errors)}. "
-            f"Check Railway logs for per-strategy errors."
-        )
-    _render_timeout = 300 if _is_long_video else 120
-    with httpx.Client(timeout=httpx.Timeout(_render_timeout)) as client:
-        if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
-            elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="render_server")
-    strategy_errors.append("3=render_server_failed")
+    def _s3_render_server() -> DownloadResult | None:
+        """Render server proxy — pre-trimmed video."""
+        if not RENDER_SERVER_URL:
+            return None
+        _render_timeout = 300 if _is_long_video else 120
+        with httpx.Client(timeout=httpx.Timeout(_render_timeout)) as client:
+            if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
+                if _file_valid():
+                    return _make_result(output_path, sectioned=has_time_range, strategy="render_server")
+        return None
 
-    # ── Strategy 4: yt-dlp android muxed + EJS (360p but reliable) ──
-    if _total_expired():
-        strategy_errors.append("4=total_timeout_skip")
-        strategy_errors.append("5=total_timeout_skip")
-        strategy_errors.append("6=total_timeout_skip")
-        strategy_errors.append("7=total_timeout_skip")
-        raise RuntimeError(
-            f"All 7 YouTube download strategies failed (sync) for: {url} "
-            f"(original: {original_url}). "
-            f"Errors: {', '.join(strategy_errors)}. "
-            f"Check Railway logs for per-strategy errors."
-        )
-    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                        client="android", start_time=start_time, end_time=end_time,
-                        strategy_name="Strategy 4", format_override=_MUXED_FORMAT,
-                        use_ejs=True):
-        elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 4 (android muxed+EJS)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_ejs")
-    strategy_errors.append("4=android_muxed_ejs_failed")
+    def _s4_android_muxed_ejs() -> DownloadResult | None:
+        """android muxed + EJS (360p but reliable)."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android", start_time=start_time, end_time=end_time,
+                            strategy_name="Strategy 4", format_override=_MUXED_FORMAT,
+                            use_ejs=True, timeout=_strategy_timeout):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_ejs")
+        return None
 
-    # ── Strategy 5: yt-dlp Python library with android_vr + DASH ──
-    if _total_expired():
-        strategy_errors.extend(["5=timeout_skip", "6=timeout_skip", "7=timeout_skip"])
-        raise RuntimeError(
-            f"All 7 YouTube download strategies failed (sync) for: {url} "
-            f"(original: {original_url}). Errors: {', '.join(strategy_errors)}. "
-            f"Check Railway logs for per-strategy errors."
-        )
-    if _yt_dlp_python_download(url, output_path, client="android_vr",
-                               start_time=0, end_time=0,
-                               strategy_name="Strategy 5 (full+trim)",
-                               format_override=_DASH_H264_FORMAT):
-        if has_time_range:
-            LOGGER.info("Strategy 5: post-download trim %.0fs-%.0fs", start_time, end_time)
-            _trim_video(output_path, start_time, end_time, ffmpeg_binary)
-        elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 5 (Python lib android_vr full+trim)", elapsed)
-        return _make_result(output_path, sectioned=False, strategy="python_lib_android_vr")
-    strategy_errors.append("5=python_lib_android_vr_failed")
+    def _s5_python_lib() -> DownloadResult | None:
+        """Python lib android_vr + DASH, full download + trim."""
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
+                                   start_time=0, end_time=0,
+                                   strategy_name="Strategy 5 (full+trim)",
+                                   format_override=_DASH_H264_FORMAT,
+                                   timeout=_strategy_timeout):
+            if has_time_range:
+                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            if _file_valid():
+                return _make_result(output_path, sectioned=False, strategy="python_lib_android_vr")
+        return None
 
-    # ── Strategy 6: yt-dlp android muxed no-EJS (bare minimum) ──
-    if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                        client="android", start_time=start_time, end_time=end_time,
-                        strategy_name="Strategy 6", format_override=_ANDROID_FORMAT,
-                        use_ejs=False):
-        elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 6 (android muxed bare)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_bare")
-    strategy_errors.append("6=android_muxed_bare_failed")
+    def _s6_android_bare() -> DownloadResult | None:
+        """android muxed no-EJS (bare minimum fallback)."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android", start_time=start_time, end_time=end_time,
+                            strategy_name="Strategy 6", format_override=_ANDROID_FORMAT,
+                            use_ejs=False, timeout=_strategy_timeout):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_bare")
+        return None
 
-    # ── Strategy 7: Render server /extract-frames (last resort) ──
-    if RENDER_SERVER_URL:
-        try:
-            LOGGER.info("Strategy 7: render server /extract-frames (last resort)")
-            with httpx.Client(timeout=httpx.Timeout(120)) as client:
-                payload: dict = {"youtubeUrl": url}
-                if start_time > 0:
-                    payload["startTime"] = start_time
-                if end_time > 0:
-                    payload["endTime"] = end_time
-                resp = client.post(f"{RENDER_SERVER_URL}/extract-frames", json=payload)
-                if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "")
-                    if "video" in content_type or "octet-stream" in content_type:
-                        if output_path.exists():
-                            output_path.unlink()
-                        output_path.write_bytes(resp.content)
-                        elapsed = round(time.perf_counter() - dl_start, 1)
-                        LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames)", elapsed)
+    def _s7_render_extract() -> DownloadResult | None:
+        """Render server /extract-frames (last resort)."""
+        if not RENDER_SERVER_URL:
+            return None
+        with httpx.Client(timeout=httpx.Timeout(120)) as client:
+            payload: dict = {"youtubeUrl": url}
+            if start_time > 0:
+                payload["startTime"] = start_time
+            if end_time > 0:
+                payload["endTime"] = end_time
+            resp = client.post(f"{RENDER_SERVER_URL}/extract-frames", json=payload)
+            if resp.status_code == 200:
+                content_type = resp.headers.get("content-type", "")
+                if "video" in content_type or "octet-stream" in content_type:
+                    if output_path.exists():
+                        output_path.unlink()
+                    output_path.write_bytes(resp.content)
+                    if _file_valid():
                         return _make_result(output_path, sectioned=has_time_range, strategy="render_extract_frames")
-                    ct = resp.headers.get("content-type", "")
-                    if "json" in ct or "text" in ct:
-                        data = resp.json()
-                        download_url = data.get("cloudinaryUrl") or data.get("downloadUrl") or data.get("url") or data.get("videoUrl")
-                        if download_url:
-                            dl_resp = client.get(download_url, follow_redirects=True)
-                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
-                                if output_path.exists():
-                                    output_path.unlink()
-                                output_path.write_bytes(dl_resp.content)
-                                elapsed = round(time.perf_counter() - dl_start, 1)
-                                LOGGER.info("Sync downloaded in %ss via Strategy 7 (extract-frames URL)", elapsed)
+                if "json" in content_type or "text" in content_type:
+                    data = resp.json()
+                    download_url = (data.get("cloudinaryUrl") or data.get("downloadUrl")
+                                    or data.get("url") or data.get("videoUrl"))
+                    if download_url:
+                        dl_resp = client.get(download_url, follow_redirects=True)
+                        if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                            if output_path.exists():
+                                output_path.unlink()
+                            output_path.write_bytes(dl_resp.content)
+                            if _file_valid():
                                 return _make_result(output_path, sectioned=has_time_range, strategy="render_extract_frames_url")
-                LOGGER.warning("Strategy 7 failed: %d", resp.status_code)
+        return None
+
+    # ── Build strategy chain as (name, function) tuples ──────────────────
+    strategies: list[tuple[str, callable]] = [
+        ("decodo_dash_sections", _s0_decodo_sections),
+        ("decodo_dash_full_trim", _s0a_decodo_full_trim),
+        ("decodo_muxed_full_trim", _s0b_decodo_muxed),
+        ("render_server_early", _s_render_early),
+        ("android_vr_dash_ejs", _s1_android_vr_dash),
+        ("android_vr_dash_proxy", _s2_android_vr_proxy),
+        ("render_server", _s3_render_server),
+        ("android_muxed_ejs", _s4_android_muxed_ejs),
+        ("python_lib_full_trim", _s5_python_lib),
+        ("android_muxed_bare", _s6_android_bare),
+        ("render_extract_frames", _s7_render_extract),
+    ]
+
+    # ── Run strategies — each wrapped in try/except, NEVER crashes chain ─
+    for name, fn in strategies:
+        if _total_expired():
+            strategy_errors.append(f"{name}=total_timeout_skip")
+            continue  # Skip but NEVER raise — always try remaining strategies
+
+        try:
+            result = fn()
+            if result is not None:
+                elapsed = round(time.perf_counter() - dl_start, 1)
+                LOGGER.info("Downloaded in %ss via %s", elapsed, name)
+                return result
+            # fn returned None — strategy didn't apply or failed gracefully
+            strategy_errors.append(f"{name}=failed")
         except Exception as exc:
-            LOGGER.warning("Strategy 7 failed: %s", exc)
-    strategy_errors.append("7=extract_frames_failed")
+            strategy_errors.append(f"{name}={type(exc).__name__}")
+            LOGGER.warning("Strategy %s EXCEPTION: %s: %s", name, type(exc).__name__, str(exc)[:200])
+            continue
 
     raise RuntimeError(
-        f"All 7 YouTube download strategies failed (sync) for: {url} "
+        f"All download strategies failed for: {url} "
         f"(original: {original_url}). "
         f"Errors: {', '.join(strategy_errors)}. "
         f"Check Railway logs for per-strategy errors."

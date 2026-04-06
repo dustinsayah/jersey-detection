@@ -48,25 +48,34 @@ RENDER_SERVER_URL = os.getenv(
 
 # Decodo residential proxy — bypasses YouTube datacenter IP blocks
 # Set DECODO_USERNAME + DECODO_PASSWORD env vars in Railway to enable
+#
+# Decodo has two proxy endpoints:
+#   - Port 10001: Basic rotating proxy (raw username:password)
+#   - Port 7000: Advanced endpoint with parameters (session, country, etc.)
+#     Requires "user-" prefix: user-USERNAME-session-ID-sessionduration-MIN
+#
+# See: https://help.decodo.com/docs/residential-proxy-custom-sticky-sessions
 def _get_decodo_proxy(sticky: bool = False) -> str:
     """Build Decodo residential proxy URL from env vars.
 
     Args:
-        sticky: If True, append a random session ID to the username so that
+        sticky: If True, use port 7000 with a random session ID so that
                 all requests through this proxy URL hit the SAME residential IP.
                 Critical for DASH downloads where yt-dlp extracts stream URLs
                 bound to one IP and ffmpeg must download from the same IP.
+                Session duration: 10 minutes (enough for any single download).
 
-    Returns proxy URL like http://USERNAME:PASSWORD@gate.decodo.com:10001
-    or empty string if not configured.
+    Returns proxy URL or empty string if not configured.
     """
     user = os.getenv("DECODO_USERNAME", "").strip()
     passwd = os.getenv("DECODO_PASSWORD", "").strip()
     if user and passwd:
         if sticky:
             session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-            # Smartproxy/Decodo sticky session format: user-session-ID
-            return f"http://{user}-session-{session_id}:{passwd}@gate.decodo.com:10001"
+            # Decodo advanced format: user-USERNAME-session-ID-sessionduration-MIN
+            # Port 7000 with "user-" prefix — supports session parameters
+            return f"http://user-{user}-session-{session_id}-sessionduration-10:{passwd}@gate.decodo.com:7000"
+        # Port 10001: basic rotating proxy (no session parameters)
         return f"http://{user}:{passwd}@gate.decodo.com:10001"
     return ""
 

@@ -177,6 +177,7 @@ def _yt_dlp_download(
     use_ejs: bool = True,
     proxy: str = "",
     skip_sections: bool = False,
+    errors_detail: dict | None = None,
 ) -> bool:
     """Run yt-dlp subprocess with given client. Returns True on success.
 
@@ -227,6 +228,8 @@ def _yt_dlp_download(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         LOGGER.warning("%s: TIMED OUT after %ds (client=%s)", strategy_name, timeout, client)
+        if errors_detail is not None:
+            errors_detail[strategy_name] = f"TIMEOUT after {timeout}s"
         return False
 
     if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
@@ -240,6 +243,8 @@ def _yt_dlp_download(
 
     err = result.stderr[:300] if result.stderr else "no stderr"
     LOGGER.warning("%s: FAILED (client=%s): %s", strategy_name, client, err)
+    if errors_detail is not None:
+        errors_detail[strategy_name] = err[:120]
     return False
 
 
@@ -253,6 +258,7 @@ def _yt_dlp_python_download(
     format_override: str | None = None,
     proxy: str = "",
     timeout: int = 90,
+    errors_detail: dict | None = None,
 ) -> bool:
     """Use yt-dlp as Python library (no subprocess). Returns True on success.
 
@@ -312,9 +318,13 @@ def _yt_dlp_python_download(
             return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         LOGGER.warning("%s: TIMED OUT after %ds (Python lib, client=%s)", strategy_name, timeout, client)
+        if errors_detail is not None:
+            errors_detail[strategy_name] = f"TIMEOUT after {timeout}s"
         return False
     except Exception as exc:
         LOGGER.warning("%s: FAILED (Python lib, client=%s): %s", strategy_name, client, str(exc)[:200])
+        if errors_detail is not None:
+            errors_detail[strategy_name] = str(exc)[:120]
         return False
 
 
@@ -462,6 +472,9 @@ def download_youtube_sync(
 
     proxy = _get_proxy()
 
+    # Shared error detail dict — populated by helpers for diagnostics
+    _errors_detail: dict[str, str] = {}
+
     # ── Strategy functions — each returns DownloadResult | None ───────────
 
     def _s0_decodo_sections() -> DownloadResult | None:
@@ -473,7 +486,7 @@ def download_youtube_sync(
                             timeout=_decodo_timeout,
                             strategy_name="Strategy 0 (Decodo DASH+EJS+sections)",
                             format_override=_DASH_H264_FORMAT,
-                            use_ejs=True, proxy=decodo_proxy):
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
         return None
@@ -488,7 +501,7 @@ def download_youtube_sync(
                             strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy=decodo_proxy,
-                            skip_sections=True):
+                            skip_sections=True, errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
         return None
@@ -502,7 +515,7 @@ def download_youtube_sync(
                                    strategy_name="Strategy 0b (Decodo muxed full+trim)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=decodo_proxy,
-                                   timeout=_decodo_timeout):
+                                   timeout=_decodo_timeout, errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
@@ -528,7 +541,8 @@ def download_youtube_sync(
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout, strategy_name="Strategy 1",
-                            format_override=_DASH_H264_FORMAT, use_ejs=True):
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs")
         return None
@@ -541,7 +555,7 @@ def download_youtube_sync(
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout, strategy_name="Strategy 2",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
-                            proxy=proxy):
+                            proxy=proxy, errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="android_vr_dash_ejs_warp")
         return None
@@ -562,7 +576,8 @@ def download_youtube_sync(
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android", start_time=start_time, end_time=end_time,
                             strategy_name="Strategy 4", format_override=_MUXED_FORMAT,
-                            use_ejs=True, timeout=_strategy_timeout):
+                            use_ejs=True, timeout=_strategy_timeout,
+                            errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_ejs")
         return None
@@ -573,7 +588,8 @@ def download_youtube_sync(
                                    start_time=0, end_time=0,
                                    strategy_name="Strategy 5 (full+trim)",
                                    format_override=_DASH_H264_FORMAT,
-                                   timeout=_strategy_timeout):
+                                   timeout=_strategy_timeout,
+                                   errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
@@ -585,7 +601,8 @@ def download_youtube_sync(
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android", start_time=start_time, end_time=end_time,
                             strategy_name="Strategy 6", format_override=_ANDROID_FORMAT,
-                            use_ejs=False, timeout=_strategy_timeout):
+                            use_ejs=False, timeout=_strategy_timeout,
+                            errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="android_muxed_bare")
         return None
@@ -657,11 +674,16 @@ def download_youtube_sync(
             LOGGER.warning("Strategy %s EXCEPTION: %s: %s", name, type(exc).__name__, str(exc)[:200])
             continue
 
+    # Build detailed error message with yt-dlp stderr excerpts
+    _detail_str = ""
+    if _errors_detail:
+        _detail_parts = [f"{k}: {v}" for k, v in _errors_detail.items()]
+        _detail_str = f" Detail: {'; '.join(_detail_parts[:5])}"
     raise RuntimeError(
         f"All download strategies failed for: {url} "
         f"(original: {original_url}). "
-        f"Errors: {', '.join(strategy_errors)}. "
-        f"Check Railway logs for per-strategy errors."
+        f"Decodo={('healthy' if _decodo_healthy else 'unhealthy')}. "
+        f"Errors: {', '.join(strategy_errors)}.{_detail_str}"
     )
 
 

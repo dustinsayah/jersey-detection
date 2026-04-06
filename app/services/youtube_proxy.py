@@ -18,7 +18,9 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import random
 import re
+import string
 import subprocess
 import tempfile
 import time
@@ -46,8 +48,14 @@ RENDER_SERVER_URL = os.getenv(
 
 # Decodo residential proxy — bypasses YouTube datacenter IP blocks
 # Set DECODO_USERNAME + DECODO_PASSWORD env vars in Railway to enable
-def _get_decodo_proxy() -> str:
+def _get_decodo_proxy(sticky: bool = False) -> str:
     """Build Decodo residential proxy URL from env vars.
+
+    Args:
+        sticky: If True, append a random session ID to the username so that
+                all requests through this proxy URL hit the SAME residential IP.
+                Critical for DASH downloads where yt-dlp extracts stream URLs
+                bound to one IP and ffmpeg must download from the same IP.
 
     Returns proxy URL like http://USERNAME:PASSWORD@gate.decodo.com:10001
     or empty string if not configured.
@@ -55,6 +63,10 @@ def _get_decodo_proxy() -> str:
     user = os.getenv("DECODO_USERNAME", "").strip()
     passwd = os.getenv("DECODO_PASSWORD", "").strip()
     if user and passwd:
+        if sticky:
+            session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            # Smartproxy/Decodo sticky session format: user-session-ID
+            return f"http://{user}-session-{session_id}:{passwd}@gate.decodo.com:10001"
         return f"http://{user}:{passwd}@gate.decodo.com:10001"
     return ""
 
@@ -194,11 +206,13 @@ def _yt_dlp_download(
         yt_dlp_binary,
         "--no-check-certificate",
         "--extractor-args", f"youtube:player_client={client}",
-        "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -reconnect_on_network_error 1",
         "--format", fmt,
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--socket-timeout", "60",
+        "--retries", "3",
+        "--fragment-retries", "5",
         "-o", str(output_path),
     ]
 
@@ -436,8 +450,13 @@ def download_youtube_sync(
     # Per-strategy timeout: 120s short clips, 900s full games
     _strategy_timeout = 900 if _is_long_video else 120
 
-    # Decodo-specific timeout: slightly shorter to leave room for fallbacks
-    _decodo_timeout = 900 if _is_long_video else 120
+    # Decodo sectioned timeout: only downloads the requested range
+    _decodo_sections_timeout = 900 if _is_long_video else 180
+
+    # Decodo FULL download timeout: downloads the ENTIRE video then trims.
+    # Must be generous even for short time ranges since the source video
+    # may be 2+ hours. 600s = enough for ~2GB at 3MB/s residential speed.
+    _decodo_full_timeout = 900 if _is_long_video else 600
 
     # Overall timeout: 1500s full games, 900s short clips (allows ~7 strategies at 120s each)
     _TOTAL_TIMEOUT = 1500 if _is_long_video else 900
@@ -454,7 +473,8 @@ def download_youtube_sync(
         return output_path.exists() and output_path.stat().st_size > _MIN_FILE_SIZE
 
     # ── Decodo proxy setup + health check ────────────────────────────────
-    decodo_proxy = _get_decodo_proxy()
+    # Use non-sticky proxy for health check, sticky for actual downloads
+    decodo_proxy = _get_decodo_proxy(sticky=False)
     _decodo_healthy = False
     if decodo_proxy:
         try:
@@ -478,44 +498,61 @@ def download_youtube_sync(
     # ── Strategy functions — each returns DownloadResult | None ───────────
 
     def _s0_decodo_sections() -> DownloadResult | None:
-        """Decodo DASH+EJS with --download-sections (ideal: fast + 720p)."""
+        """Decodo DASH+EJS with --download-sections + sticky session (ideal: fast + 720p).
+
+        Sticky session ensures yt-dlp extraction and ffmpeg DASH merge use the
+        same residential IP. Without this, IP rotation causes 'End of file' errors
+        when ffmpeg tries to download DASH segments from a different IP than the
+        one yt-dlp used to extract the stream URLs.
+        """
         if not (decodo_proxy and _decodo_healthy):
             return None
+        sticky_proxy = _get_decodo_proxy(sticky=True)
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=_decodo_timeout,
-                            strategy_name="Strategy 0 (Decodo DASH+EJS+sections)",
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0 (Decodo DASH+EJS+sections+sticky)",
                             format_override=_DASH_H264_FORMAT,
-                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+                            use_ejs=True, proxy=sticky_proxy, errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
         return None
 
     def _s0a_decodo_full_trim() -> DownloadResult | None:
-        """Decodo DASH+EJS full download + ffmpeg trim."""
+        """Decodo DASH+EJS full download + ffmpeg trim + sticky session.
+
+        Downloads the ENTIRE video (may be 2+ hours) then trims with ffmpeg -c copy.
+        Uses _decodo_full_timeout (600s) to allow enough time for large videos.
+        """
         if not (decodo_proxy and _decodo_healthy):
             return None
+        sticky_proxy = _get_decodo_proxy(sticky=True)
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=_decodo_timeout,
-                            strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
+                            timeout=_decodo_full_timeout,
+                            strategy_name="Strategy 0a (Decodo DASH+EJS full+trim+sticky)",
                             format_override=_DASH_H264_FORMAT,
-                            use_ejs=True, proxy=decodo_proxy,
+                            use_ejs=True, proxy=sticky_proxy,
                             skip_sections=True, errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
         return None
 
     def _s0b_decodo_muxed() -> DownloadResult | None:
-        """Decodo muxed fallback (360p) via Python lib, full download + trim."""
+        """Decodo muxed fallback (360p) via Python lib, full download + trim.
+
+        Uses _decodo_full_timeout since this downloads the entire video.
+        Muxed format avoids DASH merge issues but is limited to 360p.
+        """
         if not (decodo_proxy and _decodo_healthy):
             return None
+        sticky_proxy = _get_decodo_proxy(sticky=True)
         if _yt_dlp_python_download(url, output_path, client="android",
                                    start_time=0, end_time=0,
-                                   strategy_name="Strategy 0b (Decodo muxed full+trim)",
+                                   strategy_name="Strategy 0b (Decodo muxed full+trim+sticky)",
                                    format_override=_MUXED_FORMAT,
-                                   proxy=decodo_proxy,
-                                   timeout=_decodo_timeout, errors_detail=_errors_detail):
+                                   proxy=sticky_proxy,
+                                   timeout=_decodo_full_timeout, errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():

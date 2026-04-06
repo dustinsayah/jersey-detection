@@ -507,15 +507,22 @@ def download_youtube_sync(
         strategy_errors.append("0a=decodo_dash_ejs_full_failed")
 
         # 0b: Decodo muxed fallback (no EJS needed, 360p) via Python lib
+        # IMPORTANT: download_ranges fails through Decodo proxy (partial download
+        # gets blocked). Download full video then trim with ffmpeg -c copy.
         if not _total_expired() and _yt_dlp_python_download(
                 url, output_path, client="android",
-                start_time=start_time, end_time=end_time,
-                strategy_name="Strategy 0b (Decodo muxed)",
+                start_time=0, end_time=0,
+                strategy_name="Strategy 0b (Decodo muxed full+trim)",
                 format_override=_MUXED_FORMAT,
-                proxy=decodo_proxy):
+                proxy=decodo_proxy,
+                timeout=_decodo_timeout):
+            # Trim with ffmpeg if time range was requested
+            if has_time_range:
+                LOGGER.info("Strategy 0b: post-download trim %.0fs-%.0fs", start_time, end_time)
+                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             elapsed = round(time.perf_counter() - dl_start, 1)
-            LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed)", elapsed)
-            return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_pylib")
+            LOGGER.info("Sync downloaded in %ss via Strategy 0b (Decodo muxed full+trim)", elapsed)
+            return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib")
         strategy_errors.append("0b=decodo_muxed_failed")
     else:
         if not decodo_proxy:
@@ -617,12 +624,15 @@ def download_youtube_sync(
             f"Check Railway logs for per-strategy errors."
         )
     if _yt_dlp_python_download(url, output_path, client="android_vr",
-                               start_time=start_time, end_time=end_time,
-                               strategy_name="Strategy 5",
+                               start_time=0, end_time=0,
+                               strategy_name="Strategy 5 (full+trim)",
                                format_override=_DASH_H264_FORMAT):
+        if has_time_range:
+            LOGGER.info("Strategy 5: post-download trim %.0fs-%.0fs", start_time, end_time)
+            _trim_video(output_path, start_time, end_time, ffmpeg_binary)
         elapsed = round(time.perf_counter() - dl_start, 1)
-        LOGGER.info("Sync downloaded in %ss via Strategy 5 (Python lib android_vr)", elapsed)
-        return _make_result(output_path, sectioned=has_time_range, strategy="python_lib_android_vr")
+        LOGGER.info("Sync downloaded in %ss via Strategy 5 (Python lib android_vr full+trim)", elapsed)
+        return _make_result(output_path, sectioned=False, strategy="python_lib_android_vr")
     strategy_errors.append("5=python_lib_android_vr_failed")
 
     # ── Strategy 6: yt-dlp android muxed no-EJS (bare minimum) ──

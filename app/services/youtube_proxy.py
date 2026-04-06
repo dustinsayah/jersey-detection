@@ -456,22 +456,24 @@ def download_youtube_sync(
     # Per-strategy Decodo timeout: 120s for short clips, 900s for long videos.
     # Full game at 720p ~= 1-2GB through residential proxy, needs ~500-1000s.
     # Must be less than _TOTAL_TIMEOUT to leave room for fallback strategies.
-    _decodo_timeout = 900 if _is_long_video else 120
+    _decodo_timeout = 900 if _is_long_video else 45
 
-    # Quick Decodo proxy health check (10s) — skip all Decodo strategies if unreachable.
-    # Saves ~360s when proxy is down instead of timing out 3 strategies.
+    # Quick Decodo proxy health check (15s) — test YouTube reachability through proxy.
+    # Uses youtube.com HEAD request instead of ip.decodo.com to detect YouTube-specific blocks.
+    # Saves ~300s when proxy can't reach YouTube instead of timing out 3 strategies.
     _decodo_healthy = False
     if decodo_proxy:
         try:
-            _probe_resp = httpx.get(
-                "https://ip.decodo.com/json",
+            _probe_resp = httpx.head(
+                "https://www.youtube.com/",
                 proxy=decodo_proxy,
-                timeout=httpx.Timeout(10),
+                timeout=httpx.Timeout(15),
+                follow_redirects=True,
             )
-            _decodo_healthy = _probe_resp.status_code == 200
-            LOGGER.info("Decodo proxy health: %s (status=%d)", "OK" if _decodo_healthy else "FAIL", _probe_resp.status_code)
+            _decodo_healthy = _probe_resp.status_code < 400
+            LOGGER.info("Decodo YouTube probe: %s (status=%d)", "OK" if _decodo_healthy else "FAIL", _probe_resp.status_code)
         except Exception as exc:
-            LOGGER.warning("Decodo proxy health check failed: %s", str(exc)[:100])
+            LOGGER.warning("Decodo YouTube probe failed: %s", str(exc)[:100])
             _decodo_healthy = False
 
     if decodo_proxy and _decodo_healthy and not _total_expired():

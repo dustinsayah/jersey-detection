@@ -1158,19 +1158,131 @@ class RoboflowDetector:
 
     # ── v7 Football OCR ──────────────────────────────────────────────────
 
+    def _navy_adaptive_preprocess(self, crop: np.ndarray) -> np.ndarray:
+        """Navy jersey preprocessing: grayscale → adaptive threshold → invert.
+
+        This makes white/light digits on dark backgrounds pop by converting
+        to high-contrast binary where digits become dark-on-white.
+        """
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # Adaptive threshold isolates digits from dark jersey background
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 21, 5,
+        )
+        # Convert back to BGR for model input
+        return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+
+    def _run_ocr_on_crop(
+        self,
+        crop: np.ndarray,
+        conf: float,
+        jersey_number: int,
+        x1: int,
+        y1: int,
+    ) -> list[dict]:
+        """Run v7 OCR + navy specialist on a single crop. Returns detections."""
+        dets: list[dict] = []
+        _is_navy_jersey = is_navy(self._request_jersey_color)
+        _is_dark_jersey = is_dark_color(self._request_jersey_color)
+
+        # Prepare multiple preprocessing variants
+        enhanced_standard = self._preprocess(crop)
+        preprocessed_variants = [("standard", enhanced_standard)]
+
+        # Navy adaptive threshold preprocessing (additional variant)
+        if _is_navy_jersey or _is_dark_jersey:
+            navy_enhanced = self._navy_adaptive_preprocess(crop)
+            preprocessed_variants.append(("navy_adaptive", navy_enhanced))
+
+        # Lower confidence for navy jerseys — digits are harder to read
+        effective_conf = min(conf, 0.05) if _is_navy_jersey else conf
+
+        digit_detections: list[tuple[int, float, list]] = []
+
+        for variant_name, enhanced in preprocessed_variants:
+            # Run v7 OCR (digit-wise 0-9 detection)
+            try:
+                results = self.football_jersey_ocr_v7_model(enhanced, conf=effective_conf, verbose=False)[0]
+                for box in results.boxes:
+                    cls_name = self.football_jersey_ocr_v7_model.names[int(box.cls)]
+                    digit = self._parse_number(cls_name)
+                    if digit is not None and 0 <= digit <= 9:
+                        digit_detections.append((digit, float(box.conf), box.xyxy[0].tolist()))
+            except Exception as e:
+                logger.debug("v7 football OCR error (%s): %s", variant_name, e)
+
+            # Also try navy specialist if available and jersey is dark
+            if self.navy_jersey_specialist_v7_model is not None and _is_dark_jersey:
+                self._last_used["navy_jersey_specialist_v7_model"] = time.time()
+                try:
+                    navy_results = self.navy_jersey_specialist_v7_model(enhanced, conf=effective_conf, verbose=False)[0]
+                    for box in navy_results.boxes:
+                        cls_name = self.navy_jersey_specialist_v7_model.names[int(box.cls)]
+                        digit = self._parse_number(cls_name)
+                        if digit is not None and 0 <= digit <= 9:
+                            digit_detections.append((digit, float(box.conf) * 0.95, box.xyxy[0].tolist()))
+                except Exception as e:
+                    logger.debug("v7 navy specialist error (%s): %s", variant_name, e)
+
+        if not digit_detections:
+            return []
+
+        # Compose digits into target jersey number
+        target_digits = [int(d) for d in str(jersey_number)]
+
+        if len(target_digits) == 1:
+            for digit, digit_conf, bbox in digit_detections:
+                if digit == target_digits[0]:
+                    dets.append({
+                        "confidence": digit_conf,
+                        "bbox": [bbox[0] + x1, bbox[1] + y1, bbox[2] + x1, bbox[3] + y1],
+                        "number_detected": jersey_number,
+                        "layer": "v7_football_ocr",
+                    })
+        elif len(target_digits) == 2:
+            d1_matches = [(d, c, b) for d, c, b in digit_detections if d == target_digits[0]]
+            d2_matches = [(d, c, b) for d, c, b in digit_detections if d == target_digits[1]]
+            for d1, c1, b1 in d1_matches:
+                for d2, c2, b2 in d2_matches:
+                    d1_center_x = (b1[0] + b1[2]) / 2
+                    d2_center_x = (b2[0] + b2[2]) / 2
+                    if d1_center_x < d2_center_x:
+                        d1_center_y = (b1[1] + b1[3]) / 2
+                        d2_center_y = (b2[1] + b2[3]) / 2
+                        d1_h = b1[3] - b1[1]
+                        if abs(d1_center_y - d2_center_y) < d1_h * 0.5:
+                            combined_conf = min(c1, c2)
+                            combined_bbox = [
+                                min(b1[0], b2[0]) + x1,
+                                min(b1[1], b2[1]) + y1,
+                                max(b1[2], b2[2]) + x1,
+                                max(b1[3], b2[3]) + y1,
+                            ]
+                            dets.append({
+                                "confidence": combined_conf,
+                                "bbox": combined_bbox,
+                                "number_detected": jersey_number,
+                                "layer": "v7_football_ocr_composed",
+                            })
+
+        return dets
+
     def detect_football_jersey_v7(
         self,
         frame: np.ndarray,
         jersey_number: int,
         conf: float = 0.15,
     ) -> list[dict]:
-        """Run v7 football-specialist OCR pipeline.
+        """Run v7 football-specialist OCR pipeline with multi-scale scanning.
 
         Pipeline:
         1. football_player_crop_v7 → find individual players
-        2. For each crop → football_jersey_ocr_v7 (digit-wise 0-9)
-        3. If navy jersey → also run navy_jersey_specialist_v7
-        4. Compose digits into target jersey number
+        2. Multi-scale scanning: try 1x, 2x, 4x crop sizes
+        3. For each scale → football_jersey_ocr_v7 (digit-wise 0-9)
+        4. If navy jersey → adaptive threshold preprocessing + navy_specialist_v7
+        5. Grid scan for distant players not caught by player detector
+        6. Compose digits into target jersey number
 
         Returns list of {confidence, bbox, number_detected, layer} dicts.
         """
@@ -1195,17 +1307,12 @@ class RoboflowDetector:
                 logger.debug("v7 player crop error: %s", e)
 
         if not players:
-            # Fallback to v5 player detector
             players = self.detect_players_v5(frame, conf=0.25, validate_crop_size=True)
 
         if not players:
-            # Last fallback: v1 football player detector
             players = self.detect_football_players(frame, conf=0.25)
 
-        if not players:
-            return []
-
-        # Step 2: for each player crop, run v7 digit OCR
+        # Step 2: for each player crop, run multi-scale v7 digit OCR
         if self.football_jersey_ocr_v7_model is None:
             return []
 
@@ -1223,91 +1330,67 @@ class RoboflowDetector:
             if crop.size == 0:
                 continue
 
-            # Skip oversized crops (formations, not individuals)
             crop_h, crop_w = crop.shape[:2]
             if not self._is_valid_player_crop(crop_w, crop_h, frame_w, frame_h):
                 continue
 
-            # Upscale small crops for digit detection
+            # Multi-scale scanning: try 1x, 2x, 4x
+            # Larger scales help read digits on distant/small players
+            scales_to_try = [1]
+            if max(crop_h, crop_w) < 400:
+                scales_to_try.append(2)
             if max(crop_h, crop_w) < 200:
-                scale = max(2, 320 // max(crop_h, crop_w))
-                crop = cv2.resize(crop, (crop_w * scale, crop_h * scale), interpolation=cv2.INTER_CUBIC)
+                scales_to_try.append(4)
 
-            # Preprocess for dark jerseys
-            enhanced = self._preprocess(crop)
+            for scale in scales_to_try:
+                if scale > 1:
+                    scaled_crop = cv2.resize(
+                        crop, (crop_w * scale, crop_h * scale),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                else:
+                    scaled_crop = crop
 
-            # Run v7 OCR (digit-wise 0-9 detection)
-            digit_detections: list[tuple[int, float, list]] = []
-            try:
-                results = self.football_jersey_ocr_v7_model(enhanced, conf=conf, verbose=False)[0]
-                for box in results.boxes:
-                    cls_name = self.football_jersey_ocr_v7_model.names[int(box.cls)]
-                    digit = self._parse_number(cls_name)
-                    if digit is not None and 0 <= digit <= 9:
-                        digit_detections.append((digit, float(box.conf), box.xyxy[0].tolist()))
-            except Exception as e:
-                logger.debug("v7 football OCR error: %s", e)
+                scale_dets = self._run_ocr_on_crop(
+                    scaled_crop, conf, jersey_number, x1, y1,
+                )
+                if scale_dets:
+                    dets.extend(scale_dets)
+                    break  # Got detections at this scale, no need to try larger
 
-            # Also try navy specialist if available and jersey is dark
-            if self.navy_jersey_specialist_v7_model is not None and is_dark_color(self._request_jersey_color):
-                self._last_used["navy_jersey_specialist_v7_model"] = time.time()
-                try:
-                    navy_results = self.navy_jersey_specialist_v7_model(enhanced, conf=conf, verbose=False)[0]
-                    for box in navy_results.boxes:
-                        cls_name = self.navy_jersey_specialist_v7_model.names[int(box.cls)]
-                        digit = self._parse_number(cls_name)
-                        if digit is not None and 0 <= digit <= 9:
-                            digit_detections.append((digit, float(box.conf) * 0.95, box.xyxy[0].tolist()))
-                except Exception as e:
-                    logger.debug("v7 navy specialist error: %s", e)
-
-            if not digit_detections:
-                continue
-
-            # Compose digits into target jersey number
-            target_digits = [int(d) for d in str(jersey_number)]
-
-            if len(target_digits) == 1:
-                # Single digit jersey — direct match
-                for digit, digit_conf, bbox in digit_detections:
-                    if digit == target_digits[0]:
-                        dets.append({
-                            "confidence": digit_conf,
-                            "bbox": [bbox[0] + x1, bbox[1] + y1, bbox[2] + x1, bbox[3] + y1],
-                            "number_detected": jersey_number,
-                            "layer": "v7_football_ocr",
-                        })
-            elif len(target_digits) == 2:
-                # Two-digit jersey — find left-right digit pair
-                d1_matches = [(d, c, b) for d, c, b in digit_detections if d == target_digits[0]]
-                d2_matches = [(d, c, b) for d, c, b in digit_detections if d == target_digits[1]]
-                for d1, c1, b1 in d1_matches:
-                    for d2, c2, b2 in d2_matches:
-                        # d1 must be to the LEFT of d2
-                        d1_center_x = (b1[0] + b1[2]) / 2
-                        d2_center_x = (b2[0] + b2[2]) / 2
-                        if d1_center_x < d2_center_x:
-                            # Vertical overlap check — digits should be at similar height
-                            d1_center_y = (b1[1] + b1[3]) / 2
-                            d2_center_y = (b2[1] + b2[3]) / 2
-                            d1_h = b1[3] - b1[1]
-                            if abs(d1_center_y - d2_center_y) < d1_h * 0.5:
-                                combined_conf = min(c1, c2)
-                                combined_bbox = [
-                                    min(b1[0], b2[0]) + x1,
-                                    min(b1[1], b2[1]) + y1,
-                                    max(b1[2], b2[2]) + x1,
-                                    max(b1[3], b2[3]) + y1,
-                                ]
-                                dets.append({
-                                    "confidence": combined_conf,
-                                    "bbox": combined_bbox,
-                                    "number_detected": jersey_number,
-                                    "layer": "v7_football_ocr_composed",
-                                })
+        # Step 3: Grid scan for very distant players not caught by detector
+        # Divide frame into overlapping grid cells and scan each
+        if not dets and frame_h > 200 and frame_w > 200:
+            grid_cell_h = frame_h // 3
+            grid_cell_w = frame_w // 4
+            overlap = 0.25  # 25% overlap between cells
+            step_h = int(grid_cell_h * (1 - overlap))
+            step_w = int(grid_cell_w * (1 - overlap))
+            grid_dets_found = 0
+            for gy in range(0, frame_h - grid_cell_h + 1, step_h):
+                for gx in range(0, frame_w - grid_cell_w + 1, step_w):
+                    cell = frame[gy:gy + grid_cell_h, gx:gx + grid_cell_w]
+                    # Upscale grid cell 2x for better digit visibility
+                    cell_up = cv2.resize(
+                        cell,
+                        (grid_cell_w * 2, grid_cell_h * 2),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                    grid_dets = self._run_ocr_on_crop(
+                        cell_up, conf, jersey_number, gx, gy,
+                    )
+                    if grid_dets:
+                        dets.extend(grid_dets)
+                        grid_dets_found += len(grid_dets)
+            if grid_dets_found > 0:
+                logger.info("v7 grid scan found %d detections", grid_dets_found)
 
         self._track_model_call("football_jersey_ocr_v7", len(dets))
-        logger.info("v7 football OCR: %d detections for jersey #%s", len(dets), jersey_number)
+        # Track navy specialist separately for audit
+        if self.navy_jersey_specialist_v7_model is not None and is_dark_color(self._request_jersey_color):
+            navy_count = sum(1 for d in dets if "navy" in d.get("layer", ""))
+            self._track_model_call("navy_jersey_specialist_v7", navy_count)
+        logger.info("v7 football OCR: %d detections for jersey #%s (multi-scale + grid)", len(dets), jersey_number)
         return dets
 
     def detect_with_v3_primary(

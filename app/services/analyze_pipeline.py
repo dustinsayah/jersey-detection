@@ -2310,26 +2310,33 @@ async def _run_chunked_full_game(
         video_duration=video_duration,
     )
 
-    # ── Football clip splitting ──
-    if _is_football and clips:
+    # ── Sport-specific clip splitting (same logic as standard path) ──
+    import math as _math_c
+    from copy import copy as _copy_c
+    _CLIP_LEN_C = {"football": 4.0, "basketball": 4.0, "lacrosse": 5.0}
+    _MAX_CLIP_C = {"football": FOOTBALL_MAX_CLIP, "basketball": 12.0, "lacrosse": 15.0}
+    _sport_lc = sport.lower()
+    _target_c = _CLIP_LEN_C.get(_sport_lc, 5.0)
+    _max_c = _MAX_CLIP_C.get(_sport_lc, 15.0)
+    if clips:
         _split: list = []
         for clip in clips:
             dur = clip.end_time - clip.start_time
-            if dur > 7.5:
-                n_parts = max(2, int(dur / 5.0))
+            if dur > _target_c * 1.2:
+                n_parts = max(2, _math_c.ceil(dur / _target_c))
                 part_len = dur / n_parts
                 for i in range(n_parts):
-                    from copy import copy
-                    sub = copy(clip)
+                    sub = _copy_c(clip)
                     sub.start_time = round(clip.start_time + i * part_len, 1)
                     sub.end_time = round(clip.start_time + (i + 1) * part_len, 1)
                     sub.score = max(5, clip.score - i * 2)
                     _split.append(sub)
             else:
-                if dur > FOOTBALL_MAX_CLIP:
-                    clip.end_time = clip.start_time + FOOTBALL_MAX_CLIP
+                if dur > _max_c:
+                    clip.end_time = clip.start_time + _max_c
                 _split.append(clip)
         clips = _split
+        LOGGER.info("Chunked: %s clip split → %d clips (target=%.0fs)", _sport_lc, len(clips), _target_c)
 
     # ── Unload models ──
     try:

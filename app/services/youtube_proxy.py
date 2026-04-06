@@ -369,10 +369,12 @@ def _render_server_download(
                         LOGGER.info("%s: SUCCESS — %sMB (cloudinary)", strategy_name, file_mb)
                         return True
 
-        LOGGER.warning("%s: FAILED — render server returned %d: %s",
-                       strategy_name, resp.status_code, resp.text[:200])
+        LOGGER.warning("%s: FAILED — render server returned %d: %s (content-type=%s)",
+                       strategy_name, resp.status_code, resp.text[:300], resp.headers.get("content-type", ""))
+    except httpx.TimeoutException as exc:
+        LOGGER.warning("%s: TIMEOUT — %s", strategy_name, str(exc)[:200])
     except Exception as exc:
-        LOGGER.warning("%s: FAILED — %s", strategy_name, str(exc)[:200])
+        LOGGER.warning("%s: FAILED — %s: %s", strategy_name, type(exc).__name__, str(exc)[:200])
 
     return False
 
@@ -519,6 +521,17 @@ def download_youtube_sync(
         elif not _decodo_healthy:
             strategy_errors.append("0=decodo_proxy_unreachable")
             LOGGER.warning("Skipping all Decodo strategies — proxy unreachable")
+            # When Decodo is down, try render server FIRST (skip datacenter-blocked strategies)
+            if RENDER_SERVER_URL and not _total_expired():
+                LOGGER.info("Decodo down → trying render server early (before strategies 1-2)")
+                _render_timeout_early = 300 if _is_long_video else 120
+                with httpx.Client(timeout=httpx.Timeout(_render_timeout_early)) as _rs_client:
+                    if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary,
+                                               _rs_client, "Strategy 3-early (Decodo fallback)"):
+                        elapsed = round(time.perf_counter() - dl_start, 1)
+                        LOGGER.info("Sync downloaded in %ss via render server (Decodo fallback)", elapsed)
+                        return _make_result(output_path, sectioned=has_time_range, strategy="render_server_early")
+                strategy_errors.append("3-early=render_server_failed")
 
     # ── Strategy 1: yt-dlp android_vr + DASH H.264 + EJS (best quality) ──
     # android_vr client can list 720p/1080p DASH formats when EJS solver works.
@@ -551,6 +564,7 @@ def download_youtube_sync(
     # ── Strategy 3: Render server proxy ──
     # Render server receives startTime/endTime and returns pre-trimmed video.
     # Do NOT call _trim_video — that would seek to e.g. 120s in a 60s file.
+    # Use 120s timeout (Railway→Railway can be slow through edge proxy).
     if _total_expired():
         strategy_errors.append("3=total_timeout_skip")
         strategy_errors.append("4=total_timeout_skip")
@@ -563,7 +577,8 @@ def download_youtube_sync(
             f"Errors: {', '.join(strategy_errors)}. "
             f"Check Railway logs for per-strategy errors."
         )
-    with httpx.Client(timeout=httpx.Timeout(300 if _is_long_video else 60)) as client:
+    _render_timeout = 300 if _is_long_video else 120
+    with httpx.Client(timeout=httpx.Timeout(_render_timeout)) as client:
         if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
             elapsed = round(time.perf_counter() - dl_start, 1)
             LOGGER.info("Sync downloaded in %ss via Strategy 3 (render server)", elapsed)

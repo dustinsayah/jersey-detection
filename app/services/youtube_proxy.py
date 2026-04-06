@@ -516,7 +516,26 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
         return None
 
-    def _s0a_decodo_full_trim() -> DownloadResult | None:
+    def _s0a_decodo_muxed_sections() -> DownloadResult | None:
+        """Decodo muxed+EJS with --download-sections (360p but reliable).
+
+        Muxed = single pre-merged stream. No DASH video+audio merge needed,
+        so no ffmpeg HTTP requests, no reconnection issues. Only 360p but
+        reliable through the proxy. Uses subprocess so HTTP_PROXY is set.
+        """
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0a (Decodo muxed+EJS+sections)",
+                            format_override=_MUXED_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_ejs_sectioned")
+        return None
+
+    def _s0b_decodo_full_trim() -> DownloadResult | None:
         """Decodo DASH+EJS full download + ffmpeg trim.
 
         Downloads the ENTIRE video (may be 2+ hours) then trims with ffmpeg -c copy.
@@ -527,7 +546,7 @@ def download_youtube_sync(
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_decodo_full_timeout,
-                            strategy_name="Strategy 0a (Decodo DASH+EJS full+trim)",
+                            strategy_name="Strategy 0b (Decodo DASH+EJS full+trim)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy=decodo_proxy,
                             skip_sections=True, errors_detail=_errors_detail):
@@ -535,7 +554,7 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=False, strategy="decodo_dash_ejs_full_trim")
         return None
 
-    def _s0b_decodo_muxed() -> DownloadResult | None:
+    def _s0c_decodo_muxed_pylib() -> DownloadResult | None:
         """Decodo muxed fallback (360p) via Python lib, full download + trim.
 
         Uses _decodo_full_timeout since this downloads the entire video.
@@ -545,7 +564,7 @@ def download_youtube_sync(
             return None
         if _yt_dlp_python_download(url, output_path, client="android",
                                    start_time=0, end_time=0,
-                                   strategy_name="Strategy 0b (Decodo muxed full+trim)",
+                                   strategy_name="Strategy 0c (Decodo muxed pylib)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=decodo_proxy,
                                    timeout=_decodo_full_timeout, errors_detail=_errors_detail):
@@ -674,10 +693,12 @@ def download_youtube_sync(
         return None
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
+    # Order: DASH (720p) → muxed+sections (360p reliable) → full+trim → fallbacks
     strategies: list[tuple[str, callable]] = [
         ("decodo_dash_sections", _s0_decodo_sections),
-        ("decodo_dash_full_trim", _s0a_decodo_full_trim),
-        ("decodo_muxed_full_trim", _s0b_decodo_muxed),
+        ("decodo_muxed_sections", _s0a_decodo_muxed_sections),
+        ("decodo_dash_full_trim", _s0b_decodo_full_trim),
+        ("decodo_muxed_pylib", _s0c_decodo_muxed_pylib),
         ("render_server_early", _s_render_early),
         ("android_vr_dash_ejs", _s1_android_vr_dash),
         ("android_vr_dash_proxy", _s2_android_vr_proxy),

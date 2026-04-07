@@ -516,26 +516,38 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="decodo_dash_ejs_sectioned")
         return None
 
-    def _s0a_decodo_muxed_sections() -> DownloadResult | None:
-        """Decodo muxed+EJS with --download-sections (360p but reliable).
+    def _s0a_decodo_muxed_pylib_range() -> DownloadResult | None:
+        """Decodo muxed via Python lib + download_ranges (most reliable).
 
-        Muxed = single pre-merged stream. No DASH video+audio merge needed,
-        so no ffmpeg HTTP requests, no reconnection issues. Only 360p but
-        reliable through the proxy. Uses subprocess so HTTP_PROXY is set.
-        Try android_vr first, then android client as fallback.
+        Uses yt-dlp's OWN HTTP client (not ffmpeg) for downloading.
+        download_ranges cuts the video without ffmpeg during download.
+        No ffmpeg connection issues, no DASH merge, pure yt-dlp HTTP.
         """
         if not (decodo_proxy and _decodo_healthy):
             return None
-        # Try android_vr first (usually better quality options)
-        for _client in ["android_vr", "android"]:
-            if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                                client=_client, start_time=start_time, end_time=end_time,
-                                timeout=_decodo_sections_timeout,
-                                strategy_name=f"Strategy 0a (Decodo muxed+EJS+sections {_client})",
-                                format_override=_MUXED_FORMAT,
-                                use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
-                if _file_valid():
-                    return _make_result(output_path, sectioned=has_time_range, strategy=f"decodo_muxed_ejs_sectioned_{_client}")
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
+                                   start_time=start_time, end_time=end_time,
+                                   strategy_name="Strategy 0a (Decodo muxed pylib+range)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy=decodo_proxy,
+                                   timeout=_decodo_sections_timeout,
+                                   errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_pylib_range")
+        return None
+
+    def _s0a2_decodo_muxed_sections() -> DownloadResult | None:
+        """Decodo muxed+EJS with --download-sections (subprocess fallback)."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0a2 (Decodo muxed+EJS+sections)",
+                            format_override=_MUXED_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_muxed_ejs_sectioned")
         return None
 
     def _s0b_decodo_full_trim() -> DownloadResult | None:
@@ -706,10 +718,11 @@ def download_youtube_sync(
         return None
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
-    # Order: DASH (720p) → muxed+sections (360p reliable) → full+trim → fallbacks
+    # Order: DASH (720p) → muxed pylib (most reliable) → muxed subprocess → full+trim → fallbacks
     strategies: list[tuple[str, callable]] = [
         ("decodo_dash_sections", _s0_decodo_sections),
-        ("decodo_muxed_sections", _s0a_decodo_muxed_sections),
+        ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
+        ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
         ("decodo_dash_full_trim", _s0b_decodo_full_trim),
         ("decodo_muxed_pylib", _s0c_decodo_muxed_pylib),
         ("render_server_early", _s_render_early),

@@ -448,19 +448,20 @@ def download_youtube_sync(
     # Detect full game (long video) — increase timeouts
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
 
-    # Per-strategy timeout: 120s short clips, 900s full games
-    _strategy_timeout = 900 if _is_long_video else 120
+    # Per-strategy timeout: 60s for quick-try strategies (DASH, sections)
+    _strategy_timeout = 900 if _is_long_video else 60
 
     # Decodo sectioned timeout: only downloads the requested range
-    _decodo_sections_timeout = 900 if _is_long_video else 120
+    # Keep short since sections always invoke ffmpeg which fails through proxy
+    _decodo_sections_timeout = 900 if _is_long_video else 60
 
     # Decodo FULL download timeout: downloads the ENTIRE video then trims.
-    # Must be generous even for short time ranges since the source video
-    # may be 2+ hours. 600s = enough for ~2GB at 3MB/s residential speed.
-    _decodo_full_timeout = 900 if _is_long_video else 600
+    # Source video may be 2+ hours. At ~1MB/s residential proxy speed,
+    # a 555MB 360p muxed video takes ~555s. Allow 1200s for safety.
+    _decodo_full_timeout = 1200
 
-    # Overall timeout: 1500s full games, 900s short clips (allows ~7 strategies at 120s each)
-    _TOTAL_TIMEOUT = 1500 if _is_long_video else 900
+    # Overall timeout: generous for all videos since full download may be needed
+    _TOTAL_TIMEOUT = 1500
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start

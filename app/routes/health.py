@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v7.7.8",
+        "version": "v7.9.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v7.7.8",
+        "version": "v7.9.0",
     })
 
 
@@ -274,13 +274,22 @@ def health(request: Request) -> JSONResponse:
     decodo_pass = os.getenv("DECODO_PASSWORD", "").strip()
     decodo_configured = bool(decodo_user and decodo_pass)
 
+    # Check Cloudflare WARP proxy status
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 40000), timeout=2):
+            warp_running = True
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        warp_running = False
+
     return JSONResponse(
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v7.7.8",
+            "version": "v7.9.0",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
+            "warp_proxy_running": warp_running,
         },
     )
 
@@ -403,6 +412,60 @@ def test_proxy() -> JSONResponse:
         }
 
     return JSONResponse(status_code=200, content=results)
+
+
+@router.get("/test-warp")
+def test_warp() -> JSONResponse:
+    """Diagnostic: test Cloudflare WARP SOCKS5 proxy."""
+    import socket
+    import time
+    import httpx
+
+    results: dict = {}
+
+    # Test 1: Is wireproxy listening?
+    try:
+        with socket.create_connection(("127.0.0.1", 40000), timeout=2):
+            results["wireproxy_listening"] = True
+    except (ConnectionRefusedError, OSError, TimeoutError) as exc:
+        results["wireproxy_listening"] = False
+        results["wireproxy_error"] = str(exc)[:200]
+        return JSONResponse(status_code=200, content={**results, "status": "warp_not_running"})
+
+    # Test 2: Can we reach httpbin.org through WARP?
+    t = time.perf_counter()
+    try:
+        resp = httpx.get(
+            "https://httpbin.org/ip",
+            proxy="socks5://127.0.0.1:40000",
+            timeout=httpx.Timeout(15),
+        )
+        results["httpbin_test"] = {
+            "status": resp.status_code,
+            "body": resp.text[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+    except Exception as exc:
+        results["httpbin_test"] = {"error": str(exc)[:200]}
+
+    # Test 3: Can we reach YouTube through WARP?
+    t = time.perf_counter()
+    try:
+        resp = httpx.head(
+            "https://www.youtube.com/",
+            proxy="socks5://127.0.0.1:40000",
+            timeout=httpx.Timeout(15),
+            follow_redirects=True,
+        )
+        results["youtube_test"] = {
+            "status": resp.status_code,
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+    except Exception as exc:
+        results["youtube_test"] = {"error": str(exc)[:200]}
+
+    results["warp_wg_config_set"] = bool(os.getenv("WARP_WG_CONFIG", "").strip())
+    return JSONResponse(status_code=200, content={**results, "status": "warp_running"})
 
 
 @router.get("/test-v7")

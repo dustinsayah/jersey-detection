@@ -99,6 +99,205 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
         return 1, 900
 
 
+def _generate_clip_caption(
+    clip_dict: dict[str, Any],
+    sport: str,
+    position: str | None,
+    jersey_number: int,
+) -> str:
+    """Generate a coach-friendly caption for a clip.
+
+    Format: "QB #2 — Pass Play — High Motion — Crowd Reaction"
+    """
+    parts: list[str] = []
+
+    # Player identifier
+    pos_label = (position or "").upper()
+    if pos_label and clip_dict.get("jerseyNumberSeen"):
+        parts.append(f"{pos_label} #{clip_dict['jerseyNumberSeen']}")
+    elif clip_dict.get("jerseyNumberSeen"):
+        parts.append(f"#{clip_dict['jerseyNumberSeen']}")
+    elif pos_label:
+        parts.append(pos_label)
+
+    # Play type — prefer v4 outcome over generic playType
+    v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
+    play_label = clip_dict.get("description") or clip_dict.get("playType", "Game Action")
+    if v4 and v4 != "game_action":
+        parts.append(v4.replace("_", " ").title())
+    else:
+        parts.append(play_label.replace("_", " ").title())
+
+    # Rule-based play type supplement (adds detail v4 models may miss)
+    signals = clip_dict.get("signals") or {}
+    pose = signals.get("pose", "standing")
+    motion = signals.get("motion", 0) or 0
+    crowd = signals.get("crowd", 0) or 0
+    audio = signals.get("audio")
+
+    if pose == "throwing" and motion > 50 and "throw" not in (v4 or "").lower() and "pass" not in (v4 or "").lower():
+        parts.append("Pass Attempt")
+    elif pose == "running" and motion > 70 and "scramble" not in (v4 or "").lower():
+        parts.append("Scramble")
+
+    # Motion level
+    if motion > 70:
+        parts.append("High Motion")
+    elif motion > 40:
+        parts.append("Active")
+
+    # Crowd energy
+    if crowd > 0.5:
+        parts.append("Crowd Reaction")
+    elif crowd > 0.3:
+        parts.append("Crowd Energy")
+
+    # Audio context
+    if audio and "whistle" in str(audio).lower():
+        parts.append("Whistle")
+
+    return " — ".join(parts) if parts else "Game Action"
+
+
+def _compute_recruiting_score(
+    clip_dict: dict[str, Any],
+    sport: str,
+    position: str | None,
+) -> int:
+    """Compute a 0-100 recruiting score for how impressive a clip looks to a college coach."""
+    score = 0
+
+    # Base score from grade
+    grade = clip_dict.get("grade", "Decent")
+    if grade == "Elite":
+        score = 80
+    elif grade == "Strong":
+        score = 60
+    elif grade == "Decent":
+        score = 40
+    else:
+        score = 20
+
+    # Jersey visibility confirmed
+    if clip_dict.get("jerseyVisible"):
+        score += 10
+
+    # v4 outcome boosts
+    v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
+    if v4:
+        if v4 in ("touchdown", "made_shot", "goal"):
+            score += 20
+        elif v4 in ("completion", "sack", "qb_scramble", "reception_yac"):
+            score += 10
+
+    # Crowd reaction
+    crowd = (clip_dict.get("signals") or {}).get("crowd", 0)
+    if crowd and crowd > 0.5:
+        score += 10
+
+    # Position confirmed
+    if position:
+        score += 5
+
+    # High motion
+    motion = (clip_dict.get("signals") or {}).get("motion", 0)
+    if motion and motion > 70:
+        score += 5
+
+    return min(100, score)
+
+
+# ── Highlight reel ordering priority ──────────────────────────────────
+# Maps play_type and v4_outcome to a coach-priority order.
+# Lower number = shown first in the reel. Touchdowns first, etc.
+_HIGHLIGHT_PRIORITY: dict[str, int] = {
+    # Scoring plays — coaches want to see these first
+    "touchdown": 1,
+    "made_shot": 1,
+    "goal": 1,
+    # Big throws / completions
+    "pass_play": 2,
+    "completion": 2,
+    "reception_yac": 2,
+    # QB scrambles / athletic plays
+    "qb_scramble": 3,
+    "sack": 3,
+    "drive": 3,
+    "fast_break": 3,
+    # Standard plays
+    "game_action": 4,
+    "rebound": 4,
+    "ground_ball": 4,
+    # Low-priority
+    "crowd_energy": 5,
+    "dead_ball": 6,
+}
+
+
+def _get_highlight_sort_key(clip_dict: dict[str, Any]) -> tuple[int, int]:
+    """Return (priority_tier, -recruitingScore) for coach-friendly sort order.
+
+    Primary sort: play type priority (TDs first, then big throws, etc.)
+    Secondary sort: recruiting score descending within each tier.
+    """
+    v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
+    play_type = clip_dict.get("playType", "game_action")
+    # Use v4 outcome if available, else fall back to playType
+    key = v4 if v4 else play_type
+    tier = _HIGHLIGHT_PRIORITY.get(key, 4)
+    return (tier, -clip_dict.get("recruitingScore", 0))
+
+
+def _estimate_game_quarter(
+    clip_start_time: float,
+    video_duration: float,
+    sport: str,
+) -> str:
+    """Estimate which quarter/half a clip falls in based on video timestamp.
+
+    Football: ~3 hours total → 4 quarters of ~45 min each
+    Basketball: ~2 hours total → 4 quarters of ~30 min each
+    Lacrosse: ~2 hours total → 4 quarters of ~30 min each
+    """
+    if video_duration <= 0:
+        return "unknown"
+
+    fraction = clip_start_time / video_duration
+    sport_lower = sport.lower()
+
+    if sport_lower == "football":
+        # Football: 4 quarters, halftime at ~50% of video
+        if fraction < 0.25:
+            return "1st Quarter"
+        elif fraction < 0.50:
+            return "2nd Quarter"
+        elif fraction < 0.55:
+            return "Halftime"
+        elif fraction < 0.78:
+            return "3rd Quarter"
+        else:
+            return "4th Quarter"
+    elif sport_lower == "basketball":
+        if fraction < 0.25:
+            return "1st Quarter"
+        elif fraction < 0.50:
+            return "2nd Quarter"
+        elif fraction < 0.75:
+            return "3rd Quarter"
+        else:
+            return "4th Quarter"
+    elif sport_lower == "lacrosse":
+        if fraction < 0.25:
+            return "1st Quarter"
+        elif fraction < 0.50:
+            return "2nd Quarter"
+        elif fraction < 0.75:
+            return "3rd Quarter"
+        else:
+            return "4th Quarter"
+    return "unknown"
+
+
 def _force_cleanup_memory():
     """Force cleanup of ALL loaded models and caches to reclaim memory.
 
@@ -1834,7 +2033,14 @@ async def _run_analyze_pipeline_impl(
                 if clip.start_time - 1 <= det.get("timestamp", 0) <= clip.end_time + 1:
                     clip_layers.add(det.get("layer", "unknown"))
             clip_dict["detectionLayers"] = sorted(clip_layers)
+            # Caption + recruiting score + game clock for coach-friendly display
+            clip_dict["caption"] = _generate_clip_caption(clip_dict, sport, position, jersey_number)
+            clip_dict["recruitingScore"] = _compute_recruiting_score(clip_dict, sport, position)
+            clip_dict["estimatedQuarter"] = _estimate_game_quarter(clip.start_time, video_duration, sport)
             clips_out.append(clip_dict)
+
+        # Sort clips in highlight reel order (TDs first, then big plays, etc.)
+        clips_out.sort(key=_get_highlight_sort_key)
 
         # ── Build debug field ──────────────────────────────────────────
         ali_working = ali_status == "working"
@@ -2398,7 +2604,18 @@ async def _run_chunked_full_game(
             "description": clip.description,
             "signals": clip.signals,
         }
+        # Include v4_outcome from signals if present
+        v4_out = (clip.signals or {}).get("v4_outcome")
+        if v4_out:
+            clip_dict["v4Outcome"] = v4_out
+        # Caption + recruiting score + game clock for coach-friendly display
+        clip_dict["caption"] = _generate_clip_caption(clip_dict, sport, position, jersey_number)
+        clip_dict["recruitingScore"] = _compute_recruiting_score(clip_dict, sport, position)
+        clip_dict["estimatedQuarter"] = _estimate_game_quarter(clip.start_time, video_duration, sport)
         clips_out.append(clip_dict)
+
+    # Sort clips in highlight reel order (TDs first, then big plays, etc.)
+    clips_out.sort(key=_get_highlight_sort_key)
 
     # Get primary detection layer
     try:

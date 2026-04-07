@@ -1,17 +1,28 @@
-# YouTube download proxy — 9-strategy robust download chain
+# YouTube download proxy — 16-strategy robust download chain
 #
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
 # also REQUIRED to unlock any DASH formats. Strategy order:
-#   0. Decodo residential proxy (DECODO_USERNAME + DECODO_PASSWORD env vars)
-#   0b. Decodo residential proxy muxed fallback
-#   1. yt-dlp android_vr + DASH H.264 + EJS (720p+ if IP not blocked)
-#   2. yt-dlp android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY set)
-#   3. Render server proxy
-#   4. yt-dlp android muxed (360p fallback)
-#   5. yt-dlp Python lib android_vr + DASH
-#   6. yt-dlp android muxed no-EJS (last resort)
-#   7. Render server /extract-frames
+#   C0. Cookie-authenticated DASH (FREE, no proxy — if youtube_cookies.txt has auth)
+#   C1. Cookie-authenticated muxed fallback
+#   W0. WARP SOCKS5 + DASH H.264 + EJS (FREE — wireproxy on port 40000)
+#   W1. WARP SOCKS5 + muxed fallback (FREE)
+#   0.  Decodo residential proxy DASH (PAID)
+#   0a-0c. Decodo muxed/range/full fallbacks
+#   1.  yt-dlp android_vr + DASH H.264 + EJS (720p+ if IP not blocked)
+#   2.  yt-dlp android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY set)
+#   3.  Render server proxy
+#   4.  yt-dlp android muxed (360p fallback)
+#   5.  yt-dlp Python lib android_vr + DASH
+#   6.  yt-dlp android muxed no-EJS (last resort)
+#   7.  Render server /extract-frames
+#
+# Cookie notes (researched Apr 2026):
+#   - Chrome 127+ has app-bound encryption — can't extract Chrome cookies
+#   - Use Firefox for cookie export (plain SQLite, no encryption)
+#   - Cookies expire in 3-5 days (must refresh from Firefox)
+#   - Piped/Invidious/Cobalt are all dead as of 2026
+#   - Decodo residential proxy remains the most reliable approach
 
 from __future__ import annotations
 
@@ -81,6 +92,18 @@ def _get_cookie_file() -> str:
 
 def _get_proxy() -> str:
     return os.getenv("YT_DLP_PROXY", "").strip()
+
+# Cloudflare WARP SOCKS5 proxy — wireproxy listens on port 40000
+_WARP_PROXY = "socks5://127.0.0.1:40000"
+
+def _is_warp_running() -> bool:
+    """Check if wireproxy WARP SOCKS5 proxy is listening on port 40000."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 40000), timeout=2):
+            return True
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        return False
 
 _YT_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/live/)([A-Za-z0-9_-]{11})"
@@ -482,6 +505,12 @@ def download_youtube_sync(
         """Check output file exists and is large enough."""
         return output_path.exists() and output_path.stat().st_size > _MIN_FILE_SIZE
 
+    # ── Cookie file detection ─────────────────────────────────────────
+    cookie_file = _get_cookie_file()
+    _has_cookies = bool(cookie_file)
+    if _has_cookies:
+        LOGGER.info("YouTube cookies found at %s — will try cookie-first strategies", cookie_file)
+
     # ── Decodo proxy setup ──────────────────────────────────────────────
     # NOTE: No health probe. The probe was too fragile — a single transient
     # failure (IP rotation, timeout, rate limit) would skip ALL Decodo strategies.
@@ -498,6 +527,40 @@ def download_youtube_sync(
     _errors_detail: dict[str, str] = {}
 
     # ── Strategy functions — each returns DownloadResult | None ───────────
+
+    def _s_cookies_dash() -> DownloadResult | None:
+        """Cookie-authenticated DASH H.264 (720p+ without proxy).
+
+        If valid YouTube Premium/login cookies are present, this bypasses
+        datacenter IP blocks entirely. FREE — no Decodo bandwidth used.
+        Cookies expire every 3-5 days and must be refreshed from Firefox.
+        """
+        if not _has_cookies:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy C0 (Cookies DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy="", errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="cookies_dash_ejs")
+        return None
+
+    def _s_cookies_muxed() -> DownloadResult | None:
+        """Cookie-authenticated muxed fallback (360p, no proxy needed)."""
+        if not _has_cookies:
+            return None
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
+                                   start_time=start_time, end_time=end_time,
+                                   strategy_name="Strategy C1 (Cookies muxed pylib)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy="",
+                                   timeout=_strategy_timeout,
+                                   errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="cookies_muxed_pylib")
+        return None
 
     def _s0_decodo_sections() -> DownloadResult | None:
         """Decodo DASH+EJS with --download-sections (ideal: fast + 720p).
@@ -602,6 +665,43 @@ def download_youtube_sync(
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
                 return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib_full_trim")
+        return None
+
+    # ── Cloudflare WARP strategies ─────────────────────────────────────
+    # WARP routes through Cloudflare's consumer VPN network (millions of users),
+    # so YouTube treats WARP IPs as residential — FREE 720p from datacenter.
+    _warp_available = _is_warp_running()
+    if _warp_available:
+        LOGGER.info("WARP proxy detected on %s — will try WARP strategies", _WARP_PROXY)
+
+    def _s_warp_dash() -> DownloadResult | None:
+        """WARP SOCKS5 + DASH H.264 + EJS — FREE 720p via Cloudflare network."""
+        if not _warp_available:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_vr", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy W0 (WARP DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_WARP_PROXY, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_dash_ejs")
+        return None
+
+    def _s_warp_muxed_pylib() -> DownloadResult | None:
+        """WARP SOCKS5 + muxed via Python lib — full download + trim."""
+        if not _warp_available:
+            return None
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
+                                   start_time=0, end_time=0,
+                                   strategy_name="Strategy W1 (WARP muxed pylib)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy=_WARP_PROXY,
+                                   timeout=_strategy_timeout, errors_detail=_errors_detail):
+            if has_time_range:
+                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            if _file_valid():
+                return _make_result(output_path, sectioned=False, strategy="warp_muxed_pylib")
         return None
 
     def _s_render_early() -> DownloadResult | None:
@@ -723,15 +823,21 @@ def download_youtube_sync(
         return None
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
-    # Order:
-    #   1. DASH sections (fast, 720p — will fail if ffmpeg can't hold proxy connection)
-    #   2. Muxed full download via Python lib (RELIABLE — no ffmpeg during download)
-    #   3. Muxed pylib+range and muxed sections (use ffmpeg internally — often fail)
-    #   4. DASH full download + trim
-    #   5. Render server + datacenter fallbacks
+    # Order (Apr 2026):
+    #   C0-C1. Cookie-authenticated (FREE — if cookies file has YouTube auth)
+    #   W0-W1. Cloudflare WARP SOCKS5 (FREE — wireproxy on port 40000)
+    #   0-0c.  Decodo residential proxy (PAID — reliable 720p)
+    #   1-7.   Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
+        # Cookie-first: FREE, no proxy — try if cookies file has valid YouTube auth
+        ("cookies_dash_ejs", _s_cookies_dash),
+        ("cookies_muxed_pylib", _s_cookies_muxed),
+        # WARP: FREE — routes through Cloudflare's consumer VPN, YouTube treats as residential
+        ("warp_dash_ejs", _s_warp_dash),
+        ("warp_muxed_pylib", _s_warp_muxed_pylib),
+        # Decodo residential proxy — paid but reliable
         ("decodo_dash_sections", _s0_decodo_sections),
-        ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),  # ← moved up: only reliable Decodo path
+        ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
         ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
         ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
         ("decodo_dash_full_trim", _s0b_decodo_full_trim),

@@ -576,27 +576,30 @@ def download_youtube_sync(
         return None
 
     def _s0c_decodo_muxed_pylib() -> DownloadResult | None:
-        """Decodo muxed fallback (360p) via Python lib, full download + trim.
+        """Decodo muxed via Python lib — full download + local trim.
 
-        SKIP for short time ranges — only for full-game requests.
+        KEY INSIGHT: This is the ONLY strategy that avoids ffmpeg during download.
+        - Muxed format = single pre-merged file, no DASH video+audio merge
+        - No download_ranges = no ffmpeg section cutting during download
+        - yt-dlp Python lib = uses its own HTTP client, not ffmpeg subprocess
+        - After download completes, trim with ffmpeg on LOCAL file (no proxy)
+
+        This downloads the ENTIRE video (may be 2+ hours) even for short clips,
+        but it's the only reliable path when Decodo proxy drops ffmpeg connections.
+        360p muxed at ~500MB/2hr takes ~170s at 3MB/s residential.
         """
         if not (decodo_proxy and _decodo_healthy):
             return None
-        # Skip full-download for short clips
-        _requested_range = (end_time - start_time) if end_time > start_time else 0
-        if _requested_range > 0 and _requested_range < 1800:
-            LOGGER.info("Strategy 0c: SKIP — short range (%.0fs)", _requested_range)
-            return None
-        if _yt_dlp_python_download(url, output_path, client="android",
+        if _yt_dlp_python_download(url, output_path, client="android_vr",
                                    start_time=0, end_time=0,
-                                   strategy_name="Strategy 0c (Decodo muxed pylib)",
+                                   strategy_name="Strategy 0c (Decodo muxed pylib full+trim)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=decodo_proxy,
                                    timeout=_decodo_full_timeout, errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib")
+                return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib_full_trim")
         return None
 
     def _s_render_early() -> DownloadResult | None:
@@ -718,13 +721,18 @@ def download_youtube_sync(
         return None
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
-    # Order: DASH (720p) → muxed pylib (most reliable) → muxed subprocess → full+trim → fallbacks
+    # Order:
+    #   1. DASH sections (fast, 720p — will fail if ffmpeg can't hold proxy connection)
+    #   2. Muxed full download via Python lib (RELIABLE — no ffmpeg during download)
+    #   3. Muxed pylib+range and muxed sections (use ffmpeg internally — often fail)
+    #   4. DASH full download + trim
+    #   5. Render server + datacenter fallbacks
     strategies: list[tuple[str, callable]] = [
         ("decodo_dash_sections", _s0_decodo_sections),
+        ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),  # ← moved up: only reliable Decodo path
         ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
         ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
         ("decodo_dash_full_trim", _s0b_decodo_full_trim),
-        ("decodo_muxed_pylib", _s0c_decodo_muxed_pylib),
         ("render_server_early", _s_render_early),
         ("android_vr_dash_ejs", _s1_android_vr_dash),
         ("android_vr_dash_proxy", _s2_android_vr_proxy),

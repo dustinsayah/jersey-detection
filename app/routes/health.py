@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v7.7.7",
+        "version": "v7.7.8",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v7.7.7",
+        "version": "v7.7.8",
     })
 
 
@@ -278,7 +278,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v7.7.7",
+            "version": "v7.7.8",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
         },
@@ -315,6 +315,94 @@ def ready(request: Request) -> JSONResponse:
             "phases": phases,
         },
     )
+
+
+@router.get("/test-proxy")
+def test_proxy() -> JSONResponse:
+    """Diagnostic: test Decodo proxy connection independently."""
+    import httpx
+    import time
+    from urllib.parse import quote
+
+    user = os.getenv("DECODO_USERNAME", "").strip()
+    passwd = os.getenv("DECODO_PASSWORD", "").strip()
+    results: dict = {
+        "username_set": bool(user),
+        "password_set": bool(passwd),
+        "username_preview": user[:4] + "..." if user else "",
+        "password_len": len(passwd),
+    }
+
+    if not (user and passwd):
+        return JSONResponse(status_code=200, content={**results, "status": "not_configured"})
+
+    encoded_user = quote(user, safe="")
+    encoded_passwd = quote(passwd, safe="")
+    results["username_encoded"] = encoded_user[:4] + "..."
+    results["encoding_changed"] = (user != encoded_user or passwd != encoded_passwd)
+
+    # Test 1: URL-encoded proxy
+    proxy_url = f"http://{encoded_user}:{encoded_passwd}@gate.decodo.com:10001"
+    t = time.perf_counter()
+    try:
+        resp = httpx.get(
+            "https://httpbin.org/ip",
+            proxy=proxy_url,
+            timeout=httpx.Timeout(20),
+            follow_redirects=True,
+        )
+        results["test_encoded"] = {
+            "status": resp.status_code,
+            "body": resp.text[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+    except Exception as exc:
+        results["test_encoded"] = {
+            "error": str(exc)[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+
+    # Test 2: Raw (non-encoded) proxy
+    raw_proxy_url = f"http://{user}:{passwd}@gate.decodo.com:10001"
+    t = time.perf_counter()
+    try:
+        resp = httpx.get(
+            "https://httpbin.org/ip",
+            proxy=raw_proxy_url,
+            timeout=httpx.Timeout(20),
+            follow_redirects=True,
+        )
+        results["test_raw"] = {
+            "status": resp.status_code,
+            "body": resp.text[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+    except Exception as exc:
+        results["test_raw"] = {
+            "error": str(exc)[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+
+    # Test 3: YouTube via encoded proxy
+    t = time.perf_counter()
+    try:
+        resp = httpx.head(
+            "https://www.youtube.com/",
+            proxy=proxy_url,
+            timeout=httpx.Timeout(20),
+            follow_redirects=True,
+        )
+        results["test_youtube"] = {
+            "status": resp.status_code,
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+    except Exception as exc:
+        results["test_youtube"] = {
+            "error": str(exc)[:200],
+            "elapsed_ms": round((time.perf_counter() - t) * 1000),
+        }
+
+    return JSONResponse(status_code=200, content=results)
 
 
 @router.get("/test-v7")

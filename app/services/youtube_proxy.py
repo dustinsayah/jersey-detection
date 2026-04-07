@@ -51,11 +51,19 @@ def _get_decodo_proxy() -> str:
 
     Returns proxy URL like http://USERNAME:PASSWORD@gate.decodo.com:10001
     or empty string if not configured.
+
+    Credentials are URL-encoded to handle special characters (@ # $ : etc.)
+    that would otherwise break the proxy URL parsing.
     """
+    from urllib.parse import quote
     user = os.getenv("DECODO_USERNAME", "").strip()
     passwd = os.getenv("DECODO_PASSWORD", "").strip()
     if user and passwd:
-        return f"http://{user}:{passwd}@gate.decodo.com:10001"
+        encoded_user = quote(user, safe="")
+        encoded_passwd = quote(passwd, safe="")
+        proxy_url = f"http://{encoded_user}:{encoded_passwd}@gate.decodo.com:10001"
+        LOGGER.info("Decodo proxy: user=%s (encoded=%s), url_len=%d", user[:4] + "...", encoded_user[:4] + "...", len(proxy_url))
+        return proxy_url
     return ""
 
 # Optional proxy for yt-dlp — set to residential proxy or Cloudflare WARP SOCKS5

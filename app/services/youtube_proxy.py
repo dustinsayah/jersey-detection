@@ -474,22 +474,15 @@ def download_youtube_sync(
         """Check output file exists and is large enough."""
         return output_path.exists() and output_path.stat().st_size > _MIN_FILE_SIZE
 
-    # ── Decodo proxy setup + health check ────────────────────────────────
+    # ── Decodo proxy setup ──────────────────────────────────────────────
+    # NOTE: No health probe. The probe was too fragile — a single transient
+    # failure (IP rotation, timeout, rate limit) would skip ALL Decodo strategies.
+    # Instead, always try Decodo if configured. Let the actual download attempt
+    # be the test. Each strategy has its own timeout and error handling.
     decodo_proxy = _get_decodo_proxy()
-    _decodo_healthy = False
+    _decodo_healthy = bool(decodo_proxy)  # Trust config, skip fragile probe
     if decodo_proxy:
-        try:
-            _probe_resp = httpx.head(
-                "https://www.youtube.com/",
-                proxy=decodo_proxy,
-                timeout=httpx.Timeout(15),
-                follow_redirects=True,
-            )
-            _decodo_healthy = _probe_resp.status_code < 400
-            LOGGER.info("Decodo YouTube probe: %s (status=%d)", "OK" if _decodo_healthy else "FAIL", _probe_resp.status_code)
-        except Exception as exc:
-            LOGGER.warning("Decodo YouTube probe failed: %s", str(exc)[:100])
-            _decodo_healthy = False
+        LOGGER.info("Decodo proxy configured — will attempt download strategies")
 
     proxy = _get_proxy()
 
@@ -604,9 +597,9 @@ def download_youtube_sync(
         return None
 
     def _s_render_early() -> DownloadResult | None:
-        """Render server early — used when Decodo is unreachable."""
-        if not (decodo_proxy and not _decodo_healthy):
-            return None
+        """Render server early — used when Decodo is not configured."""
+        if decodo_proxy:
+            return None  # Decodo is configured, skip early render server
         if not RENDER_SERVER_URL:
             return None
         _render_timeout_early = 300 if _is_long_video else 120

@@ -81,7 +81,7 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
 RUN mkdir -p /app/app/model
 
 # Cache bust for code changes (update this on each deploy)
-ARG CACHE_BUST=v8.0.0
+ARG CACHE_BUST=v8.1.0
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

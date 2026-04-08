@@ -1252,7 +1252,7 @@ class RoboflowDetector:
                         d2_center_y = (b2[1] + b2[3]) / 2
                         d1_h = b1[3] - b1[1]
                         if abs(d1_center_y - d2_center_y) < d1_h * 0.5:
-                            combined_conf = min(c1, c2)
+                            combined_conf = (c1 + c2) / 2  # avg, not min — less punishing
                             combined_bbox = [
                                 min(b1[0], b2[0]) + x1,
                                 min(b1[1], b2[1]) + y1,
@@ -1272,7 +1272,7 @@ class RoboflowDetector:
         self,
         frame: np.ndarray,
         jersey_number: int,
-        conf: float = 0.15,
+        conf: float = 0.08,
     ) -> list[dict]:
         """Run v7 football-specialist OCR pipeline with multi-scale scanning.
 
@@ -1334,29 +1334,57 @@ class RoboflowDetector:
             if not self._is_valid_player_crop(crop_w, crop_h, frame_w, frame_h):
                 continue
 
-            # Multi-scale scanning: try 1x, 2x, 4x
-            # Larger scales help read digits on distant/small players
-            scales_to_try = [1]
-            if max(crop_h, crop_w) < 400:
-                scales_to_try.append(2)
-            if max(crop_h, crop_w) < 200:
-                scales_to_try.append(4)
+            # Torso-focused crop: jersey numbers are in the middle 50% of
+            # the player body. Removing head (top 15%) and legs (bottom 35%)
+            # dramatically reduces noise for OCR. (CVPR 2024 best practice)
+            torso_y1 = int(crop_h * 0.15)
+            torso_y2 = int(crop_h * 0.65)
+            torso_crop = crop[torso_y1:torso_y2, :]
+            player_found = False
 
-            for scale in scales_to_try:
-                if scale > 1:
-                    scaled_crop = cv2.resize(
-                        crop, (crop_w * scale, crop_h * scale),
-                        interpolation=cv2.INTER_CUBIC,
+            # Try torso crop first (higher accuracy), then fall back to full crop
+            crops_to_try = []
+            if torso_crop.size > 0 and torso_crop.shape[0] >= 15:
+                crops_to_try.append(("torso", torso_crop, x1, y1 + torso_y1))
+            crops_to_try.append(("full", crop, x1, y1))
+
+            for crop_name, scan_crop, cx1, cy1 in crops_to_try:
+                if player_found:
+                    break
+                sc_h, sc_w = scan_crop.shape[:2]
+
+                # Multi-scale scanning: try 1x, SR/2x, 4x
+                scales_to_try = [1]
+                if max(sc_h, sc_w) < 400:
+                    scales_to_try.append(2)
+                if max(sc_h, sc_w) < 200:
+                    scales_to_try.append(4)
+
+                for scale in scales_to_try:
+                    if scale > 1:
+                        if scale <= 4 and max(sc_h, sc_w) <= 200 and self._jersey_upscaler is not None:
+                            try:
+                                scaled_crop = self._jersey_upscaler.upscale(scan_crop)
+                            except Exception:
+                                scaled_crop = cv2.resize(
+                                    scan_crop, (sc_w * scale, sc_h * scale),
+                                    interpolation=cv2.INTER_CUBIC,
+                                )
+                        else:
+                            scaled_crop = cv2.resize(
+                                scan_crop, (sc_w * scale, sc_h * scale),
+                                interpolation=cv2.INTER_CUBIC,
+                            )
+                    else:
+                        scaled_crop = scan_crop
+
+                    scale_dets = self._run_ocr_on_crop(
+                        scaled_crop, conf, jersey_number, cx1, cy1,
                     )
-                else:
-                    scaled_crop = crop
-
-                scale_dets = self._run_ocr_on_crop(
-                    scaled_crop, conf, jersey_number, x1, y1,
-                )
-                if scale_dets:
-                    dets.extend(scale_dets)
-                    break  # Got detections at this scale, no need to try larger
+                    if scale_dets:
+                        dets.extend(scale_dets)
+                        player_found = True
+                        break
 
         # Step 3: Grid scan for very distant players not caught by detector
         # Divide frame into overlapping grid cells and scan each
@@ -1370,12 +1398,14 @@ class RoboflowDetector:
             for gy in range(0, frame_h - grid_cell_h + 1, step_h):
                 for gx in range(0, frame_w - grid_cell_w + 1, step_w):
                     cell = frame[gy:gy + grid_cell_h, gx:gx + grid_cell_w]
-                    # Upscale grid cell 2x for better digit visibility
-                    cell_up = cv2.resize(
-                        cell,
-                        (grid_cell_w * 2, grid_cell_h * 2),
-                        interpolation=cv2.INTER_CUBIC,
-                    )
+                    # Upscale grid cell — SR if available, else bicubic 2x
+                    if max(grid_cell_h, grid_cell_w) <= 200 and self._jersey_upscaler is not None:
+                        try:
+                            cell_up = self._jersey_upscaler.upscale(cell)
+                        except Exception:
+                            cell_up = cv2.resize(cell, (grid_cell_w * 2, grid_cell_h * 2), interpolation=cv2.INTER_CUBIC)
+                    else:
+                        cell_up = cv2.resize(cell, (grid_cell_w * 2, grid_cell_h * 2), interpolation=cv2.INTER_CUBIC)
                     grid_dets = self._run_ocr_on_crop(
                         cell_up, conf, jersey_number, gx, gy,
                     )

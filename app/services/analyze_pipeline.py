@@ -54,7 +54,7 @@ from app.services.youtube_proxy import (
 LOGGER = logging.getLogger(__name__)
 
 # Football-specific overrides
-FOOTBALL_CONF_THRESHOLD = 0.15  # Lower than default 0.35
+FOOTBALL_CONF_THRESHOLD = 0.08  # Lower for better recall on 720p crops
 FOOTBALL_MIN_CLIP = 3.0
 FOOTBALL_MAX_CLIP = 12.0
 
@@ -1855,8 +1855,8 @@ async def _run_analyze_pipeline_impl(
                     detection_points.append(DetectionPoint(
                         timestamp=t,
                         confidence=conf,
-                        jersey_visible=True,  # Inferred from OCR match elsewhere
-                        jersey_number=jersey_number,
+                        jersey_visible=False,  # Motion-inferred, NOT confirmed by OCR
+                        jersey_number=None,    # Don't stamp requested number on unconfirmed frames
                         motion_score=motion,
                         pose_action=pose.get("action", "standing"),
                         crowd_energy=_get_crowd_energy(audio_result, t),
@@ -1868,37 +1868,65 @@ async def _run_analyze_pipeline_impl(
 
         # If jersey detection found nothing, generate detection points from motion/audio
         if not detection_points and _frame_timestamps:
-            # Football: very low threshold (10) — each motion burst is likely a play
-            # Other sports: moderate threshold (30)
+            # Football: use play segmentation first, then fallback to threshold
             is_football = sport.lower() == "football"
-            motion_threshold = 10 if is_football else 30
-            LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d, sport=%s)", motion_threshold, sport)
-            for t in _frame_timestamps:
-                motion = motion_scores.get(t, 0)
-                in_boundary = _in_audio_boundary(audio_result, t)
-                if motion > motion_threshold or in_boundary:
-                    pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
-                    # Higher cap (0.7) + audio boundary bonus (0.15) to push
-                    # above the 50-point "Cut" threshold in clip_extractor
-                    conf = motion / 100.0 * 0.7
-                    if in_boundary:
-                        conf = min(1.0, conf + 0.15)
-                    # Check for v4 outcome even in fallback mode
-                    fallback_v4 = ""
-                    if v4_outcomes_by_ts:
-                        for ts_key, outcome in v4_outcomes_by_ts.items():
-                            if abs(ts_key - t) < 2.0:
-                                fallback_v4 = outcome
-                                break
-                    detection_points.append(DetectionPoint(
-                        timestamp=t,
-                        confidence=conf,
-                        jersey_visible=False,
-                        motion_score=motion,
-                        pose_action=pose.get("action", "standing"),
-                        crowd_energy=_get_crowd_energy(audio_result, t),
-                        v4_outcome=fallback_v4,
-                    ))
+
+            # Try motion-based play segmentation for football
+            if is_football and motion_scores:
+                from app.services.clip_extractor import segment_plays_from_motion
+                play_segments = segment_plays_from_motion(motion_scores, sport)
+                if play_segments:
+                    LOGGER.info("Pipeline: football play segmentation found %d plays", len(play_segments))
+                    for seg_start, seg_end in play_segments:
+                        seg_mid = (seg_start + seg_end) / 2
+                        # Get peak motion in this play segment
+                        seg_motions = [
+                            motion_scores.get(t, 0) for t in _frame_timestamps
+                            if seg_start <= t <= seg_end
+                        ]
+                        peak_motion = max(seg_motions) if seg_motions else 0
+                        avg_motion = sum(seg_motions) / len(seg_motions) if seg_motions else 0
+                        pose = pose_results.get(seg_mid, _nearest_pose(pose_results, seg_mid)) if pose_results else {}
+                        in_boundary = _in_audio_boundary(audio_result, seg_mid)
+                        conf = min(0.9, peak_motion / 100.0 * 0.8)
+                        if in_boundary:
+                            conf = min(1.0, conf + 0.15)
+                        detection_points.append(DetectionPoint(
+                            timestamp=seg_mid,
+                            confidence=conf,
+                            jersey_visible=False,
+                            motion_score=peak_motion,
+                            pose_action=pose.get("action", "standing"),
+                            crowd_energy=_get_crowd_energy(audio_result, seg_mid),
+                        ))
+
+            # Fallback: threshold-based detection (if play segmentation didn't produce points)
+            if not detection_points:
+                motion_threshold = 10 if is_football else 30
+                LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d, sport=%s)", motion_threshold, sport)
+                for t in _frame_timestamps:
+                    motion = motion_scores.get(t, 0)
+                    in_boundary = _in_audio_boundary(audio_result, t)
+                    if motion > motion_threshold or in_boundary:
+                        pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
+                        conf = motion / 100.0 * 0.7
+                        if in_boundary:
+                            conf = min(1.0, conf + 0.15)
+                        fallback_v4 = ""
+                        if v4_outcomes_by_ts:
+                            for ts_key, outcome in v4_outcomes_by_ts.items():
+                                if abs(ts_key - t) < 2.0:
+                                    fallback_v4 = outcome
+                                    break
+                        detection_points.append(DetectionPoint(
+                            timestamp=t,
+                            confidence=conf,
+                            jersey_visible=False,
+                            motion_score=motion,
+                            pose_action=pose.get("action", "standing"),
+                            crowd_energy=_get_crowd_energy(audio_result, t),
+                            v4_outcome=fallback_v4,
+                        ))
 
         # Extract and rank clips
         clips = extract_clips(
@@ -2301,6 +2329,7 @@ async def _run_chunked_full_game(
     total_frames = 0
     total_dead = 0
     chunk_count = 0
+    _chunked_ocr_start = time.perf_counter()
 
     chunk_start = extract_start
     while chunk_start < extract_end:
@@ -2365,6 +2394,7 @@ async def _run_chunked_full_game(
         chunk_start = chunk_end
 
     layer_timings["chunked_processing"] = {
+        "elapsed_ms": round((time.perf_counter() - _chunked_ocr_start) * 1000),
         "chunks": chunk_count,
         "total_frames": total_frames,
         "total_v5_detections": len(all_ocr_dets),
@@ -2478,8 +2508,8 @@ async def _run_chunked_full_game(
                 detection_points.append(DetectionPoint(
                     timestamp=t,
                     confidence=conf,
-                    jersey_visible=True,
-                    jersey_number=jersey_number,
+                    jersey_visible=False,  # Motion-inferred, NOT confirmed by OCR
+                    jersey_number=None,    # Don't stamp requested number on unconfirmed frames
                     motion_score=motion,
                     crowd_energy=_get_crowd_energy(audio_result, t),
                 ))
@@ -2508,6 +2538,7 @@ async def _run_chunked_full_game(
                 ))
 
     # ── Extract clips ──
+    _t_clip_extract = time.perf_counter()
     clips = extract_clips(
         detections=detection_points,
         audio_result=audio_result if audio_result.has_audio else None,
@@ -2515,6 +2546,11 @@ async def _run_chunked_full_game(
         position=position,
         video_duration=video_duration,
     )
+    layer_timings["clip_extraction"] = {
+        "elapsed_ms": round((time.perf_counter() - _t_clip_extract) * 1000),
+        "detection_points": len(detection_points),
+        "clips_extracted": len(clips),
+    }
 
     # ── Sport-specific clip splitting (same logic as standard path) ──
     import math as _math_c

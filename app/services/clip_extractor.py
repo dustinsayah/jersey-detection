@@ -16,6 +16,107 @@ from app.services.play_classifier import ClassificationResult, classify_play
 
 LOGGER = logging.getLogger(__name__)
 
+
+# ── Play segmentation from motion patterns ───────────────────────────
+def segment_plays_from_motion(
+    motion_scores: dict[float, float],
+    sport: str = "football",
+) -> list[tuple[float, float]]:
+    """Detect individual plays from motion score time series.
+
+    Football rhythm: ~5s of action (snap → whistle) + ~25s dead ball.
+    Returns list of (start_time, end_time) play segments.
+    """
+    if not motion_scores or sport.lower() != "football":
+        return []
+
+    sorted_ts = sorted(motion_scores.keys())
+    if len(sorted_ts) < 3:
+        return []
+
+    scores = [motion_scores[t] for t in sorted_ts]
+    mean_motion = sum(scores) / len(scores)
+
+    # Threshold: motion above mean indicates active play
+    # Use adaptive threshold: mean + 0.3*std to catch most plays
+    variance = sum((s - mean_motion) ** 2 for s in scores) / len(scores)
+    std_motion = variance ** 0.5
+    play_threshold = max(8.0, mean_motion + 0.3 * std_motion)
+
+    plays: list[tuple[float, float]] = []
+    in_play = False
+    play_start = 0.0
+
+    for i, t in enumerate(sorted_ts):
+        motion = motion_scores[t]
+        if not in_play and motion > play_threshold:
+            # Play start — motion spike
+            in_play = True
+            play_start = t
+        elif in_play and motion < play_threshold * 0.5:
+            # Play end — motion drops
+            in_play = False
+            play_end = t
+            duration = play_end - play_start
+            if 1.5 <= duration <= 20.0:  # Reasonable play duration
+                plays.append((play_start, play_end))
+
+    # Close any open play
+    if in_play:
+        play_end = sorted_ts[-1]
+        duration = play_end - play_start
+        if 1.5 <= duration <= 20.0:
+            plays.append((play_start, play_end))
+
+    LOGGER.info("Play segmentation: %d plays detected (threshold=%.1f, mean=%.1f)",
+                len(plays), play_threshold, mean_motion)
+    return plays
+
+
+def compute_crowd_energy_boost(
+    energy_curve: list | None,
+    clip_start: float,
+    clip_end: float,
+) -> float:
+    """Compute crowd energy boost for a clip time range.
+
+    Returns boost value 0-25 based on audio energy spikes (crowd noise).
+    """
+    if not energy_curve:
+        return 0.0
+
+    # Get energy values in clip range
+    clip_energies = [
+        pt.energy for pt in energy_curve
+        if clip_start - 1 <= pt.timestamp <= clip_end + 2
+    ]
+    if not clip_energies:
+        return 0.0
+
+    # Get baseline from full curve
+    all_energies = [pt.energy for pt in energy_curve]
+    mean_e = sum(all_energies) / len(all_energies) if all_energies else 0
+    variance = sum((e - mean_e) ** 2 for e in all_energies) / len(all_energies) if all_energies else 0
+    std_e = variance ** 0.5
+
+    # Peak energy in clip range
+    peak = max(clip_energies)
+    # How many standard deviations above mean
+    if std_e > 0.001:
+        z_score = (peak - mean_e) / std_e
+    else:
+        z_score = 0.0
+
+    # Boost: 0-25 points scaled by z-score (>2 std = significant crowd reaction)
+    if z_score > 3.0:
+        return 25.0
+    elif z_score > 2.0:
+        return 15.0
+    elif z_score > 1.0:
+        return 8.0
+    return 0.0
+
+
 # v4 outcome actions that auto-boost clip grade to Elite
 _ELITE_OUTCOMES = {"made_shot", "touchdown", "goal"}
 # v4 outcome actions that boost clip score by fixed amount
@@ -260,9 +361,15 @@ def extract_clips(
             v4_outcome=dominant_v4,
         )
 
+        # ── Crowd energy boost ───────────────────────────────────────
+        crowd_boost = compute_crowd_energy_boost(
+            audio_result.energy_curve if audio_result else None,
+            start_time, end_time,
+        )
+
         # ── v4: Apply outcome detection boosts ─────────────────────────
         v4_outcomes = [d.v4_outcome for d in cluster if d.v4_outcome]
-        outcome_score = classification.score
+        outcome_score = min(100, classification.score + int(crowd_boost))
         outcome_grade = classification.grade
 
         if v4_outcomes:

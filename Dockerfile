@@ -78,76 +78,19 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
     || echo "EJS pre-cache: solver will be downloaded on first use"
 
 # Ensure model directory exists for Roboflow trained weights
-# football_digit_detector.pt, football_player_detector.pt,
-# basketball_jersey_ocr.pt, football_jersey_tracker.pt
-# must be committed to the repo at app/model/ after Colab training
 RUN mkdir -p /app/app/model
+
+# Cache bust for code changes (update this on each deploy)
+ARG CACHE_BUST=v8.0.0
+RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app
 COPY asgi.py /app/asgi.py
 COPY layers /app/layers
 
 # Startup script: WARP proxy + volume models + gunicorn
-RUN printf '#!/bin/bash\nset -e\n\
-\n\
-# ── Link volume models ──\n\
-if [ -d "/data/models" ]; then\n\
-  for f in /data/models/*.pt /data/models/*.pth; do\n\
-    [ -f "$f" ] || continue\n\
-    bn=$(basename "$f")\n\
-    [ -f "/app/app/model/$bn" ] || ln -sf "$f" "/app/app/model/$bn"\n\
-  done\n\
-  echo "Volume models linked"\n\
-fi\n\
-\n\
-# ── Download critical football models if missing (6MB each, non-fatal) ──\n\
-GITHUB_RAW="https://raw.githubusercontent.com/dustinsayah/jersey-detection/main/app/model"\n\
-for model in football_player_detector.pt football_digit_detector.pt football_jersey_tracker.pt; do\n\
-  if [ ! -f "/app/app/model/$model" ]; then\n\
-    echo "Downloading missing model: $model"\n\
-    curl -fsSL "$GITHUB_RAW/$model" -o "/app/app/model/$model" 2>/dev/null \\\n\
-      && echo "Downloaded $model" \\\n\
-      || echo "Failed to download $model (non-fatal)"\n\
-  fi\n\
-done\n\
-echo "Models: $(ls /app/app/model/*.pt /app/app/model/*.pth 2>/dev/null | wc -l)"\n\
-\n\
-# ── Reassemble split v7 models (>100MB, split for GitHub) ──\n\
-for base in navy_jersey_specialist_v7 football_player_crop_v7; do\n\
-  if [ ! -f "/app/app/model/${base}.pt" ] && [ -f "/app/app/model/${base}.pt.part_aa" ]; then\n\
-    echo "Reassembling ${base}.pt from parts..."\n\
-    cat /app/app/model/${base}.pt.part_* > /app/app/model/${base}.pt\n\
-    echo "Reassembled ${base}.pt ($(du -h /app/app/model/${base}.pt | cut -f1))"\n\
-  fi\n\
-done\n\
-\n\
-# ── Update yt-dlp at runtime (YouTube changes API frequently) ──\n\
-echo "Updating yt-dlp..."\n\
-pip install --upgrade --pre yt-dlp 2>/dev/null \\\n\
-  && echo "yt-dlp updated: $(yt-dlp --version)" \\\n\
-  || echo "yt-dlp update failed (using build version: $(yt-dlp --version))"\n\
-\n\
-# ── Start Cloudflare WARP proxy (non-fatal) ──\n\
-if [ -n "$WARP_WG_CONFIG" ]; then\n\
-  echo "Starting Cloudflare WARP proxy..."\n\
-  echo "$WARP_WG_CONFIG" | base64 -d > /tmp/warp.conf\n\
-  # Append wireproxy SOCKS5 config\n\
-  printf "\\n[Socks5]\\nBindAddress = 127.0.0.1:40000\\n" >> /tmp/warp.conf\n\
-  wireproxy -c /tmp/warp.conf &\n\
-  WARP_PID=$!\n\
-  sleep 2\n\
-  if kill -0 $WARP_PID 2>/dev/null; then\n\
-    echo "WARP proxy running on socks5://127.0.0.1:40000 (PID=$WARP_PID)"\n\
-    export YT_DLP_PROXY="socks5://127.0.0.1:40000"\n\
-  else\n\
-    echo "WARP proxy failed to start (non-fatal)"\n\
-  fi\n\
-else\n\
-  echo "WARP_WG_CONFIG not set, skipping WARP proxy"\n\
-fi\n\
-\n\
-exec gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout ${GUNICORN_TIMEOUT:-1800} asgi:app\n' > /app/start.sh \
-    && chmod +x /app/start.sh
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
 EXPOSE 8000
 

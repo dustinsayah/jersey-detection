@@ -164,47 +164,85 @@ def _compute_recruiting_score(
     sport: str,
     position: str | None,
 ) -> int:
-    """Compute a 0-100 recruiting score for how impressive a clip looks to a college coach."""
-    score = 0
+    """Compute a 0-100 recruiting score for how impressive a clip looks to a college coach.
 
-    # Base score from grade
-    grade = clip_dict.get("grade", "Decent")
-    if grade == "Elite":
-        score = 80
-    elif grade == "Strong":
-        score = 60
-    elif grade == "Decent":
-        score = 40
-    else:
-        score = 20
+    Uses the raw clip score (0-100 from clip_extractor) as the PRIMARY base,
+    then applies modifiers. This ensures clips with different underlying quality
+    get different recruiting scores even when they share the same grade.
 
-    # Jersey visibility confirmed
-    if clip_dict.get("jerseyVisible"):
+    Positive modifiers (add):
+      +20  jerseyVisible AND jerseyNumberSeen matches target
+      +15  touchdown / made_shot / goal detected
+      +10  crowd energy > 0.7
+      +10  pose = throwing or jumping (athletic action)
+      +5   audio whistle (end of play confirmed)
+      +5   completion / sack / qb_scramble / reception_yac
+
+    Negative modifiers (subtract):
+      -10  jerseyVisible is false (can't confirm player identity)
+      -15  playType = formation (pre-snap, not action)
+      -20  deadBallRatio > 0.5 (mostly dead ball footage)
+      -5   playType = dead_ball
+    """
+    # Use raw clip score as primary base (already 0-100 from clip_extractor)
+    # Scale it to 0-60 range to leave room for modifiers to push up to 100
+    raw_score = clip_dict.get("score", 50)
+    score = int(raw_score * 0.6)  # 0-60 base from clip quality
+
+    # ── Positive modifiers ──
+
+    # Jersey visibility + number match
+    if clip_dict.get("jerseyVisible") and clip_dict.get("jerseyNumberSeen"):
+        score += 20
+    elif clip_dict.get("jerseyVisible"):
         score += 10
 
     # v4 outcome boosts
     v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
     if v4:
         if v4 in ("touchdown", "made_shot", "goal"):
-            score += 20
+            score += 15
         elif v4 in ("completion", "sack", "qb_scramble", "reception_yac"):
-            score += 10
+            score += 5
 
-    # Crowd reaction
-    crowd = (clip_dict.get("signals") or {}).get("crowd", 0)
-    if crowd and crowd > 0.5:
+    # Crowd energy (from signals)
+    crowd = (clip_dict.get("signals") or {}).get("crowd", 0) or 0
+    if crowd > 0.7:
+        score += 10
+    elif crowd > 0.5:
+        score += 5
+
+    # Pose action — athletic actions boost
+    pose = (clip_dict.get("signals") or {}).get("pose", "standing")
+    if pose in ("throwing", "jumping"):
         score += 10
 
-    # Position confirmed
-    if position:
+    # Audio whistle — confirms end of play
+    audio = (clip_dict.get("signals") or {}).get("audio")
+    if audio and "whistle" in str(audio).lower():
         score += 5
 
-    # High motion
-    motion = (clip_dict.get("signals") or {}).get("motion", 0)
-    if motion and motion > 70:
-        score += 5
+    # ── Negative modifiers ──
 
-    return min(100, score)
+    # No jersey visible — can't confirm player identity
+    if not clip_dict.get("jerseyVisible"):
+        score -= 10
+
+    # Formation / pre-snap — not actual game action
+    play_type = clip_dict.get("playType", "game_action")
+    if play_type == "formation":
+        score -= 15
+    elif play_type == "dead_ball":
+        score -= 5
+
+    # Dead ball ratio — mostly dead ball footage in clip
+    dead_ball_ratio = clip_dict.get("deadBallRatio", 0) or 0
+    if dead_ball_ratio > 0.5:
+        score -= 20
+    elif dead_ball_ratio > 0.3:
+        score -= 10
+
+    return max(0, min(100, score))
 
 
 # ── Highlight reel ordering priority ──────────────────────────────────
@@ -298,18 +336,37 @@ def _estimate_game_quarter(
     return "unknown"
 
 
+def _get_rss_mb() -> float:
+    """Get current process RSS in MB."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1024 / 1024
+    except Exception:
+        return 0.0
+
+
+# Models that should stay loaded between requests (minimal footprint)
+_ALWAYS_LOADED_MODELS = {
+    "dead_ball_classifier_v5_model",
+    "player_detector_v5_model",
+}
+
+
 def _force_cleanup_memory():
     """Force cleanup of ALL loaded models and caches to reclaim memory.
 
     Called when RSS exceeds threshold between requests.
+    Unloads everything except _ALWAYS_LOADED_MODELS.
     """
     import gc
-    LOGGER.info("Pipeline: force memory cleanup starting")
+    rss_before = _get_rss_mb()
+    LOGGER.info("Pipeline: force memory cleanup starting (RSS=%.0fMB)", rss_before)
     try:
         from app.services.roboflow_detector import roboflow_detector
         for attr in dir(roboflow_detector):
-            if attr.endswith("_model") and getattr(roboflow_detector, attr, None) is not None:
-                setattr(roboflow_detector, attr, None)
+            if attr.endswith("_model") and attr not in _ALWAYS_LOADED_MODELS:
+                if getattr(roboflow_detector, attr, None) is not None:
+                    setattr(roboflow_detector, attr, None)
         roboflow_detector._loaded = False
         if roboflow_detector._jersey_upscaler is not None:
             roboflow_detector._jersey_upscaler = None
@@ -320,9 +377,17 @@ def _force_cleanup_memory():
         clear_detector_cache()
     except Exception:
         pass
-    # Delete any lingering YOLO Results references
     gc.collect()
-    LOGGER.info("Pipeline: force memory cleanup done")
+    # Free PyTorch GPU cache if available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    rss_after = _get_rss_mb()
+    LOGGER.info("Pipeline: force memory cleanup done (RSS: %.0fMB → %.0fMB, freed %.0fMB)",
+                rss_before, rss_after, rss_before - rss_after)
 
 
 async def run_analyze_pipeline(
@@ -394,40 +459,11 @@ async def _run_analyze_pipeline_impl(
     youtube_strategy_used: str | None = None
 
     # ── Pre-request cleanup: free ALL models from previous requests ──
-    # This prevents OOM when back-to-back requests accumulate models in memory.
-    import gc as _gc_pre
-    # Check RSS before cleanup
-    _pre_rss = 0.0
-    try:
-        import psutil as _ps
-        _pre_rss = _ps.Process().memory_info().rss / 1024 / 1024
-        LOGGER.info("Pipeline: pre-request RSS = %.0fMB (threshold=%dMB)", _pre_rss, _MEMORY_THRESHOLD_MB)
-    except Exception:
-        pass
-    # Always clean up between requests
-    try:
-        from app.services.roboflow_detector import roboflow_detector
-        for _attr in dir(roboflow_detector):
-            if _attr.endswith("_model") and getattr(roboflow_detector, _attr, None) is not None:
-                setattr(roboflow_detector, _attr, None)
-        roboflow_detector._loaded = False
-        if roboflow_detector._jersey_upscaler is not None:
-            roboflow_detector._jersey_upscaler = None
-    except Exception:
-        pass
-    try:
-        from app.services.detection_detector import clear_detector_cache
-        clear_detector_cache()
-    except Exception:
-        pass
-    _gc_pre.collect()
-    # Check RSS after cleanup
-    try:
-        _post_rss = _ps.Process().memory_info().rss / 1024 / 1024
-        LOGGER.info("Pipeline: pre-request cleanup done (RSS: %.0fMB → %.0fMB, freed %.0fMB)",
-                     _pre_rss, _post_rss, _pre_rss - _post_rss)
-    except Exception:
-        LOGGER.info("Pipeline: pre-request cleanup done")
+    rss_start = _get_rss_mb()
+    LOGGER.info("Pipeline: REQUEST START — RSS=%.0fMB (threshold=%dMB)", rss_start, _MEMORY_THRESHOLD_MB)
+    _force_cleanup_memory()
+    rss_after_cleanup = _get_rss_mb()
+    LOGGER.info("Pipeline: pre-request cleanup done (RSS: %.0fMB → %.0fMB)", rss_start, rss_after_cleanup)
 
     # Per-layer timing and debug info
     layer_timings: dict[str, dict] = {}
@@ -853,12 +889,14 @@ async def _run_analyze_pipeline_impl(
         v7_navy_detections = 0
         v7_player_crops = 0
         if sport.lower() == "football" and ocr_frames:
-            # Log v7 model availability for diagnostics
+            # Log v7 model availability + memory for diagnostics
+            _v7_rss = _get_rss_mb()
             LOGGER.info(
-                "Pipeline: v7 football model status — ocr=%s, crop=%s, navy=%s",
+                "Pipeline: v7 football model status — ocr=%s, crop=%s, navy=%s, RSS=%.0fMB",
                 roboflow_detector.football_jersey_ocr_v7_model is not None,
                 roboflow_detector.football_player_crop_v7_model is not None,
                 roboflow_detector.navy_jersey_specialist_v7_model is not None,
+                _v7_rss,
             )
             t0 = time.perf_counter()
             try:
@@ -2204,31 +2242,14 @@ async def _run_analyze_pipeline_impl(
 
     finally:
         # ── Post-request cleanup (Blocker 3) ──
-        # Unload ALL models (not just request-specific) to free memory
-        # for the next request. Models are re-loaded per-request anyway.
-        import gc as _gc_post
-        try:
-            from app.services.roboflow_detector import roboflow_detector
-            for _attr in dir(roboflow_detector):
-                if _attr.endswith("_model") and getattr(roboflow_detector, _attr, None) is not None:
-                    setattr(roboflow_detector, _attr, None)
-            roboflow_detector._loaded = False
-            if roboflow_detector._jersey_upscaler is not None:
-                roboflow_detector._jersey_upscaler = None
-        except Exception:
-            pass
-        try:
-            from app.services.detection_detector import clear_detector_cache
-            clear_detector_cache()
-        except Exception:
-            pass
-        _gc_post.collect()
-        try:
-            import psutil as _ps_post
-            _rss_after = _ps_post.Process().memory_info().rss / 1024 / 1024
-            LOGGER.info("Pipeline: post-request cleanup done (RSS=%.0fMB)", _rss_after)
-        except Exception:
-            LOGGER.info("Pipeline: post-request cleanup done")
+        # Unload ALL models and force garbage collection.
+        elapsed_total = time.perf_counter() - start_time
+        _force_cleanup_memory()
+        rss_end = _get_rss_mb()
+        LOGGER.info(
+            "Pipeline: REQUEST END — Memory delta: +%.0fMB (start=%.0fMB end=%.0fMB) elapsed=%.1fs",
+            rss_end - rss_start, rss_start, rss_end, elapsed_total,
+        )
         # Cleanup temp files
         if tmp_dir and tmp_dir.exists():
             try:
@@ -2380,16 +2401,31 @@ async def _run_chunked_full_game(
 
         # Free chunk frames immediately
         chunk_frames.clear()
-        gc.collect()
 
-        # Log memory after chunk
+        # Unload non-essential models between chunks to prevent memory growth
         try:
-            import psutil
-            rss = psutil.Process().memory_info().rss // (1024 * 1024)
-            LOGGER.info("Chunked: chunk %d done — %d v5 dets, %d v7 dets, RSS=%dMB",
-                         chunk_count, len(ocr_dets), len(v7_dets), rss)
+            for _attr in dir(roboflow_detector):
+                if _attr.endswith("_model") and _attr not in _ALWAYS_LOADED_MODELS:
+                    if getattr(roboflow_detector, _attr, None) is not None:
+                        setattr(roboflow_detector, _attr, None)
         except Exception:
             pass
+        gc.collect()
+        try:
+            import torch as _torch_chunk
+            if _torch_chunk.cuda.is_available():
+                _torch_chunk.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Log memory after chunk + gate for next chunk
+        rss_chunk = _get_rss_mb()
+        LOGGER.info("Chunked: chunk %d done — %d v5 dets, %d v7 dets, RSS=%.0fMB",
+                     chunk_count, len(ocr_dets), len(v7_dets), rss_chunk)
+        if rss_chunk > 5000:
+            LOGGER.warning("Chunked: Memory high (%.0fMB > 5000MB) — forcing full cleanup before next chunk",
+                           rss_chunk)
+            _force_cleanup_memory()
 
         chunk_start = chunk_end
 
@@ -2975,8 +3011,10 @@ def _run_chunk_ocr(
         len(chunk_motion), time.perf_counter() - t0,
     )
 
-    # Free chunk models
+    # Free chunk models and check memory
     gc.collect()
+    rss_after_chunk = _get_rss_mb()
+    LOGGER.info("Chunk OCR cleanup: RSS=%.0fMB", rss_after_chunk)
 
     return chunk_ocr_dets, chunk_v7_dets, chunk_motion
 

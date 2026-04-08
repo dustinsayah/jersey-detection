@@ -282,6 +282,47 @@ def health(request: Request) -> JSONResponse:
     except (ConnectionRefusedError, OSError, TimeoutError):
         warp_running = False
 
+    # Check YouTube cookie file health
+    cookie_health: dict = {"exists": False, "has_auth_tokens": False}
+    for cookie_path in ["/app/youtube_cookies.txt", "/app/app/youtube_cookies.txt",
+                        "/data/youtube_cookies.txt", os.getenv("YOUTUBE_COOKIES_FILE", "")]:
+        if cookie_path and Path(cookie_path).is_file():
+            cookie_health["exists"] = True
+            cookie_health["path"] = cookie_path
+            try:
+                import time as _time
+                stat = Path(cookie_path).stat()
+                age_days = (_time.time() - stat.st_mtime) / 86400
+                cookie_health["age_days"] = round(age_days, 1)
+                cookie_health["size_bytes"] = stat.st_size
+                # Check for real auth tokens (not just anonymous session)
+                content = Path(cookie_path).read_text(errors="replace")
+                auth_tokens = ["LOGIN_INFO", "SID", "SSID", "HSID", "APISID", "SAPISID"]
+                found_tokens = [t for t in auth_tokens if t in content]
+                cookie_health["has_auth_tokens"] = len(found_tokens) >= 3
+                cookie_health["auth_tokens_found"] = found_tokens
+                has_youtube = ".youtube.com" in content
+                cookie_health["has_youtube_cookies"] = has_youtube
+                # Estimate expiry: cookies last ~3-5 days
+                if cookie_health["has_auth_tokens"]:
+                    est_expiry_days = max(0, 3.0 - age_days)
+                    cookie_health["estimated_days_remaining"] = round(est_expiry_days, 1)
+                    cookie_health["likely_expired"] = age_days > 3.0
+                else:
+                    cookie_health["likely_expired"] = True
+                    cookie_health["action_needed"] = "Export authenticated YouTube cookies from Firefox"
+            except Exception:
+                pass
+            break
+
+    # Memory usage
+    memory_rss_mb = 0
+    try:
+        import psutil
+        memory_rss_mb = round(psutil.Process().memory_info().rss / 1024 / 1024)
+    except Exception:
+        pass
+
     return JSONResponse(
         status_code=200,
         content={
@@ -290,6 +331,8 @@ def health(request: Request) -> JSONResponse:
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
+            "cookie_health": cookie_health,
+            "memory_rss_mb": memory_rss_mb,
         },
     )
 

@@ -471,11 +471,10 @@ class RoboflowDetector:
     def unload_request_models(self) -> None:
         """Unload non-essential models after a request to free memory.
 
-        Keeps ONLY the 3 v5 essential models loaded between requests.
-        Outcome classifiers are unloaded (reloaded per-request if needed).
+        Keeps ONLY dead_ball + player_detector loaded between requests.
+        jersey_ocr_universal_v5 is reloaded per-request to save ~500MB RSS.
         """
         keep_attrs = {
-            "jersey_ocr_universal_v5_model",
             "player_detector_v5_model",
             "dead_ball_classifier_v5_model",
         }
@@ -1195,8 +1194,9 @@ class RoboflowDetector:
             navy_enhanced = self._navy_adaptive_preprocess(crop)
             preprocessed_variants.append(("navy_adaptive", navy_enhanced))
 
-        # Lower confidence for navy jerseys — digits are harder to read
-        effective_conf = min(conf, 0.05) if _is_navy_jersey else conf
+        # Lower confidence for v7 — trained on football-specific data, so lower
+        # threshold is safe. Navy jerseys get even lower.
+        effective_conf = min(conf, 0.03) if _is_navy_jersey else min(conf, 0.05)
 
         digit_detections: list[tuple[int, float, list]] = []
 
@@ -1204,13 +1204,18 @@ class RoboflowDetector:
             # Run v7 OCR (digit-wise 0-9 detection)
             try:
                 results = self.football_jersey_ocr_v7_model(enhanced, conf=effective_conf, verbose=False)[0]
+                raw_count = len(results.boxes)
+                if raw_count > 0:
+                    confs = [float(b.conf) for b in results.boxes]
+                    logger.debug("V7 raw results (%s): %d boxes, conf_range=%.3f-%.3f",
+                                 variant_name, raw_count, min(confs), max(confs))
                 for box in results.boxes:
                     cls_name = self.football_jersey_ocr_v7_model.names[int(box.cls)]
                     digit = self._parse_number(cls_name)
                     if digit is not None and 0 <= digit <= 9:
                         digit_detections.append((digit, float(box.conf), box.xyxy[0].tolist()))
             except Exception as e:
-                logger.debug("v7 football OCR error (%s): %s", variant_name, e)
+                logger.warning("v7 football OCR error (%s): %s", variant_name, e)
 
             # Also try navy specialist if available and jersey is dark
             if self.navy_jersey_specialist_v7_model is not None and _is_dark_jersey:
@@ -1291,6 +1296,7 @@ class RoboflowDetector:
 
         # Step 1: find player crops using v7 player crop model (or v5/v1 fallback)
         players: list[dict] = []
+        _v7_crop_source = "none"
         if self.football_player_crop_v7_model is not None:
             self._last_used["football_player_crop_v7_model"] = time.time()
             try:
@@ -1303,17 +1309,33 @@ class RoboflowDetector:
                             "confidence": float(box.conf),
                             "layer": "v7_player_crop",
                         })
+                _v7_crop_source = "v7_crop"
+                logger.debug("V7 player crop: %d players found (frame %dx%d)",
+                             len(players), frame.shape[1], frame.shape[0])
             except Exception as e:
-                logger.debug("v7 player crop error: %s", e)
+                logger.warning("v7 player crop error: %s", e)
+        else:
+            logger.debug("V7 player crop model NOT loaded — falling back to v5/v1")
 
         if not players:
             players = self.detect_players_v5(frame, conf=0.25, validate_crop_size=True)
+            if players:
+                _v7_crop_source = "v5_fallback"
 
         if not players:
             players = self.detect_football_players(frame, conf=0.25)
+            if players:
+                _v7_crop_source = "v1_fallback"
+
+        # Log crop dimensions for first 3 players
+        for i, p in enumerate(players[:3]):
+            bx = p["bbox"]
+            pw, ph = int(bx[2] - bx[0]), int(bx[3] - bx[1])
+            logger.debug("V7 crop %d: %dx%dpx (source=%s, conf=%.3f)", i, pw, ph, _v7_crop_source, p.get("confidence", 0))
 
         # Step 2: for each player crop, run multi-scale v7 digit OCR
         if self.football_jersey_ocr_v7_model is None:
+            logger.warning("V7 football_jersey_ocr_v7_model NOT loaded — skipping v7 OCR")
             return []
 
         self._last_used["football_jersey_ocr_v7_model"] = time.time()

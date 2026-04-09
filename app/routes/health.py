@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
@@ -308,6 +308,15 @@ def health(request: Request) -> JSONResponse:
                     est_expiry_days = max(0, 3.0 - age_days)
                     cookie_health["estimated_days_remaining"] = round(est_expiry_days, 1)
                     cookie_health["likely_expired"] = age_days > 3.0
+                    if est_expiry_days < 1.0:
+                        cookie_health["warning"] = "Cookies expiring soon — refresh within 24h"
+                        cookie_health["action_needed"] = (
+                            "POST new cookies via: curl -X POST "
+                            "https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
+                            "-F 'file=@youtube_cookies.txt'"
+                        )
+                    elif est_expiry_days < 2.0:
+                        cookie_health["warning"] = "Cookies expiring in ~1 day — plan refresh"
                 else:
                     cookie_health["likely_expired"] = True
                     cookie_health["action_needed"] = "Export authenticated YouTube cookies from Firefox"
@@ -535,3 +544,134 @@ def test_v7() -> JSONResponse:
         })
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+def _get_cookie_path() -> Path:
+    """Return the cookie file path (prefer Railway /app path)."""
+    for p in ["/app/app/youtube_cookies.txt", "/app/youtube_cookies.txt",
+              "/data/youtube_cookies.txt", "app/youtube_cookies.txt"]:
+        if Path(p).is_file():
+            return Path(p)
+    return Path("/app/app/youtube_cookies.txt")
+
+
+def _validate_cookie_content(content: str) -> dict:
+    """Check cookie content for required auth tokens."""
+    auth_tokens = ["LOGIN_INFO", "SID", "SSID", "HSID", "APISID", "SAPISID"]
+    found = [t for t in auth_tokens if t in content]
+    has_youtube = ".youtube.com" in content
+    return {
+        "has_auth_tokens": len(found) >= 3,
+        "auth_tokens_found": found,
+        "has_youtube_cookies": has_youtube,
+        "line_count": content.count("\n"),
+        "size_bytes": len(content.encode("utf-8")),
+    }
+
+
+@router.get("/refresh-cookies")
+def refresh_cookies() -> JSONResponse:
+    """Check cookie freshness and return refresh instructions if needed."""
+    import time as _time
+    cookie_path = _get_cookie_path()
+
+    if not cookie_path.is_file():
+        return JSONResponse(status_code=200, content={
+            "status": "no_cookies",
+            "action_needed": "Upload cookies via POST /upload-cookies",
+            "instructions": (
+                "1. Open Firefox/Chrome, log into YouTube with a Premium account\n"
+                "2. Install 'Get cookies.txt LOCALLY' extension\n"
+                "3. Export cookies for youtube.com\n"
+                "4. Upload: curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
+                "-F 'file=@cookies.txt'"
+            ),
+        })
+
+    stat = cookie_path.stat()
+    age_days = (_time.time() - stat.st_mtime) / 86400
+    content = cookie_path.read_text(errors="replace")
+    validation = _validate_cookie_content(content)
+    days_remaining = max(0, 3.0 - age_days)
+
+    if not validation["has_auth_tokens"]:
+        status = "invalid"
+        message = "Cookie file exists but has no auth tokens — re-export while logged into YouTube"
+    elif days_remaining < 0.5:
+        status = "expired"
+        message = "Cookies are expired or expiring very soon — upload new cookies now"
+    elif days_remaining < 1.5:
+        status = "expiring_soon"
+        message = f"Cookies expire in ~{days_remaining:.1f} days — refresh within 24h"
+    else:
+        status = "ok"
+        message = f"Cookies are fresh — {days_remaining:.1f} days remaining"
+
+    return JSONResponse(status_code=200, content={
+        "status": status,
+        "age_days": round(age_days, 2),
+        "days_remaining": round(days_remaining, 1),
+        "message": message,
+        **validation,
+        "instructions": (
+            "To refresh:\n"
+            "1. Open Chrome/Firefox, verify you're logged into YouTube\n"
+            "2. Use 'Get cookies.txt LOCALLY' extension to export\n"
+            "3. Upload: curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
+            "-F 'file=@cookies.txt'"
+        ),
+    })
+
+
+@router.post("/upload-cookies")
+async def upload_cookies(file: UploadFile = File(...)) -> JSONResponse:
+    """Upload new YouTube cookies without redeploying.
+
+    Usage:
+        curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies \\
+             -F 'file=@youtube_cookies.txt'
+    """
+    content = (await file.read()).decode("utf-8", errors="replace")
+
+    # Validate the uploaded cookie file
+    validation = _validate_cookie_content(content)
+
+    if not validation["has_youtube_cookies"]:
+        return JSONResponse(status_code=400, content={
+            "status": "rejected",
+            "reason": "File does not contain youtube.com cookies",
+            "hint": "Make sure you exported cookies while on youtube.com",
+        })
+
+    if not validation["has_auth_tokens"]:
+        return JSONResponse(status_code=400, content={
+            "status": "rejected",
+            "reason": "File has no auth tokens (LOGIN_INFO, SID, etc.)",
+            "auth_tokens_found": validation["auth_tokens_found"],
+            "hint": "Make sure you're logged into YouTube before exporting cookies",
+        })
+
+    # Save the cookies
+    cookie_path = _get_cookie_path()
+    try:
+        # Backup existing cookies
+        if cookie_path.is_file():
+            backup = cookie_path.with_suffix(".txt.bak")
+            import shutil
+            shutil.copy2(cookie_path, backup)
+
+        cookie_path.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "reason": f"Failed to write cookie file: {exc}",
+        })
+
+    return JSONResponse(status_code=200, content={
+        "status": "ok",
+        "message": "Cookies uploaded successfully",
+        "path": str(cookie_path),
+        **validation,
+        "estimated_days_remaining": 3.0,
+        "next_refresh": "Upload new cookies in ~3 days",
+    })

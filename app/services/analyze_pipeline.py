@@ -337,6 +337,105 @@ def _estimate_game_quarter(
     return "unknown"
 
 
+def _generate_sequence_note(
+    clip_dict: dict[str, Any],
+    clip_index: int,
+    total_clips: int,
+    prev_clip: dict[str, Any] | None,
+    sport: str,
+) -> str:
+    """Generate play context / drive sequence note for a clip.
+
+    Provides coaches with context about where this clip sits in the game flow.
+    """
+    parts: list[str] = []
+
+    quarter = clip_dict.get("estimatedQuarter", "")
+    if quarter and quarter != "unknown":
+        parts.append(quarter)
+
+    play_type = clip_dict.get("playType", "game_action")
+    v4 = clip_dict.get("v4Outcome", "")
+
+    # Sequence position
+    if clip_index == 0:
+        parts.append("Opening highlight")
+    elif clip_index == total_clips - 1:
+        parts.append("Final highlight")
+
+    # Time gap from previous clip — indicates drive continuity
+    if prev_clip:
+        gap = clip_dict.get("startTime", 0) - prev_clip.get("endTime", 0)
+        if gap < 15:
+            parts.append("Same drive" if sport.lower() == "football" else "Same possession")
+        elif gap < 60:
+            parts.append("Next series")
+
+    # Play description
+    action = v4 or play_type
+    action_label = action.replace("_", " ").title()
+    if action_label and action_label not in ("Game Action",):
+        parts.append(action_label)
+
+    # Jersey context
+    if clip_dict.get("jerseyVisible") and clip_dict.get("jerseyNumberSeen"):
+        parts.append(f"#{clip_dict['jerseyNumberSeen']} confirmed")
+
+    return " — ".join(parts) if parts else "Game Action"
+
+
+def _build_player_summary(
+    clips_out: list[dict[str, Any]],
+    jersey_number: int,
+    sport: str,
+    position: str | None,
+    video_duration: float,
+    elapsed: float,
+) -> dict[str, Any]:
+    """Build aggregate player stats summary from all detected clips.
+
+    Returns a dict with stats coaches care about: total clips, jersey detection
+    rate, top plays, total highlight time, average recruiting score, etc.
+    """
+    total = len(clips_out)
+    jersey_clips = [c for c in clips_out if c.get("jerseyVisible")]
+    scoring_plays = [c for c in clips_out if c.get("v4Outcome") in ("touchdown", "made_shot", "goal")]
+    recruiting_scores = [c.get("recruitingScore", 0) for c in clips_out]
+
+    # Play type breakdown
+    play_types: dict[str, int] = {}
+    for c in clips_out:
+        pt = c.get("v4Outcome") or c.get("playType", "game_action")
+        play_types[pt] = play_types.get(pt, 0) + 1
+
+    # Total highlight seconds
+    total_highlight_secs = sum(
+        c.get("endTime", 0) - c.get("startTime", 0) for c in clips_out
+    )
+
+    # Grade breakdown
+    grades: dict[str, int] = {}
+    for c in clips_out:
+        g = c.get("grade", "Decent")
+        grades[g] = grades.get(g, 0) + 1
+
+    return {
+        "jerseyNumber": jersey_number,
+        "sport": sport,
+        "position": position,
+        "totalClips": total,
+        "jerseyDetectionRate": round(len(jersey_clips) / total * 100, 1) if total else 0,
+        "scoringPlays": len(scoring_plays),
+        "avgRecruitingScore": round(sum(recruiting_scores) / total, 1) if total else 0,
+        "topRecruitingScore": max(recruiting_scores) if recruiting_scores else 0,
+        "totalHighlightSeconds": round(total_highlight_secs, 1),
+        "videoDurationSeconds": round(video_duration, 1),
+        "processingTimeSeconds": round(elapsed, 1),
+        "gradeBreakdown": grades,
+        "playTypeBreakdown": play_types,
+    }
+
+
 def _get_rss_mb() -> float:
     """Get current process RSS in MB."""
     try:
@@ -2006,36 +2105,16 @@ async def _run_analyze_pipeline_impl(
         except Exception:
             pass
 
-        # Apply sport-specific clip splitting — break long clips into sub-clips
-        # Football: 4s clips (60s/4=15 target), Basketball: 4s, Lacrosse: 5s
-        import math as _math
-        from copy import copy as _copy_clip
-        _CLIP_LEN_BY_SPORT = {"football": 4.0, "basketball": 4.0, "lacrosse": 5.0}
-        _MAX_CLIP_BY_SPORT = {"football": FOOTBALL_MAX_CLIP, "basketball": 12.0, "lacrosse": 15.0}
-        _sport_lower = sport.lower()
-        _target_clip_len = _CLIP_LEN_BY_SPORT.get(_sport_lower, 5.0)
-        _max_clip_dur = _MAX_CLIP_BY_SPORT.get(_sport_lower, 15.0)
-        if clips:
-            _split_clips: list = []
-            for clip in clips:
-                duration = clip.end_time - clip.start_time
-                if duration > _target_clip_len * 1.2:  # Split if >20% longer than target
-                    n_parts = max(2, _math.ceil(duration / _target_clip_len))
-                    part_len = duration / n_parts
-                    for i in range(n_parts):
-                        sub_start = round(clip.start_time + i * part_len, 1)
-                        sub_end = round(clip.start_time + (i + 1) * part_len, 1)
-                        sub_clip = _copy_clip(clip)
-                        sub_clip.start_time = sub_start
-                        sub_clip.end_time = sub_end
-                        sub_clip.score = max(5, clip.score - i * 2)
-                        _split_clips.append(sub_clip)
-                else:
-                    if duration > _max_clip_dur:
-                        clip.end_time = clip.start_time + _max_clip_dur
-                    _split_clips.append(clip)
-            clips = _split_clips
-            LOGGER.info("Pipeline: %s clip split → %d clips (target=%.0fs)", _sport_lower, len(clips), _target_clip_len)
+        # Clip splitting REMOVED in v8.4 — clip_extractor now handles hard caps
+        # and aggressive merging. Splitting 50 clips into 117 sub-clips was
+        # destroying the UX. Clips are already capped at MAX_CLIPS_PER_GAME=30.
+        # Just enforce max duration per clip.
+        _MAX_CLIP_DUR = {"football": FOOTBALL_MAX_CLIP, "basketball": 12.0, "lacrosse": 15.0}
+        _max_dur = _MAX_CLIP_DUR.get(sport.lower(), 15.0)
+        for clip in clips:
+            if clip.end_time - clip.start_time > _max_dur:
+                clip.end_time = clip.start_time + _max_dur
+        LOGGER.info("Pipeline: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_dur)
 
         # ── Step 9: Stat generation pipeline ───────────────────────────
         stat_result: dict = {"game_stats": {}, "per_clip_stats": [], "actions_detected": []}
@@ -2130,6 +2209,13 @@ async def _run_analyze_pipeline_impl(
 
         # Sort clips in highlight reel order (TDs first, then big plays, etc.)
         clips_out.sort(key=_get_highlight_sort_key)
+
+        # Add sequenceNote to each clip
+        for i, clip_dict in enumerate(clips_out):
+            prev = clips_out[i - 1] if i > 0 else None
+            clip_dict["sequenceNote"] = _generate_sequence_note(
+                clip_dict, i, len(clips_out), prev, sport,
+            )
 
         # ── Build debug field ──────────────────────────────────────────
         ali_working = ali_status == "working"
@@ -2249,7 +2335,13 @@ async def _run_analyze_pipeline_impl(
             "memory_rss_mb": memory_rss_mb,
         }
 
+        # Player summary for coaches
+        player_summary = _build_player_summary(
+            clips_out, jersey_number, sport, position, video_duration, elapsed,
+        )
+
         return {
+            "playerSummary": player_summary,
             "clips": clips_out,
             "layerUsed": layer_used,
             "elapsed": round(elapsed, 1),
@@ -2688,33 +2780,14 @@ async def _run_chunked_full_game(
         "clips_extracted": len(clips),
     }
 
-    # ── Sport-specific clip splitting (same logic as standard path) ──
-    import math as _math_c
-    from copy import copy as _copy_c
-    _CLIP_LEN_C = {"football": 4.0, "basketball": 4.0, "lacrosse": 5.0}
+    # Clip splitting REMOVED in v8.4 — clip_extractor handles hard caps.
+    # Just enforce max duration per clip.
     _MAX_CLIP_C = {"football": FOOTBALL_MAX_CLIP, "basketball": 12.0, "lacrosse": 15.0}
-    _sport_lc = sport.lower()
-    _target_c = _CLIP_LEN_C.get(_sport_lc, 5.0)
-    _max_c = _MAX_CLIP_C.get(_sport_lc, 15.0)
-    if clips:
-        _split: list = []
-        for clip in clips:
-            dur = clip.end_time - clip.start_time
-            if dur > _target_c * 1.2:
-                n_parts = max(2, _math_c.ceil(dur / _target_c))
-                part_len = dur / n_parts
-                for i in range(n_parts):
-                    sub = _copy_c(clip)
-                    sub.start_time = round(clip.start_time + i * part_len, 1)
-                    sub.end_time = round(clip.start_time + (i + 1) * part_len, 1)
-                    sub.score = max(5, clip.score - i * 2)
-                    _split.append(sub)
-            else:
-                if dur > _max_c:
-                    clip.end_time = clip.start_time + _max_c
-                _split.append(clip)
-        clips = _split
-        LOGGER.info("Chunked: %s clip split → %d clips (target=%.0fs)", _sport_lc, len(clips), _target_c)
+    _max_c = _MAX_CLIP_C.get(sport.lower(), 15.0)
+    for clip in clips:
+        if clip.end_time - clip.start_time > _max_c:
+            clip.end_time = clip.start_time + _max_c
+    LOGGER.info("Chunked: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_c)
 
     # ── Unload models ──
     try:
@@ -2789,6 +2862,13 @@ async def _run_chunked_full_game(
     # Sort clips in highlight reel order (TDs first, then big plays, etc.)
     clips_out.sort(key=_get_highlight_sort_key)
 
+    # Add sequenceNote to each clip
+    for i, clip_dict in enumerate(clips_out):
+        prev = clips_out[i - 1] if i > 0 else None
+        clip_dict["sequenceNote"] = _generate_sequence_note(
+            clip_dict, i, len(clips_out), prev, sport,
+        )
+
     # Get primary detection layer
     try:
         primary_layer = roboflow_detector.get_primary_detection()
@@ -2851,7 +2931,13 @@ async def _run_chunked_full_game(
         "chunks_processed": chunk_count,
     }
 
+    # Player summary for coaches
+    player_summary = _build_player_summary(
+        clips_out, jersey_number, sport, position, video_duration, elapsed,
+    )
+
     return {
+        "playerSummary": player_summary,
         "clips": clips_out,
         "layerUsed": "+".join(phases_used),
         "elapsed": round(elapsed, 1),

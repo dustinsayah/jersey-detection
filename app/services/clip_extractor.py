@@ -150,6 +150,10 @@ MAX_CLIP_DURATION = 30.0
 # Shorter clips for full-game analysis (>1800s videos)
 FULL_GAME_MAX_CLIP_DURATION = 15.0
 
+# ── Hard caps on clip count ──────────────────────────────────────────
+MAX_CLIPS_PER_GAME = 30   # Absolute max clips returned
+MAX_CLIPS_PER_HOUR = 15   # Per hour of video
+
 # Maximum distance between jersey detections to cluster them (seconds)
 # Basketball: 3s gap — fast-paced, plays change quickly
 # Football: 2.5s gap — each play is a distinct burst (snap → whistle)
@@ -440,11 +444,10 @@ def extract_clips(
                 clip.description = "Game Action"
 
     # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
-    # Merge clips that overlap OR are within 2s of each other with similar
-    # motion scores (±15). This prevents consecutive 5s windows with
-    # identical motion scores from appearing as separate clips.
-    PROXIMITY_GAP = 2.0
-    MOTION_SIMILARITY = 15.0
+    # Merge clips that overlap OR are within 8s of each other.
+    # Aggressive merging prevents 100+ micro-clips from play-by-play splitting.
+    PROXIMITY_GAP = 8.0
+    MOTION_SIMILARITY = 25.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []
 
@@ -556,9 +559,51 @@ def extract_clips(
                 len(merged), len(result), rescue_threshold, sport,
             )
 
+    # ── Step 5: Hard cap — keep only the best N clips ───────────────────
+    result = _select_best_clips(result, video_duration)
+
     LOGGER.info(
-        "Extracted %d clips from %d detections (%d clusters, %d after merge/filter)",
+        "Extracted %d clips from %d detections (%d clusters, %d after cap)",
         len(result), len(detections), len(clusters), len(result),
     )
 
     return result
+
+
+def _get_max_clips(video_duration_seconds: float) -> int:
+    """Compute max clip count based on video duration."""
+    if video_duration_seconds <= 0:
+        return MAX_CLIPS_PER_GAME
+    hours = max(1.0, video_duration_seconds / 3600.0)
+    return min(MAX_CLIPS_PER_GAME, int(hours * MAX_CLIPS_PER_HOUR))
+
+
+def _select_best_clips(
+    clips: list[ExtractedClip],
+    video_duration: float,
+) -> list[ExtractedClip]:
+    """Sort by score descending and keep only top N clips.
+
+    Prioritizes clips with jersey visibility and meaningful play types.
+    """
+    max_clips = _get_max_clips(video_duration)
+    if len(clips) <= max_clips:
+        return clips
+
+    # Sort: jersey-visible first, then by score descending
+    clips.sort(
+        key=lambda c: (
+            0 if c.jersey_visible else 1,  # jersey clips first
+            -c.score,                       # then highest score
+        ),
+    )
+
+    selected = clips[:max_clips]
+    # Re-sort by time for chronological output
+    selected.sort(key=lambda c: c.start_time)
+
+    LOGGER.info(
+        "Hard cap: %d → %d clips (max=%d, duration=%.0fs)",
+        len(clips), len(selected), max_clips, video_duration,
+    )
+    return selected

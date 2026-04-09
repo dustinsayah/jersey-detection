@@ -471,52 +471,64 @@ async def _run_analyze_pipeline_impl(
     try:
         # ── Step 1: Acquire video ────────────────────────────────────────
         if video_url and is_youtube_url(video_url):
-            LOGGER.info("Pipeline: downloading YouTube video")
-            t0 = time.perf_counter()
-            try:
-                from app.services.detection_runtime import PipelineSettings
-                settings = PipelineSettings()
-                dl_result: DownloadResult = await run_in_threadpool(
-                    partial(
-                        download_youtube_sync,
-                        video_url,
-                        start_time=time_range_start,
-                        end_time=time_range_end,
-                        yt_dlp_binary=settings.yt_dlp_binary,
-                        ffmpeg_binary=settings.ffmpeg_binary,
+            # For full games (>30 min), skip upfront download — chunked pipeline
+            # will download each 30-min chunk separately to avoid timeouts
+            _requested_duration = (time_range_end - time_range_start) if time_range_end > time_range_start else 0
+            if _requested_duration > 1800:
+                LOGGER.info(
+                    "Pipeline: SKIPPING upfront download for %.0fs game — will download per-chunk",
+                    _requested_duration,
+                )
+                extract_start = time_range_start
+                extract_end = time_range_end
+                # local_video_path stays None — chunked pipeline will download
+            else:
+                LOGGER.info("Pipeline: downloading YouTube video")
+                t0 = time.perf_counter()
+                try:
+                    from app.services.detection_runtime import PipelineSettings
+                    settings = PipelineSettings()
+                    dl_result: DownloadResult = await run_in_threadpool(
+                        partial(
+                            download_youtube_sync,
+                            video_url,
+                            start_time=time_range_start,
+                            end_time=time_range_end,
+                            yt_dlp_binary=settings.yt_dlp_binary,
+                            ffmpeg_binary=settings.ffmpeg_binary,
+                        )
                     )
-                )
-                local_video_path = dl_result.path
-                # If video was pre-trimmed by --download-sections, adjust frame extraction range
-                if dl_result.was_sectioned:
-                    LOGGER.info("Pipeline: video was pre-sectioned (%.0f-%.0f) → extracting from 0", time_range_start, time_range_end)
-                    extract_start = 0.0
-                    extract_end = (time_range_end - time_range_start) if time_range_end > 0 else 0.0
-                else:
-                    extract_start = time_range_start
-                    extract_end = time_range_end
-                phases_used.append("youtube_download")
-                youtube_strategy_used = getattr(dl_result, "strategy_used", "download_success")
-                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
-                LOGGER.info("Pipeline: YouTube video downloaded to %s (sectioned=%s)", local_video_path, dl_result.was_sectioned)
-                # Log resolution for diagnostic purposes — also include in API response
-                vid_w, vid_h = get_video_resolution(local_video_path)
-                LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
-                layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
-                layer_timings["youtube_download"]["was_sectioned"] = dl_result.was_sectioned
-                # Log file size
-                file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
-                layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
-                LOGGER.info("Pipeline: Downloaded file size = %sMB", file_size_mb)
-            except Exception as exc:
-                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
-                youtube_strategy_used = "all_failed"
-                LOGGER.error("Pipeline: YouTube download failed: %s", exc)
-                return _error_response(
-                    f"YouTube download failed: {exc}",
-                    time.perf_counter() - start_time,
-                    layer_timings=layer_timings,
-                )
+                    local_video_path = dl_result.path
+                    # If video was pre-trimmed by --download-sections, adjust frame extraction range
+                    if dl_result.was_sectioned:
+                        LOGGER.info("Pipeline: video was pre-sectioned (%.0f-%.0f) → extracting from 0", time_range_start, time_range_end)
+                        extract_start = 0.0
+                        extract_end = (time_range_end - time_range_start) if time_range_end > 0 else 0.0
+                    else:
+                        extract_start = time_range_start
+                        extract_end = time_range_end
+                    phases_used.append("youtube_download")
+                    youtube_strategy_used = getattr(dl_result, "strategy_used", "download_success")
+                    layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
+                    LOGGER.info("Pipeline: YouTube video downloaded to %s (sectioned=%s)", local_video_path, dl_result.was_sectioned)
+                    # Log resolution for diagnostic purposes — also include in API response
+                    vid_w, vid_h = get_video_resolution(local_video_path)
+                    LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
+                    layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
+                    layer_timings["youtube_download"]["was_sectioned"] = dl_result.was_sectioned
+                    # Log file size
+                    file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+                    layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
+                    LOGGER.info("Pipeline: Downloaded file size = %sMB", file_size_mb)
+                except Exception as exc:
+                    layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
+                    youtube_strategy_used = "all_failed"
+                    LOGGER.error("Pipeline: YouTube download failed: %s", exc)
+                    return _error_response(
+                        f"YouTube download failed: {exc}",
+                        time.perf_counter() - start_time,
+                        layer_timings=layer_timings,
+                    )
         elif video_url:
             # Direct URL — download it first
             extract_start = time_range_start
@@ -561,20 +573,21 @@ async def _run_analyze_pipeline_impl(
         # → OCR/detection → free frames. Merge all results at end.
         _CHUNK_THRESHOLD = 1800  # 30 minutes
         _CHUNK_SIZE = 1800  # 30-minute chunks
-        if _effective_duration > _CHUNK_THRESHOLD and local_video_path and local_video_path.exists():
+        if _effective_duration > _CHUNK_THRESHOLD:
             LOGGER.info(
                 "Pipeline: CHUNKED MODE — %.0fs video, processing in %ds chunks",
                 _effective_duration, _CHUNK_SIZE,
             )
             return await _run_chunked_full_game(
-                local_video_path=local_video_path,
-                video_duration=video_duration,
+                local_video_path=local_video_path if (local_video_path and local_video_path.exists()) else None,
+                video_url=video_url if (video_url and is_youtube_url(video_url)) else None,
+                video_duration=video_duration if video_duration > 0 else _effective_duration,
                 jersey_number=jersey_number,
                 jersey_color=jersey_color,
                 sport=sport,
                 position=position,
-                extract_start=extract_start,
-                extract_end=extract_end if extract_end > 0 else video_duration,
+                extract_start=time_range_start,
+                extract_end=time_range_end if time_range_end > 0 else (video_duration if video_duration > 0 else _effective_duration),
                 enable_audio=enable_audio,
                 quality_mode=quality_mode,
                 youtube_strategy_used=youtube_strategy_used,
@@ -2265,7 +2278,8 @@ async def _run_analyze_pipeline_impl(
 
 async def _run_chunked_full_game(
     *,
-    local_video_path: Path,
+    local_video_path: Path | None,
+    video_url: str | None = None,
     video_duration: float,
     jersey_number: int,
     jersey_color: str,
@@ -2282,7 +2296,9 @@ async def _run_chunked_full_game(
 ) -> dict[str, Any]:
     """Process full game video in 30-minute chunks to avoid OOM.
 
-    Each chunk: extract ~150 frames → run OCR → collect detections → free frames.
+    If video_url is provided and local_video_path is None, downloads each
+    30-min chunk separately (avoids 2hr+ downloads that timeout/403).
+    Each chunk: download → extract ~400 frames → run OCR → collect detections → free.
     After all chunks: merge detections → temporal consensus → clip extraction.
     Memory stays under ~2.5GB per chunk (vs 3.5GB+ for full game at once).
     """
@@ -2310,7 +2326,7 @@ async def _run_chunked_full_game(
 
     # ── Audio analysis (one-time, on full video) ──
     audio_result = AudioAnalysisResult(has_audio=False)
-    if enable_audio and local_video_path.exists():
+    if enable_audio and local_video_path and local_video_path.exists():
         t0 = time.perf_counter()
         try:
             from app.services.audio_analyzer import analyze_audio
@@ -2353,26 +2369,81 @@ async def _run_chunked_full_game(
     chunk_count = 0
     _chunked_ocr_start = time.perf_counter()
 
+    # Per-chunk download mode: download each 30-min chunk from YouTube separately
+    # This avoids 2hr+ downloads that timeout or get 403 errors
+    _per_chunk_download = (video_url is not None and local_video_path is None)
+    _chunk_video_path = local_video_path  # Will be overwritten per chunk if downloading
+
     chunk_start = extract_start
     while chunk_start < extract_end:
         chunk_end = min(chunk_start + CHUNK_SIZE, extract_end)
         chunk_count += 1
         LOGGER.info(
-            "Chunked: processing chunk %d (%.0f-%.0fs of %.0fs)",
+            "Chunked: processing chunk %d (%.0f-%.0fs of %.0fs)%s",
             chunk_count, chunk_start, chunk_end, extract_end,
+            " [per-chunk download]" if _per_chunk_download else "",
         )
+
+        # ── Per-chunk download from YouTube ──
+        if _per_chunk_download:
+            t_dl = time.perf_counter()
+            try:
+                from app.services.detection_runtime import PipelineSettings
+                settings = PipelineSettings()
+                from functools import partial
+                from starlette.concurrency import run_in_threadpool
+                dl_result = await run_in_threadpool(
+                    partial(
+                        download_youtube_sync,
+                        video_url,
+                        start_time=chunk_start,
+                        end_time=chunk_end,
+                        yt_dlp_binary=settings.yt_dlp_binary,
+                        ffmpeg_binary=settings.ffmpeg_binary,
+                    )
+                )
+                _chunk_video_path = dl_result.path
+                dl_elapsed = time.perf_counter() - t_dl
+                vid_w, vid_h = get_video_resolution(_chunk_video_path)
+                file_mb = round(_chunk_video_path.stat().st_size / 1024 / 1024, 1)
+                LOGGER.info(
+                    "Chunked: chunk %d downloaded %dx%d %sMB in %.1fs via %s",
+                    chunk_count, vid_w, vid_h, file_mb, dl_elapsed,
+                    getattr(dl_result, "strategy_used", "?"),
+                )
+                if chunk_count == 1:
+                    youtube_strategy_used = getattr(dl_result, "strategy_used", "chunked_download")
+                    layer_timings["youtube_download"] = {
+                        "elapsed_ms": round(dl_elapsed * 1000),
+                        "status": "success",
+                        "video_resolution": f"{vid_w}x{vid_h}",
+                        "was_sectioned": dl_result.was_sectioned,
+                        "file_size_mb": file_mb,
+                        "mode": "per_chunk",
+                    }
+                    phases_used.append("youtube_download")
+            except Exception as exc:
+                LOGGER.error("Chunked: chunk %d download failed: %s", chunk_count, exc)
+                chunk_start = chunk_end
+                continue
 
         # Extract frames for this chunk only
         t0 = time.perf_counter()
-        # Log chunk info for diagnostics
+        # For per-chunk downloads, the video starts at 0 (it was pre-sectioned)
+        _frame_start = 0.0 if _per_chunk_download else chunk_start
+        _frame_end = (chunk_end - chunk_start) if _per_chunk_download else chunk_end
         chunk_frames = _extract_frames(
-            local_video_path,
+            _chunk_video_path,
             fps=1,  # 1fps for full games (capped by max_frames)
             sport=sport,
-            start_sec=chunk_start,
-            end_sec=chunk_end,
+            start_sec=_frame_start,
+            end_sec=_frame_end,
             max_frames=CHUNK_MAX_FRAMES,  # 400 frames per 30-min chunk
         )
+        # For per-chunk downloads, offset timestamps to real game time
+        if _per_chunk_download and chunk_frames:
+            chunk_frames = [(ts + chunk_start, frame) for ts, frame in chunk_frames]
+
         total_frames += len(chunk_frames)
         all_frame_timestamps.extend(ts for ts, _ in chunk_frames)
         LOGGER.info("Chunked: chunk %d extracted %d frames in %.1fs",
@@ -2403,6 +2474,14 @@ async def _run_chunked_full_game(
 
         # Free chunk frames immediately
         chunk_frames.clear()
+
+        # Clean up per-chunk download file to save disk space
+        if _per_chunk_download and _chunk_video_path and _chunk_video_path.exists():
+            try:
+                import shutil
+                shutil.rmtree(_chunk_video_path.parent, ignore_errors=True)
+            except Exception:
+                pass
 
         # Unload non-essential models between chunks to prevent memory growth
         try:

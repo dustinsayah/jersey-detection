@@ -587,11 +587,11 @@ def download_youtube_sync(
     _segment_seconds = (end_time - start_time) if end_time > 0 else 0
 
     # Per-strategy timeout: scale with segment length
-    # Short clips: 60s, medium segments: 120s, full games: 600s
+    # Short clips: 60s, medium segments (10-30 min): 300s, full games: 600s
     if _segment_seconds > 3600:
         _strategy_timeout = 600  # 2hr game = big download, needs time
     elif _segment_seconds > 600:
-        _strategy_timeout = 180
+        _strategy_timeout = 300  # 30-min chunk at 720p = ~350MB, needs 300s via WARP
     else:
         _strategy_timeout = 60
 
@@ -870,7 +870,7 @@ def download_youtube_sync(
         """
         if not _warp_available:
             return None
-        _max_retries = 1 if _segment_seconds > 3600 else 3  # Less retries for long videos
+        _max_retries = 1 if _segment_seconds > 1200 else 3  # Less retries for 20min+ segments
         for _retry in range(_max_retries):
             if _retry > 0:
                 LOGGER.info("W0: retry %d/%d after 5s backoff", _retry + 1, _max_retries)

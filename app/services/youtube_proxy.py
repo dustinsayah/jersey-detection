@@ -573,6 +573,26 @@ def download_youtube_sync(
         """Check output file exists and is large enough."""
         return output_path.exists() and output_path.stat().st_size > _MIN_FILE_SIZE
 
+    def _get_video_height() -> int:
+        """Get video height in pixels using ffprobe. Returns 0 on error."""
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                [ffmpeg_binary.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffmpeg_binary else "ffprobe",
+                 "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=height",
+                 "-of", "csv=p=0", str(output_path)],
+                capture_output=True, text=True, timeout=10)
+            return int(result.stdout.strip())
+        except Exception:
+            return 0
+
+    def _is_720p_or_better() -> bool:
+        """Check if the downloaded video is at least 720p."""
+        h = _get_video_height()
+        LOGGER.info("Resolution check: height=%d for %s", h, output_path.name)
+        return h >= 700  # Allow some tolerance (720 → 700)
+
     # ── Cookie file detection ─────────────────────────────────────────
     cookie_file = _get_cookie_file()
     _has_cookies = bool(cookie_file)
@@ -650,12 +670,24 @@ def download_youtube_sync(
                             proxy=_WARP_HTTP_PROXY, skip_cookies=False,
                             errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_dash_web")
+                if _is_720p_or_better():
+                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_dash_web")
+                LOGGER.warning("CW0: Downloaded but only %dp — continuing to try 720p strategies", _get_video_height())
+                # Keep the file as fallback but continue trying for 720p
+                _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
+                import shutil
+                shutil.move(str(output_path), str(_low_res_fallback_path))
         return None
 
     def _s_warp_cookies_muxed() -> DownloadResult | None:
-        """WARP proxy + cookies + web client — muxed 360p fallback."""
+        """WARP proxy + cookies + web client — muxed fallback (skip if 720p needed)."""
         if not (_warp_available and _has_cookies):
+            return None
+        # Skip muxed (360p) — we already have a 360p fallback from CW0
+        # Continue to WARP-only strategies which might get 720p via android_vr
+        _low_res_fb = output_path.with_suffix(".360p.mp4")
+        if _low_res_fb.exists():
+            LOGGER.info("CW1: Skipping muxed — already have 360p fallback, trying for 720p")
             return None
         if _yt_dlp_python_download(url, output_path, client="web",
                                    start_time=start_time, end_time=end_time,
@@ -1103,6 +1135,16 @@ def download_youtube_sync(
     if _errors_detail:
         _detail_parts = [f"{k}: {v}" for k, v in _errors_detail.items()]
         _detail_str = f" Detail: {'; '.join(_detail_parts[:5])}"
+    # ── 360p fallback recovery ──────────────────────────────────────────
+    # If CW0 downloaded at 360p and we saved it as a fallback, use it rather than failing entirely
+    _low_res_fb = output_path.with_suffix(".360p.mp4")
+    if _low_res_fb.exists() and _low_res_fb.stat().st_size > _MIN_FILE_SIZE:
+        import shutil
+        shutil.move(str(_low_res_fb), str(output_path))
+        LOGGER.warning("Using 360p fallback — all 720p strategies failed")
+        _record_download_success()
+        return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_360p_fallback")
+
     raise RuntimeError(
         f"All download strategies failed for: {url} "
         f"(original: {original_url}). "

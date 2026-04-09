@@ -1,4 +1,4 @@
-# YouTube download proxy — 16-strategy robust download chain
+# YouTube download proxy — 18-strategy robust download chain
 #
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
@@ -602,13 +602,14 @@ def download_youtube_sync(
         If valid YouTube Premium/login cookies are present, this bypasses
         datacenter IP blocks entirely. FREE — no Decodo bandwidth used.
         Cookies expire every 3-5 days and must be refreshed from Firefox.
+        Uses 'web' client because 'android_vr' does not support cookies.
         """
         if not _has_cookies:
             return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="android_vr", start_time=start_time, end_time=end_time,
+                            client="web", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout,
-                            strategy_name="Strategy C0 (Cookies DASH+EJS)",
+                            strategy_name="Strategy C0 (Cookies DASH+EJS web)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy="", errors_detail=_errors_detail):
             if _file_valid():
@@ -616,18 +617,54 @@ def download_youtube_sync(
         return None
 
     def _s_cookies_muxed() -> DownloadResult | None:
-        """Cookie-authenticated muxed fallback (360p, no proxy needed)."""
+        """Cookie-authenticated muxed fallback (360p, no proxy needed).
+        Uses 'web' client because 'android_vr' does not support cookies.
+        """
         if not _has_cookies:
             return None
-        if _yt_dlp_python_download(url, output_path, client="android_vr",
+        if _yt_dlp_python_download(url, output_path, client="web",
                                    start_time=start_time, end_time=end_time,
-                                   strategy_name="Strategy C1 (Cookies muxed pylib)",
+                                   strategy_name="Strategy C1 (Cookies muxed pylib web)",
                                    format_override=_MUXED_FORMAT,
                                    proxy="",
                                    timeout=_strategy_timeout,
                                    errors_detail=_errors_detail):
             if _file_valid():
                 return _make_result(output_path, sectioned=has_time_range, strategy="cookies_muxed_pylib")
+        return None
+
+    # ── WARP + Cookies strategies (web client) ──────────────────────────
+    # Combines Cloudflare WARP residential IP with cookie authentication.
+    # Uses 'web' client because 'android_vr' does not support cookies.
+    # These go BEFORE pure-WARP strategies since auth helps bypass bot checks.
+
+    def _s_warp_cookies_dash() -> DownloadResult | None:
+        """WARP proxy + cookies + web client — DASH 720p."""
+        if not (_warp_available and _has_cookies):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy CW0 (WARP+Cookies DASH web)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_WARP_HTTP_PROXY, skip_cookies=False,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_dash_web")
+        return None
+
+    def _s_warp_cookies_muxed() -> DownloadResult | None:
+        """WARP proxy + cookies + web client — muxed 360p fallback."""
+        if not (_warp_available and _has_cookies):
+            return None
+        if _yt_dlp_python_download(url, output_path, client="web",
+                                   start_time=start_time, end_time=end_time,
+                                   strategy_name="Strategy CW1 (WARP+Cookies muxed web)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy=_WARP_HTTP_PROXY, skip_cookies=False,
+                                   timeout=_strategy_timeout, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_muxed_web")
         return None
 
     def _s0_decodo_sections() -> DownloadResult | None:
@@ -990,14 +1027,18 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
-    #   C0-C1. Cookie-authenticated (FREE — if cookies file has YouTube auth)
-    #   W0-W1. Cloudflare WARP SOCKS5 (FREE — wireproxy on port 40000)
-    #   0-0c.  Decodo residential proxy (PAID — reliable 720p)
-    #   1-7.   Direct datacenter + render server fallbacks
+    #   C0-C1.   Cookie-authenticated, no proxy (FREE — web client + cookies)
+    #   CW0-CW1. WARP + Cookies (FREE — best combo: residential IP + auth)
+    #   W0-W2.   Cloudflare WARP only (FREE — wireproxy on port 40000/40001)
+    #   0-0c.    Decodo residential proxy (PAID — reliable 720p)
+    #   1-7.     Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
         # Cookie-first: FREE, no proxy — try if cookies file has valid YouTube auth
         ("cookies_dash_ejs", _s_cookies_dash),
         ("cookies_muxed_pylib", _s_cookies_muxed),
+        # WARP + Cookies (web client): FREE — residential IP + auth, best combo
+        ("warp_cookies_dash_web", _s_warp_cookies_dash),
+        ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
         # WARP HTTP: FREE — HTTP proxy (port 40001) works with both yt-dlp AND ffmpeg
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),

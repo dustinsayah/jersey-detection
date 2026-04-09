@@ -996,11 +996,11 @@ async def _run_analyze_pipeline_impl(
         _is_dark_jersey = is_dark_color(jersey_color)
         _is_navy_jersey = is_navy(jersey_color)
         if _is_navy_jersey:
-            ocr_conf = 0.12
+            ocr_conf = 0.08  # Navy jerseys: dark + reflective = very hard to read
         elif _is_dark_jersey:
-            ocr_conf = 0.15
+            ocr_conf = 0.12
         elif sport.lower() == "football":
-            ocr_conf = FOOTBALL_CONF_THRESHOLD  # 0.15 — smaller numbers on helmets/distance
+            ocr_conf = FOOTBALL_CONF_THRESHOLD  # 0.08 — smaller numbers on helmets/distance
         elif resolved_quality == "aggressive":
             ocr_conf = 0.15
         else:

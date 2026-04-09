@@ -444,10 +444,10 @@ def extract_clips(
                 clip.description = "Game Action"
 
     # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
-    # Merge clips that overlap OR are within 8s of each other.
-    # Aggressive merging prevents 100+ micro-clips from play-by-play splitting.
-    PROXIMITY_GAP = 8.0
-    MOTION_SIMILARITY = 25.0
+    # Merge clips that overlap OR are within 5s of each other.
+    # Balances merging nearby plays without collapsing distinct plays.
+    PROXIMITY_GAP = 5.0
+    MOTION_SIMILARITY = 20.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []
 

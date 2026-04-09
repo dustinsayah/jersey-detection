@@ -100,6 +100,13 @@ def _get_proxy() -> str:
 _WARP_PROXY = "socks5://127.0.0.1:40000"
 _WARP_HTTP_PROXY = "http://127.0.0.1:40001"
 
+# WARP rate-limit tracking: skip WARP strategies after repeated failures
+# YouTube blocks WARP IP after ~1-2 requests, wasting 30-60s per chunk trying all WARP strategies
+_warp_consecutive_failures: int = 0
+_warp_blocked_until: float = 0.0
+_WARP_BLOCK_THRESHOLD = 2  # Block after 2 consecutive full-failures
+_WARP_BLOCK_DURATION = 300  # Skip all WARP strategies for 5 minutes
+
 # Rate limiting: track last successful YouTube download to prevent 429
 _last_download_time: float = 0.0
 _MIN_DOWNLOAD_INTERVAL = 15  # seconds between download requests
@@ -867,8 +874,15 @@ def download_youtube_sync(
 
         YouTube intermittently blocks android_vr (LOGIN_REQUIRED), so we retry
         up to 3 times with short delays. This is the ONLY path to 720p DASH.
+        Skips entirely if android_vr has been rate-limited recently.
         """
+        global _warp_consecutive_failures, _warp_blocked_until
         if not _warp_available:
+            return None
+        # Skip if WARP IP was recently rate-limited by YouTube
+        if time.time() < _warp_blocked_until:
+            LOGGER.info("W0: SKIPPED — WARP blocked for %.0fs more",
+                        _warp_blocked_until - time.time())
             return None
         _max_retries = 1 if _segment_seconds > 1200 else 3  # Less retries for 20min+ segments
         for _retry in range(_max_retries):
@@ -885,7 +899,10 @@ def download_youtube_sync(
                 if _file_valid():
                     h = _get_video_height()
                     LOGGER.info("W0: downloaded %dp (attempt %d)", h, _retry + 1)
+                    _warp_consecutive_failures = 0  # Reset on success
                     return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
+        # All retries failed — will be counted by the WARP block logic below
+        return None
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:
@@ -1168,6 +1185,13 @@ def download_youtube_sync(
             strategy_errors.append(f"{name}=total_timeout_skip")
             continue  # Skip but NEVER raise — always try remaining strategies
 
+        # Skip ALL WARP strategies if WARP IP is rate-limited by YouTube
+        if "warp" in name and time.time() < _warp_blocked_until:
+            LOGGER.info("WARP blocked: skipping %s (%.0fs remaining)",
+                        name, _warp_blocked_until - time.time())
+            strategy_errors.append(f"{name}=warp_blocked")
+            continue
+
         # If we just hit 429 on a WARP strategy and this is another WARP strategy,
         # add a short backoff to let YouTube's rate limiter reset
         if _429_hit and "warp" in name:
@@ -1181,12 +1205,23 @@ def download_youtube_sync(
                 elapsed = round(time.perf_counter() - dl_start, 1)
                 LOGGER.info("Downloaded in %ss via %s", elapsed, name)
                 _record_download_success()
+                if "warp" in name:
+                    _warp_consecutive_failures = 0  # Reset on WARP success
                 return result
             # fn returned None — strategy didn't apply or failed gracefully
             err_detail = _errors_detail.get(name, "")
             if "429" in str(err_detail):
                 _429_hit = True
             strategy_errors.append(f"{name}=failed")
+            # Track WARP failures for rate-limit detection
+            if "warp" in name and name != "warp_cookies_dash_web":
+                # Don't count CW0 (it often gets 360p which is "fail" for 720p but not a block)
+                _warp_consecutive_failures += 1
+                if _warp_consecutive_failures >= _WARP_BLOCK_THRESHOLD * 3:
+                    # Multiple WARP strategies failed = WARP IP is blocked
+                    _warp_blocked_until = time.time() + _WARP_BLOCK_DURATION
+                    LOGGER.warning("WARP IP blocked by YouTube (%d failures) — skipping WARP for %ds",
+                                   _warp_consecutive_failures, _WARP_BLOCK_DURATION)
         except Exception as exc:
             strategy_errors.append(f"{name}={type(exc).__name__}")
             LOGGER.warning("Strategy %s EXCEPTION: %s: %s", name, type(exc).__name__, str(exc)[:200])

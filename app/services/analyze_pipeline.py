@@ -1964,34 +1964,30 @@ async def _run_analyze_pipeline_impl(
                     tc_stats["cross_layer_confirmed"],
                 )
 
-                # Use confirmed timestamps to filter detection_points
+                # Boost (don't filter) detection_points near confirmed timestamps.
+                # Previously this REMOVED detection_points not near jersey sightings,
+                # which threw away valid motion/pose/audio detections and caused
+                # only 4 clips from 288 detections.  Now we keep ALL detection_points
+                # but boost confidence of those near confirmed jersey timestamps.
                 if confirmed_dets:
                     confirmed_timestamps = set()
                     for cd in confirmed_dets:
                         confirmed_timestamps.add(cd.get("timestamp", 0))
-                    pre_filter_count = len(detection_points)
-                    # Widen timestamp matching to 1.5s (was 0.5s)
-                    filtered_dp = [
-                        dp for dp in detection_points
-                        if any(
-                            abs(dp.timestamp - cts) < 1.5
+                    boosted_count = 0
+                    for dp in detection_points:
+                        near_confirmed = any(
+                            abs(dp.timestamp - cts) < 2.0
                             for cts in confirmed_timestamps
                         )
-                    ]
-                    # Only apply filter if it keeps at least some detections
-                    if filtered_dp:
-                        detection_points = filtered_dp
-                        LOGGER.info(
-                            "Pipeline: temporal consensus reduced detection_points "
-                            "%d → %d",
-                            pre_filter_count, len(detection_points),
-                        )
-                    else:
-                        LOGGER.warning(
-                            "Pipeline: temporal consensus timestamp match found 0 "
-                            "of %d — keeping original detection_points",
-                            pre_filter_count,
-                        )
+                        if near_confirmed and not dp.jersey_visible:
+                            dp.confidence = min(1.0, dp.confidence + 0.1)
+                            boosted_count += 1
+                    LOGGER.info(
+                        "Pipeline: temporal consensus boosted %d of %d "
+                        "detection_points (kept all, %d confirmed timestamps)",
+                        boosted_count, len(detection_points),
+                        len(confirmed_timestamps),
+                    )
                 else:
                     # Consensus found 0 confirmed — keep detection_points anyway
                     # The jitter filter in clip_extractor handles false positives
@@ -2850,12 +2846,16 @@ async def _run_chunked_full_game(
 
     # ── Extract clips ──
     _t_clip_extract = time.perf_counter()
+    # Use effective analyzed duration, NOT full video duration.
+    # Full video might be 7200s but we only extracted 0-1200s.
+    # Passing full duration forces _is_full_game=True → cluster_gap=5.0 (too wide).
+    _effective_clip_dur = extract_end - extract_start
     clips = extract_clips(
         detections=detection_points,
         audio_result=audio_result if audio_result.has_audio else None,
         sport=sport,
         position=position,
-        video_duration=video_duration,
+        video_duration=_effective_clip_dur,
     )
     layer_timings["clip_extraction"] = {
         "elapsed_ms": round((time.perf_counter() - _t_clip_extract) * 1000),

@@ -291,7 +291,7 @@ class TestModelsEndpoint:
     def test_models_endpoint_version_is_v6(self, client: TestClient) -> None:
         response = client.get("/models")
         data = response.json()
-        assert data["version"] == "v7.0.1"
+        assert data["version"] == "v8.6.0"
 
     def test_models_endpoint_lists_are_valid(self, client: TestClient) -> None:
         response = client.get("/models")
@@ -309,7 +309,7 @@ class TestLiveEndpointV6:
     def test_live_includes_v6_version(self, client: TestClient) -> None:
         response = client.get("/live")
         data = response.json()
-        assert data["version"] == "v7.0.1"
+        assert data["version"] == "v8.6.0"
 
     def test_live_includes_model_count(self, client: TestClient) -> None:
         response = client.get("/live")

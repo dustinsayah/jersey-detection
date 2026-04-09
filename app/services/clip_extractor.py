@@ -151,8 +151,8 @@ MAX_CLIP_DURATION = 30.0
 FULL_GAME_MAX_CLIP_DURATION = 15.0
 
 # ── Hard caps on clip count ──────────────────────────────────────────
-MAX_CLIPS_PER_GAME = 30   # Absolute max clips returned
-MAX_CLIPS_PER_HOUR = 15   # Per hour of video
+MAX_CLIPS_PER_GAME = 35   # Absolute max clips returned
+MAX_CLIPS_PER_HOUR = 20   # Per hour of video
 
 # Maximum distance between jersey detections to cluster them (seconds)
 # Basketball: 3s gap — fast-paced, plays change quickly
@@ -444,9 +444,11 @@ def extract_clips(
                 clip.description = "Game Action"
 
     # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
-    # Merge clips that overlap OR are within 5s of each other.
-    # Balances merging nearby plays without collapsing distinct plays.
-    PROXIMITY_GAP = 5.0
+    # Merge clips that overlap OR are within gap of each other.
+    # Football: tighter gap (2s) — plays are well-separated by 25-30s dead ball,
+    # and expansion already adds 2.5s before + 5s after = 7.5s buffer.
+    # Other sports: 5s gap for continuous action.
+    PROXIMITY_GAP = 2.0 if sport.lower() == "football" else 5.0
     MOTION_SIMILARITY = 20.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []

@@ -662,29 +662,33 @@ def download_youtube_sync(
         """WARP proxy + cookies + web client — DASH 720p."""
         if not (_warp_available and _has_cookies):
             return None
-        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="web", start_time=start_time, end_time=end_time,
-                            timeout=_strategy_timeout,
-                            strategy_name="Strategy CW0 (WARP+Cookies DASH web)",
-                            format_override=_DASH_H264_FORMAT, use_ejs=True,
-                            proxy=_WARP_HTTP_PROXY, skip_cookies=False,
-                            errors_detail=_errors_detail):
-            if _file_valid():
-                if _is_720p_or_better():
-                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_dash_web")
-                LOGGER.warning("CW0: Downloaded but only %dp — continuing to try 720p strategies", _get_video_height())
-                # Keep the file as fallback but continue trying for 720p
-                _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
-                import shutil
-                shutil.move(str(output_path), str(_low_res_fallback_path))
+        # Try multiple clients that support cookies: web, android, ios
+        for _client in ("web", "android", "ios"):
+            if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                                client=_client, start_time=start_time, end_time=end_time,
+                                timeout=_strategy_timeout,
+                                strategy_name=f"Strategy CW0 (WARP+Cookies DASH {_client})",
+                                format_override=_DASH_H264_FORMAT, use_ejs=True,
+                                proxy=_WARP_HTTP_PROXY, skip_cookies=False,
+                                errors_detail=_errors_detail):
+                if _file_valid():
+                    if _is_720p_or_better():
+                        return _make_result(output_path, sectioned=has_time_range,
+                                            strategy=f"warp_cookies_dash_{_client}")
+                    LOGGER.warning("CW0 (%s): Downloaded but only %dp — trying next client",
+                                   _client, _get_video_height())
+        # Save the last download as fallback if it exists
+        if _file_valid():
+            _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
+            import shutil
+            shutil.move(str(output_path), str(_low_res_fallback_path))
         return None
 
     def _s_warp_cookies_muxed() -> DownloadResult | None:
-        """WARP proxy + cookies + web client — muxed fallback (skip if 720p needed)."""
+        """WARP proxy + cookies — muxed fallback (skip if 720p needed)."""
         if not (_warp_available and _has_cookies):
             return None
         # Skip muxed (360p) — we already have a 360p fallback from CW0
-        # Continue to WARP-only strategies which might get 720p via android_vr
         _low_res_fb = output_path.with_suffix(".360p.mp4")
         if _low_res_fb.exists():
             LOGGER.info("CW1: Skipping muxed — already have 360p fallback, trying for 720p")

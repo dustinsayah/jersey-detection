@@ -2152,6 +2152,26 @@ async def _run_analyze_pipeline_impl(
                 clip.end_time = clip.start_time + _max_dur
         LOGGER.info("Pipeline: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_dur)
 
+        # ── Temporal jersey attribution (standard path) ──
+        _jersey_ts_std = sorted(
+            d["timestamp"] for d in all_layer_dets
+            if d.get("number_detected") == jersey_number
+        ) if all_layer_dets else []
+        if _jersey_ts_std and clips:
+            _attr_count_std = 0
+            for clip in clips:
+                if clip.jersey_visible:
+                    continue
+                for jts in _jersey_ts_std:
+                    if clip.start_time - 15 <= jts <= clip.end_time + 15:
+                        clip.jersey_visible = True
+                        clip.jersey_number_seen = jersey_number
+                        _attr_count_std += 1
+                        break
+            if _attr_count_std:
+                LOGGER.info("Pipeline: temporal jersey attribution: %d clips gained jersey=%d",
+                            _attr_count_std, jersey_number)
+
         # ── Step 9: Stat generation pipeline ───────────────────────────
         stat_result: dict = {"game_stats": {}, "per_clip_stats": [], "actions_detected": []}
         t0 = time.perf_counter()
@@ -2468,9 +2488,9 @@ async def _run_chunked_full_game(
 
     # OCR confidence threshold
     if _is_navy_jersey:
-        ocr_conf = 0.12
+        ocr_conf = 0.08  # Navy jerseys need very low threshold (dark + reflective)
     elif _is_dark:
-        ocr_conf = 0.15
+        ocr_conf = 0.12
     elif _is_football:
         ocr_conf = FOOTBALL_CONF_THRESHOLD
     elif quality_mode == "aggressive":
@@ -2872,6 +2892,30 @@ async def _run_chunked_full_game(
             clip.end_time = clip.start_time + _max_c
     LOGGER.info("Chunked: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_c)
 
+    # ── Temporal jersey attribution ──
+    # If jersey was confirmed in nearby clips (within 15s), attribute it to
+    # unconfirmed clips too.  This dramatically improves jerseyDetectionRate
+    # for footage where the jersey is intermittently visible.
+    _jersey_ts = sorted(
+        d["timestamp"] for d in all_layer_dets
+        if d.get("number_detected") == jersey_number
+    ) if all_layer_dets else []
+    if _jersey_ts and clips:
+        _attr_count = 0
+        for clip in clips:
+            if clip.jersey_visible:
+                continue
+            # Check if any OCR detection of this jersey is within 15s of this clip
+            for jts in _jersey_ts:
+                if clip.start_time - 15 <= jts <= clip.end_time + 15:
+                    clip.jersey_visible = True
+                    clip.jersey_number_seen = jersey_number
+                    _attr_count += 1
+                    break
+        if _attr_count:
+            LOGGER.info("Chunked: temporal jersey attribution: %d clips gained jersey=%d",
+                        _attr_count, jersey_number)
+
     # ── Unload models ──
     try:
         roboflow_detector.unload_request_models()
@@ -3227,8 +3271,19 @@ def _run_chunk_ocr(
                 pass
 
     # ── v5 player detection → OCR ──
+    # Football: sample every frame during motion windows (≥2fps effective),
+    # every 3rd frame otherwise.  Other sports: every 2nd frame.
     _player_conf = 0.35 if _is_football else 0.20
-    sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
+    if _is_football and len(live_frames) > 30:
+        sampled = []
+        for idx, (ts, frame) in enumerate(live_frames):
+            motion = chunk_motion.get(ts, 0)
+            if motion > 15:
+                sampled.append((ts, frame))        # Every frame during action
+            elif idx % 3 == 0:
+                sampled.append((ts, frame))        # Every 3rd frame during lull
+    else:
+        sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
     _v5_crops = 0
     _V5_MAX_CROPS = 300  # Per chunk
     for ts, frame in sampled:

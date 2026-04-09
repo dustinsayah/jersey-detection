@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, Request, UploadFile, File
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
@@ -313,7 +313,7 @@ def health(request: Request) -> JSONResponse:
                         cookie_health["action_needed"] = (
                             "POST new cookies via: curl -X POST "
                             "https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
-                            "-F 'file=@youtube_cookies.txt'"
+                            "--data-binary @youtube_cookies.txt"
                         )
                     elif est_expiry_days < 2.0:
                         cookie_health["warning"] = "Cookies expiring in ~1 day — plan refresh"
@@ -584,7 +584,7 @@ def refresh_cookies() -> JSONResponse:
                 "2. Install 'Get cookies.txt LOCALLY' extension\n"
                 "3. Export cookies for youtube.com\n"
                 "4. Upload: curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
-                "-F 'file=@cookies.txt'"
+                "--data-binary @cookies.txt"
             ),
         })
 
@@ -618,20 +618,27 @@ def refresh_cookies() -> JSONResponse:
             "1. Open Chrome/Firefox, verify you're logged into YouTube\n"
             "2. Use 'Get cookies.txt LOCALLY' extension to export\n"
             "3. Upload: curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies "
-            "-F 'file=@cookies.txt'"
+            "--data-binary @cookies.txt"
         ),
     })
 
 
 @router.post("/upload-cookies")
-async def upload_cookies(file: UploadFile = File(...)) -> JSONResponse:
+async def upload_cookies(request: Request) -> JSONResponse:
     """Upload new YouTube cookies without redeploying.
 
-    Usage:
+    Usage (raw body):
         curl -X POST https://jersey-detection-production-d8d8.up.railway.app/upload-cookies \\
-             -F 'file=@youtube_cookies.txt'
+             --data-binary @youtube_cookies.txt
     """
-    content = (await file.read()).decode("utf-8", errors="replace")
+    body = await request.body()
+    if not body:
+        return JSONResponse(status_code=400, content={
+            "status": "rejected",
+            "reason": "Empty request body",
+            "hint": "Send cookie file as raw body: curl -X POST URL --data-binary @cookies.txt",
+        })
+    content = body.decode("utf-8", errors="replace")
 
     # Validate the uploaded cookie file
     validation = _validate_cookie_content(content)

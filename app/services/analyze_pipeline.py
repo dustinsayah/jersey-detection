@@ -2306,7 +2306,10 @@ async def _run_chunked_full_game(
     from collections import defaultdict
     from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
 
-    CHUNK_SIZE = 1800  # 30 minutes per chunk
+    # Per-chunk download uses 10-min chunks (fits in WARP 300s timeout at 720p)
+    # Pre-downloaded video uses 30-min chunks (no download timeout concern)
+    _per_chunk_download = (video_url is not None and local_video_path is None)
+    CHUNK_SIZE = 600 if _per_chunk_download else 1800
     CHUNK_MAX_FRAMES = 400  # Up from 200 — more frames = more clips (frames every ~4.5s)
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
@@ -2369,9 +2372,6 @@ async def _run_chunked_full_game(
     chunk_count = 0
     _chunked_ocr_start = time.perf_counter()
 
-    # Per-chunk download mode: download each 30-min chunk from YouTube separately
-    # This avoids 2hr+ downloads that timeout or get 403 errors
-    _per_chunk_download = (video_url is not None and local_video_path is None)
     _chunk_video_path = local_video_path  # Will be overwritten per chunk if downloading
 
     chunk_start = extract_start

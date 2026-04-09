@@ -590,8 +590,8 @@ def download_youtube_sync(
     # Short clips: 60s, medium segments (10-30 min): 300s, full games: 600s
     if _segment_seconds > 3600:
         _strategy_timeout = 600  # 2hr game = big download, needs time
-    elif _segment_seconds > 600:
-        _strategy_timeout = 300  # 30-min chunk at 720p = ~350MB, needs 300s via WARP
+    elif _segment_seconds >= 300:
+        _strategy_timeout = 300  # 10-30 min chunk at 720p, needs 300s via WARP
     else:
         _strategy_timeout = 60
 

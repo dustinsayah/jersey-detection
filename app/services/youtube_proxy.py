@@ -1027,18 +1027,18 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
-    #   C0-C1.   Cookie-authenticated, no proxy (FREE — web client + cookies)
-    #   CW0-CW1. WARP + Cookies (FREE — best combo: residential IP + auth)
+    #   CW0-CW1. WARP + Cookies (FREE — best combo: residential IP + auth → 720p)
+    #   C0-C1.   Cookie-only, no proxy (FREE — datacenter IP, usually 360p)
     #   W0-W2.   Cloudflare WARP only (FREE — wireproxy on port 40000/40001)
     #   0-0c.    Decodo residential proxy (PAID — reliable 720p)
     #   1-7.     Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # Cookie-first: FREE, no proxy — try if cookies file has valid YouTube auth
-        ("cookies_dash_ejs", _s_cookies_dash),
-        ("cookies_muxed_pylib", _s_cookies_muxed),
-        # WARP + Cookies (web client): FREE — residential IP + auth, best combo
+        # WARP + Cookies (web client): FREE — residential IP + auth → 720p
         ("warp_cookies_dash_web", _s_warp_cookies_dash),
         ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
+        # Cookie-only: FREE, no proxy — datacenter IP, usually 360p only
+        ("cookies_dash_ejs", _s_cookies_dash),
+        ("cookies_muxed_pylib", _s_cookies_muxed),
         # WARP HTTP: FREE — HTTP proxy (port 40001) works with both yt-dlp AND ffmpeg
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),

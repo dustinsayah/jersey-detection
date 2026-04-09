@@ -587,11 +587,11 @@ def download_youtube_sync(
     _segment_seconds = (end_time - start_time) if end_time > 0 else 0
 
     # Per-strategy timeout: scale with segment length
-    # Short clips: 60s, medium segments: 120s, full games: 300s
+    # Short clips: 60s, medium segments: 120s, full games: 600s
     if _segment_seconds > 3600:
-        _strategy_timeout = 300
+        _strategy_timeout = 600  # 2hr game = big download, needs time
     elif _segment_seconds > 600:
-        _strategy_timeout = 120
+        _strategy_timeout = 180
     else:
         _strategy_timeout = 60
 
@@ -604,7 +604,7 @@ def download_youtube_sync(
     _decodo_full_timeout = 1200
 
     # Overall timeout: generous for all videos since full download may be needed
-    _TOTAL_TIMEOUT = 1500
+    _TOTAL_TIMEOUT = 1800 if _segment_seconds > 3600 else 1500
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start
@@ -870,14 +870,15 @@ def download_youtube_sync(
         """
         if not _warp_available:
             return None
-        for _retry in range(3):
+        _max_retries = 1 if _segment_seconds > 3600 else 3  # Less retries for long videos
+        for _retry in range(_max_retries):
             if _retry > 0:
-                LOGGER.info("W0: retry %d/3 after 5s backoff", _retry + 1)
+                LOGGER.info("W0: retry %d/%d after 5s backoff", _retry + 1, _max_retries)
                 time.sleep(5)
             if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                                 client="android_vr", start_time=start_time, end_time=end_time,
                                 timeout=_strategy_timeout,
-                                strategy_name=f"Strategy W0 (WARP HTTP DASH+EJS, attempt {_retry+1})",
+                                strategy_name=f"Strategy W0 (WARP HTTP DASH+EJS, attempt {_retry+1}/{_max_retries})",
                                 format_override=_DASH_H264_FORMAT, use_ejs=True,
                                 proxy=_WARP_HTTP_PROXY, skip_cookies=True,
                                 errors_detail=_errors_detail):

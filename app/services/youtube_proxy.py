@@ -536,7 +536,44 @@ def download_youtube_sync(
     strategy_errors: list[str] = []
     _MIN_FILE_SIZE = 100_000  # 0.1MB — reject tiny/corrupt downloads
 
+    def _fix_moov_atom(path: Path) -> None:
+        """Fix missing moov atom in MP4 — common with download_ranges on muxed streams.
+
+        Uses ffmpeg to remux the file with faststart, which moves the moov atom
+        to the beginning. Without this, OpenCV's cv2.VideoCapture fails to open.
+        """
+        try:
+            import subprocess as _sp
+            probe = _sp.run(
+                [ffmpeg_binary.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffmpeg_binary else "ffprobe",
+                 "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=10)
+            if probe.returncode != 0 and "moov atom not found" in (probe.stderr or ""):
+                LOGGER.warning("moov atom not found in %s — attempting remux", path.name)
+                fixed = path.with_suffix(".fixed.mp4")
+                fix_cmd = [
+                    ffmpeg_binary, "-y",
+                    "-i", str(path),
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    str(fixed),
+                ]
+                result = _sp.run(fix_cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode == 0 and fixed.exists() and fixed.stat().st_size > 1000:
+                    path.unlink()
+                    fixed.rename(path)
+                    LOGGER.info("moov atom fixed successfully for %s", path.name)
+                else:
+                    LOGGER.warning("moov atom fix failed: %s", (result.stderr or "")[:200])
+                    if fixed.exists():
+                        fixed.unlink()
+        except Exception as exc:
+            LOGGER.warning("moov atom check failed: %s", exc)
+
     def _make_result(path: Path, sectioned: bool, strategy: str = "unknown") -> DownloadResult:
+        # Fix moov atom if needed (especially for muxed + download_ranges)
+        _fix_moov_atom(path)
         return DownloadResult(
             path=path,
             was_sectioned=sectioned and has_time_range,
@@ -826,20 +863,28 @@ def download_youtube_sync(
                      _WARP_PROXY, _WARP_HTTP_PROXY)
 
     def _s_warp_http_dash() -> DownloadResult | None:
-        """WARP HTTP proxy + DASH H.264 + EJS — best quality, ffmpeg-compatible."""
+        """WARP HTTP proxy + DASH H.264 + EJS — best quality, ffmpeg-compatible.
+
+        YouTube intermittently blocks android_vr (LOGIN_REQUIRED), so we retry
+        up to 3 times with short delays. This is the ONLY path to 720p DASH.
+        """
         if not _warp_available:
             return None
-        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="android_vr", start_time=start_time, end_time=end_time,
-                            timeout=_strategy_timeout,
-                            strategy_name="Strategy W0 (WARP HTTP DASH+EJS)",
-                            format_override=_DASH_H264_FORMAT, use_ejs=True,
-                            proxy=_WARP_HTTP_PROXY, skip_cookies=True,
-                            errors_detail=_errors_detail):
-            if _file_valid():
-                h = _get_video_height()
-                LOGGER.info("W0: downloaded %dp", h)
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
+        for _retry in range(3):
+            if _retry > 0:
+                LOGGER.info("W0: retry %d/3 after 5s backoff", _retry + 1)
+                time.sleep(5)
+            if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                                client="android_vr", start_time=start_time, end_time=end_time,
+                                timeout=_strategy_timeout,
+                                strategy_name=f"Strategy W0 (WARP HTTP DASH+EJS, attempt {_retry+1})",
+                                format_override=_DASH_H264_FORMAT, use_ejs=True,
+                                proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                errors_detail=_errors_detail):
+                if _file_valid():
+                    h = _get_video_height()
+                    LOGGER.info("W0: downloaded %dp (attempt %d)", h, _retry + 1)
+                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:

@@ -4,6 +4,10 @@
 # Pipeline runs in a SEPARATE THREAD with its own event loop, so the main
 # event loop stays free to yield keepalive lines every 15s.
 # Last line of response is the actual JSON result.
+#
+# Client disconnect detection: when the client drops the connection,
+# the cancel_event is set to signal the pipeline to abort. This prevents
+# zombie pipeline threads from holding the lock and blocking new requests.
 
 from __future__ import annotations
 
@@ -79,22 +83,38 @@ async def analyze(
     result_holder: dict[str, Any] = {}
     error_holder: list[Exception] = []
     pipeline_done = threading.Event()
+    cancel_event = threading.Event()
 
     def _run_pipeline_in_thread() -> None:
         """Run the async pipeline in a dedicated thread with its own event loop."""
-        with _PIPELINE_LOCK:
+        # Try to acquire lock with timeout — if another pipeline is running,
+        # wait up to 30s before giving up (prevents infinite queue)
+        acquired = _PIPELINE_LOCK.acquire(timeout=30)
+        if not acquired:
+            error_holder.append(RuntimeError("Server busy — another analysis is in progress"))
+            pipeline_done.set()
+            return
+        if cancel_event.is_set():
+            _PIPELINE_LOCK.release()
+            pipeline_done.set()
+            return
+        try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 from app.services.analyze_pipeline import run_analyze_pipeline
-                result = loop.run_until_complete(run_analyze_pipeline(**pipeline_params))
+                result = loop.run_until_complete(
+                    run_analyze_pipeline(**pipeline_params, cancel_event=cancel_event)
+                )
                 result_holder["data"] = result
             except Exception as exc:
                 LOGGER.exception("analyze.pipeline_thread_failed")
                 error_holder.append(exc)
             finally:
                 loop.close()
-                pipeline_done.set()
+        finally:
+            _PIPELINE_LOCK.release()
+            pipeline_done.set()
 
     async def _stream_with_keepalive() -> AsyncIterator[bytes]:
         """Yield keepalive lines while pipeline runs in separate thread."""
@@ -109,6 +129,14 @@ async def analyze(
                 None, pipeline_done.wait, _KEEPALIVE_INTERVAL
             )
             if not finished:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    LOGGER.warning("analyze.client_disconnected elapsed=%.1f — cancelling pipeline",
+                                   time.perf_counter() - started_at)
+                    cancel_event.set()
+                    # Wait briefly for pipeline to notice cancellation
+                    await main_loop.run_in_executor(None, pipeline_done.wait, 5)
+                    return
                 elapsed = round(time.perf_counter() - started_at, 1)
                 keepalive = json.dumps({"keepalive": True, "elapsed": elapsed})
                 LOGGER.debug("analyze.keepalive elapsed=%.1f", elapsed)
@@ -119,7 +147,8 @@ async def analyze(
 
         if error_holder:
             LOGGER.exception("analyze.request_failed", exc_info=error_holder[0])
-            error_json = json.dumps({"error": "Internal analysis error. See server logs for details."})
+            error_msg = str(error_holder[0])[:200]
+            error_json = json.dumps({"error": f"Analysis error: {error_msg}"})
             yield (error_json + "\n").encode()
         elif "data" in result_holder:
             result = result_holder["data"]

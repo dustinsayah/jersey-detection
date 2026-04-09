@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -404,6 +405,7 @@ async def run_analyze_pipeline(
     enable_tracking: bool = True,
     enable_pose: bool = True,
     quality_mode: str = "auto",
+    cancel_event: "threading.Event | None" = None,
 ) -> dict[str, Any]:
     """Run the full analysis pipeline with single-request concurrency.
 
@@ -432,6 +434,7 @@ async def run_analyze_pipeline(
             enable_tracking=enable_tracking,
             enable_pose=enable_pose,
             quality_mode=quality_mode,
+            cancel_event=cancel_event,
         )
 
 
@@ -449,6 +452,7 @@ async def _run_analyze_pipeline_impl(
     enable_tracking: bool = True,
     enable_pose: bool = True,
     quality_mode: str = "auto",
+    cancel_event: "threading.Event | None" = None,
 ) -> dict[str, Any]:
     """Internal pipeline implementation (called under semaphore)."""
     start_time = time.perf_counter()
@@ -467,6 +471,9 @@ async def _run_analyze_pipeline_impl(
 
     # Per-layer timing and debug info
     layer_timings: dict[str, dict] = {}
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
     try:
         # ── Step 1: Acquire video ────────────────────────────────────────
@@ -2376,6 +2383,10 @@ async def _run_chunked_full_game(
 
     chunk_start = extract_start
     while chunk_start < extract_end:
+        # Check for cancellation (client disconnected)
+        if cancel_event is not None and cancel_event.is_set():
+            LOGGER.warning("Pipeline: CANCELLED by client disconnect at chunk %d", chunk_count + 1)
+            break
         chunk_end = min(chunk_start + CHUNK_SIZE, extract_end)
         chunk_count += 1
         LOGGER.info(

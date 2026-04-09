@@ -436,6 +436,46 @@ def _build_player_summary(
     }
 
 
+def _detect_play_type_rules(
+    motion_score: float,
+    pose: str,
+    crowd_energy: float,
+    jersey_visible: bool,
+    sport: str,
+) -> str:
+    """Rule-based play type detection — supplements v4 model output.
+
+    Assigns meaningful play types based on signal combinations
+    even when v4 models return no detections.
+    """
+    sl = sport.lower()
+    if sl == "football":
+        if pose == "throwing" and motion_score > 40:
+            return "pass_play"
+        if pose == "running" and motion_score > 60:
+            return "qb_scramble"
+        if crowd_energy > 0.75 and motion_score > 50:
+            return "big_play"
+        if motion_score > 70:
+            return "game_action"  # High motion = active play
+        return "game_action"
+    elif sl == "basketball":
+        if pose == "jumping" and motion_score > 40:
+            return "shot_attempt"
+        if pose == "running" and motion_score > 60:
+            return "fast_break"
+        if crowd_energy > 0.7:
+            return "big_play"
+        return "game_action"
+    elif sl == "lacrosse":
+        if pose == "throwing" and motion_score > 40:
+            return "shot_attempt"
+        if crowd_energy > 0.7:
+            return "big_play"
+        return "game_action"
+    return "game_action"
+
+
 def _get_rss_mb() -> float:
     """Get current process RSS in MB."""
     try:
@@ -2192,6 +2232,18 @@ async def _run_analyze_pipeline_impl(
             v4_out = (clip.signals or {}).get("v4_outcome")
             if v4_out:
                 clip_dict["v4Outcome"] = v4_out
+            # Rule-based play type supplement (when v4 models didn't detect)
+            if not v4_out and clip_dict["playType"] == "game_action":
+                rule_type = _detect_play_type_rules(
+                    motion_score=(clip.signals or {}).get("motion", 0) or 0,
+                    pose=(clip.signals or {}).get("pose", "standing"),
+                    crowd_energy=(clip.signals or {}).get("crowd", 0) or 0,
+                    jersey_visible=clip.jersey_visible,
+                    sport=sport,
+                )
+                if rule_type != "game_action":
+                    clip_dict["playType"] = rule_type
+                    clip_dict["description"] = rule_type.replace("_", " ").title()
             # Include enriched fields for frontend
             clip_dict["deadBallRatio"] = round(dead_ball_ratio, 2)
             clip_dict["scoreboardDetected"] = len(scoreboard_detections) > 0
@@ -2468,6 +2520,7 @@ async def _run_chunked_full_game(
     # ── Process chunks ──
     all_ocr_dets: list[dict] = []
     all_v7_dets: list[dict] = []
+    all_v4_dets: list[dict] = []
     all_motion: dict[float, float] = {}
     all_frame_timestamps: list[float] = []
     total_frames = 0
@@ -2566,8 +2619,8 @@ async def _run_chunked_full_game(
         except Exception:
             pass
 
-        # Run OCR on this chunk
-        ocr_dets, v7_dets, motion = _run_chunk_ocr(
+        # Run OCR + v4 outcome detection on this chunk
+        ocr_dets, v7_dets, motion, v4_dets = _run_chunk_ocr(
             chunk_frames,
             jersey_number=jersey_number,
             jersey_color=jersey_color,
@@ -2578,6 +2631,7 @@ async def _run_chunked_full_game(
         all_ocr_dets.extend(ocr_dets)
         all_v7_dets.extend(v7_dets)
         all_motion.update(motion)
+        all_v4_dets.extend(v4_dets)
 
         # Free chunk frames immediately
         chunk_frames.clear()
@@ -2623,11 +2677,12 @@ async def _run_chunked_full_game(
         "total_frames": total_frames,
         "total_v5_detections": len(all_ocr_dets),
         "total_v7_detections": len(all_v7_dets),
+        "total_v4_detections": len(all_v4_dets),
         "total_motion_scores": len(all_motion),
     }
     LOGGER.info(
-        "Chunked: ALL %d chunks done — %d v5 dets, %d v7 dets, %d frames total",
-        chunk_count, len(all_ocr_dets), len(all_v7_dets), total_frames,
+        "Chunked: ALL %d chunks done — %d v5, %d v7, %d v4 outcomes, %d frames",
+        chunk_count, len(all_ocr_dets), len(all_v7_dets), len(all_v4_dets), total_frames,
     )
     phases_used.append("chunked_ocr")
 
@@ -2660,6 +2715,19 @@ async def _run_chunked_full_game(
     all_layer_dets = [d for d in all_layer_dets_raw if d.get("number_detected") == jersey_number]
     wrong_number_count = len(all_layer_dets_raw) - len(all_layer_dets)
 
+    # ── Build v4 outcome lookup ──
+    v4_outcomes_by_ts: dict[float, str] = {}
+    for d in all_v4_dets:
+        ts = d.get("timestamp", 0)
+        outcome = d.get("outcome", "")
+        if outcome:
+            # Keep highest-confidence outcome per timestamp
+            existing = v4_outcomes_by_ts.get(ts)
+            if not existing:
+                v4_outcomes_by_ts[ts] = outcome
+    LOGGER.info("Chunked: %d v4 outcome detections, %d unique timestamps",
+                len(all_v4_dets), len(v4_outcomes_by_ts))
+
     # ── Build detection points ──
     detection_points: list[DetectionPoint] = []
     ts_buckets: dict[float, list[dict]] = defaultdict(list)
@@ -2687,6 +2755,13 @@ async def _run_chunked_full_game(
             bonus += 0.15
         final_conf = min(1.0, best_conf + bonus)
 
+        # Find v4 outcome near this timestamp (±2s)
+        v4_out = ""
+        for v4_ts, v4_outcome in v4_outcomes_by_ts.items():
+            if abs(v4_ts - bucket_ts) < 2.0:
+                v4_out = v4_outcome
+                break
+
         detection_points.append(DetectionPoint(
             timestamp=bucket_ts,
             confidence=final_conf,
@@ -2694,6 +2769,7 @@ async def _run_chunked_full_game(
             jersey_number=jersey_number,
             motion_score=all_motion.get(bucket_ts, _nearest_value(all_motion, bucket_ts)),
             crowd_energy=_get_crowd_energy(audio_result, bucket_ts),
+            v4_outcome=v4_out,
         ))
 
     # ── Temporal consensus (relaxed for full games) ──
@@ -2733,6 +2809,12 @@ async def _run_chunked_full_game(
                 conf = motion / 100.0 * 0.5
                 if in_boundary:
                     conf = min(0.8, conf + 0.1)
+                # Check for v4 outcome near this timestamp
+                _v4_out_supp = ""
+                for _v4ts, _v4oc in v4_outcomes_by_ts.items():
+                    if abs(_v4ts - t) < 2.0:
+                        _v4_out_supp = _v4oc
+                        break
                 detection_points.append(DetectionPoint(
                     timestamp=t,
                     confidence=conf,
@@ -2740,6 +2822,7 @@ async def _run_chunked_full_game(
                     jersey_number=None,    # Don't stamp requested number on unconfirmed frames
                     motion_score=motion,
                     crowd_energy=_get_crowd_energy(audio_result, t),
+                    v4_outcome=_v4_out_supp,
                 ))
                 _supplement_count += 1
         if _supplement_count:
@@ -2853,6 +2936,18 @@ async def _run_chunked_full_game(
         v4_out = (clip.signals or {}).get("v4_outcome")
         if v4_out:
             clip_dict["v4Outcome"] = v4_out
+        # Rule-based play type supplement (when v4 models didn't detect)
+        if not v4_out and clip_dict["playType"] == "game_action":
+            rule_type = _detect_play_type_rules(
+                motion_score=(clip.signals or {}).get("motion", 0) or 0,
+                pose=(clip.signals or {}).get("pose", "standing"),
+                crowd_energy=(clip.signals or {}).get("crowd", 0) or 0,
+                jersey_visible=clip.jersey_visible,
+                sport=sport,
+            )
+            if rule_type != "game_action":
+                clip_dict["playType"] = rule_type
+                clip_dict["description"] = rule_type.replace("_", " ").title()
         # Caption + recruiting score + game clock for coach-friendly display
         clip_dict["caption"] = _generate_clip_caption(clip_dict, sport, position, jersey_number)
         clip_dict["recruitingScore"] = _compute_recruiting_score(clip_dict, sport, position)
@@ -2880,8 +2975,8 @@ async def _run_chunked_full_game(
     LOGGER.info("=== CHUNKED DETECTION SUMMARY ===")
     LOGGER.info("Sport: %s, Jersey: #%d, Chunks: %d, Frames: %d",
                 sport, jersey_number, chunk_count, total_frames)
-    LOGGER.info("V5 OCR: %d, V7 OCR: %d, Detection points: %d, Clips: %d",
-                len(all_ocr_dets), len(all_v7_dets), len(detection_points), len(clips_out))
+    LOGGER.info("V5 OCR: %d, V7 OCR: %d, V4 outcomes: %d, Detection points: %d, Clips: %d",
+                len(all_ocr_dets), len(all_v7_dets), len(all_v4_dets), len(detection_points), len(clips_out))
     LOGGER.info("Memory RSS: %dMB, Elapsed: %.1fs", memory_rss_mb, elapsed)
     LOGGER.info("=================================")
 
@@ -2896,8 +2991,8 @@ async def _run_chunked_full_game(
         "v7_football_detections": len(all_v7_dets),
         "v7_navy_detections": sum(1 for d in all_v7_dets if "v7_navy" in d.get("layer", "")),
         "v7_player_crops": 0,
-        "v4_outcome_detections": 0,
-        "v4_outcomes_found": 0,
+        "v4_outcome_detections": len(all_v4_dets),
+        "v4_outcomes_found": len(v4_outcomes_by_ts),
         "combined_detections": len(detection_points),
         "numbers_detected": sorted(str(n) for n in all_numbers_seen),
         "target_jersey_number": jersey_number,
@@ -3033,11 +3128,11 @@ def _run_chunk_ocr(
     sport: str,
     ocr_conf: float,
     time_limit: float = 90,
-) -> tuple[list[dict], list[dict], dict[float, float]]:
-    """Run OCR detection on a chunk of frames. Returns (ocr_detections, v7_detections, motion_scores).
+) -> tuple[list[dict], list[dict], dict[float, float], list[dict]]:
+    """Run OCR + v4 outcome detection on a chunk of frames.
 
-    Used by chunked pipeline to process one 30-min chunk at a time, keeping
-    memory usage bounded by only loading frames for one chunk.
+    Returns (ocr_detections, v7_detections, motion_scores, v4_outcome_detections).
+    Used by chunked pipeline to process one 30-min chunk at a time.
     """
     import gc
     from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
@@ -3191,9 +3286,25 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
+    # ── v4 outcome detection (every 6th live frame for speed) ──
+    chunk_v4_dets: list[dict] = []
+    _v4_sample = live_frames[::6] if len(live_frames) > 20 else live_frames
+    _v4_t0 = time.perf_counter()
+    for ts, frame in _v4_sample:
+        if time.perf_counter() - _v4_t0 > 30:  # Max 30s for v4
+            break
+        try:
+            v4_dets = roboflow_detector.detect_outcome_v4(frame, sport=sport)
+            if v4_dets:
+                for d in v4_dets:
+                    d["timestamp"] = ts
+                    chunk_v4_dets.append(d)
+        except Exception:
+            pass
+
     LOGGER.info(
-        "Chunk OCR: %d v5 dets, %d v7 dets, %d crops, %d motion scores in %.1fs",
-        len(chunk_ocr_dets), len(chunk_v7_dets), _v5_crops,
+        "Chunk OCR: %d v5, %d v7, %d v4 outcomes, %d crops, %d motion in %.1fs",
+        len(chunk_ocr_dets), len(chunk_v7_dets), len(chunk_v4_dets), _v5_crops,
         len(chunk_motion), time.perf_counter() - t0,
     )
 
@@ -3202,7 +3313,7 @@ def _run_chunk_ocr(
     rss_after_chunk = _get_rss_mb()
     LOGGER.info("Chunk OCR cleanup: RSS=%.0fMB", rss_after_chunk)
 
-    return chunk_ocr_dets, chunk_v7_dets, chunk_motion
+    return chunk_ocr_dets, chunk_v7_dets, chunk_motion, chunk_v4_dets
 
 
 def _smart_sample_frames(

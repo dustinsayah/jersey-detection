@@ -3,19 +3,20 @@
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
 # also REQUIRED to unlock any DASH formats. Strategy order:
-#   C0. Cookie-authenticated DASH (FREE, no proxy — if youtube_cookies.txt has auth)
-#   C1. Cookie-authenticated muxed fallback
-#   W0. WARP SOCKS5 + DASH H.264 + EJS (FREE — wireproxy on port 40000)
-#   W1. WARP SOCKS5 + muxed fallback (FREE)
+#   W0. WARP HTTP + android_vr DASH (FREE — 720p, no cookies needed)
+#   W0b. WARP HTTP + web client DASH (FREE — different fingerprint)
+#   CW0. WARP + Cookies DASH (FREE — auth fallback if bot-detected)
+#   W0e/f. WARP pylib DASH (FREE — no EJS needed)
+#   W1/W1b. WARP muxed (FREE — 480p fallback)
+#   WS. WARP SOCKS5 DASH/muxed (fallback if HTTP proxy issues)
+#   CW1. WARP + Cookies muxed
+#   C0/C1. Cookie-only DASH/muxed (datacenter IP — usually 360p)
 #   0.  Decodo residential proxy DASH (PAID)
 #   0a-0c. Decodo muxed/range/full fallbacks
-#   1.  yt-dlp android_vr + DASH H.264 + EJS (720p+ if IP not blocked)
-#   2.  yt-dlp android_vr + DASH H.264 + EJS + proxy (if YT_DLP_PROXY set)
+#   1.  yt-dlp android_vr + DASH (720p+ if IP not blocked)
+#   2.  yt-dlp android_vr + DASH + proxy
 #   3.  Render server proxy
-#   4.  yt-dlp android muxed (360p fallback)
-#   5.  yt-dlp Python lib android_vr + DASH
-#   6.  yt-dlp android muxed no-EJS (last resort)
-#   7.  Render server /extract-frames
+#   4-7. Muxed/pylib/bare fallbacks
 #
 # Cookie notes (researched Apr 2026):
 #   - Chrome 127+ has app-bound encryption — can't extract Chrome cookies
@@ -830,7 +831,12 @@ def download_youtube_sync(
                             proxy=_WARP_HTTP_PROXY, skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
+                if _is_720p_or_better():
+                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
+                LOGGER.warning("W0: Downloaded but only %dp — saving fallback, trying next", _get_video_height())
+                _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
+                import shutil
+                shutil.move(str(output_path), str(_low_res_fallback_path))
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:
@@ -845,7 +851,12 @@ def download_youtube_sync(
                             proxy=_WARP_HTTP_PROXY, skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_web")
+                if _is_720p_or_better():
+                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_web")
+                LOGGER.warning("W0b: Downloaded but only %dp — trying next", _get_video_height())
+                if not output_path.with_suffix(".360p.mp4").exists():
+                    import shutil
+                    shutil.move(str(output_path), str(output_path.with_suffix(".360p.mp4")))
         return None
 
     def _s_warp_http_dash_pylib() -> DownloadResult | None:
@@ -1063,29 +1074,32 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
-    #   CW0-CW1. WARP + Cookies (FREE — best combo: residential IP + auth → 720p)
-    #   C0-C1.   Cookie-only, no proxy (FREE — datacenter IP, usually 360p)
-    #   W0-W2.   Cloudflare WARP only (FREE — wireproxy on port 40000/40001)
-    #   0-0c.    Decodo residential proxy (PAID — reliable 720p)
-    #   1-7.     Direct datacenter + render server fallbacks
+    #   W0-W0b. WARP + android_vr (FREE — 720p via DASH, no cookies needed)
+    #   CW0.    WARP + Cookies (FREE — auth fallback for bot detection)
+    #   W0e-W2. WARP pylib/muxed/SOCKS fallbacks
+    #   C0-C1.  Cookie-only, no proxy (datacenter, 360p last resort)
+    #   0-0c.   Decodo residential proxy (PAID)
+    #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # WARP + Cookies (web client): FREE — residential IP + auth → 720p
-        ("warp_cookies_dash_web", _s_warp_cookies_dash),
-        ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
-        # Cookie-only: FREE, no proxy — datacenter IP, usually 360p only
-        ("cookies_dash_ejs", _s_cookies_dash),
-        ("cookies_muxed_pylib", _s_cookies_muxed),
-        # WARP HTTP: FREE — HTTP proxy (port 40001) works with both yt-dlp AND ffmpeg
+        # WARP + android_vr: FREE — gets 720p DASH, no cookies needed
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),
-        # WARP DASH via Python library — no EJS needed, proxy env vars set for ffmpeg
+        # WARP + Cookies: FREE — auth fallback if android_vr gets bot-detected
+        ("warp_cookies_dash_web", _s_warp_cookies_dash),
+        # WARP pylib: FREE — no EJS needed
         ("warp_http_dash_pylib", _s_warp_http_dash_pylib),
         ("warp_http_dash_pylib_web", _s_warp_http_dash_pylib_web),
+        # WARP muxed: FREE — 480p fallback
         ("warp_http_muxed", _s_warp_http_muxed),
         ("warp_http_muxed_web", _s_warp_http_muxed_web),
-        # WARP SOCKS5: fallback if HTTP proxy not working
+        # WARP SOCKS5: fallback if HTTP proxy has issues
         ("warp_socks_dash", _s_warp_socks_dash),
         ("warp_socks_muxed", _s_warp_socks_muxed),
+        # WARP + Cookies muxed: auth + muxed last WARP attempt
+        ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
+        # Cookie-only (no WARP) — datacenter IP, usually 360p
+        ("cookies_dash_ejs", _s_cookies_dash),
+        ("cookies_muxed_pylib", _s_cookies_muxed),
         # Decodo residential proxy — paid but reliable
         ("decodo_dash_sections", _s0_decodo_sections),
         ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),

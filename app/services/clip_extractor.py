@@ -250,9 +250,11 @@ def extract_clips(
     clusters: list[list[DetectionPoint]] = []
     current_cluster: list[DetectionPoint] = []
 
-    # Full-game mode: wider cluster gap because frames are 1fps (8-10s apart)
+    # Full-game mode: tuned for ~600 frames per 30-min chunk (frames every ~3s)
+    # Football play = ~5-7s action + ~25-30s dead ball → gap=5 separates plays
+    # Basketball = continuous action → gap=4 keeps possessions separate
     if _is_full_game:
-        cluster_gap = 8.0  # Wider gap for sparse frames
+        cluster_gap = 5.0 if sport.lower() == "football" else 4.0
     elif sport.lower() == "football":
         cluster_gap = FOOTBALL_CLUSTER_GAP
     else:

@@ -2291,6 +2291,7 @@ async def _run_chunked_full_game(
     from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
 
     CHUNK_SIZE = 1800  # 30 minutes per chunk
+    CHUNK_MAX_FRAMES = 600  # Up from 200 — more frames = more clips
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2365,11 +2366,11 @@ async def _run_chunked_full_game(
         t0 = time.perf_counter()
         chunk_frames = _extract_frames(
             local_video_path,
-            fps=1,  # 1fps for full games
+            fps=1,  # 1fps for full games (capped by max_frames)
             sport=sport,
             start_sec=chunk_start,
             end_sec=chunk_end,
-            max_frames=200,  # ~200 frames per 30-min chunk
+            max_frames=CHUNK_MAX_FRAMES,  # 600 frames per 30-min chunk
         )
         total_frames += len(chunk_frames)
         all_frame_timestamps.extend(ts for ts, _ in chunk_frames)
@@ -2393,7 +2394,7 @@ async def _run_chunked_full_game(
             jersey_color=jersey_color,
             sport=sport,
             ocr_conf=ocr_conf,
-            time_limit=120,  # 2 min per chunk max
+            time_limit=180,  # 3 min per chunk max (600 frames)
         )
         all_ocr_dets.extend(ocr_dets)
         all_v7_dets.extend(v7_dets)
@@ -2527,7 +2528,11 @@ async def _run_chunked_full_game(
         LOGGER.warning("Chunked: temporal consensus failed: %s", exc)
 
     # ── Motion supplement for full games ──
-    if 1 <= len(detection_points) <= 60 and all_frame_timestamps:
+    # Lowered thresholds: with 600 frames/chunk we get enough motion data
+    # to reliably detect plays. Previous threshold (30) missed most action.
+    _motion_supp_threshold = 15 if _is_football else 20
+    _motion_supp_audio = 10 if _is_football else 15
+    if 1 <= len(detection_points) <= 120 and all_frame_timestamps:
         _existing_ts = {dp.timestamp for dp in detection_points}
         _supplement_count = 0
         for t in all_frame_timestamps:
@@ -2537,7 +2542,7 @@ async def _run_chunked_full_game(
                 continue
             motion = all_motion.get(t, 0)
             in_boundary = _in_audio_boundary(audio_result, t)
-            if motion > 30 or (in_boundary and motion > 25):
+            if motion > _motion_supp_threshold or (in_boundary and motion > _motion_supp_audio):
                 conf = motion / 100.0 * 0.5
                 if in_boundary:
                     conf = min(0.8, conf + 0.1)
@@ -2556,7 +2561,7 @@ async def _run_chunked_full_game(
 
     # ── Motion/audio fallback if no OCR detections ──
     if not detection_points and all_frame_timestamps:
-        motion_threshold = 10 if _is_football else 30
+        motion_threshold = 8 if _is_football else 15
         LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
         for t in all_frame_timestamps:
             motion = all_motion.get(t, 0)

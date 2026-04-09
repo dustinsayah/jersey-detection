@@ -523,6 +523,8 @@ def download_youtube_sync(
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
+    global _warp_consecutive_failures, _warp_blocked_until
+
     # Rate limit: wait if we recently downloaded (prevents YouTube 429)
     _enforce_download_cooldown()
 
@@ -902,7 +904,6 @@ def download_youtube_sync(
                     _warp_consecutive_failures = 0  # Reset on success
                     return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
         # All retries failed — will be counted by the WARP block logic below
-        return None
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:

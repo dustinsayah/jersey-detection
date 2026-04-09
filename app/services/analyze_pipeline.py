@@ -576,11 +576,12 @@ async def _run_analyze_pipeline_impl(
         if time_range_end > time_range_start:
             _effective_duration = time_range_end - time_range_start
 
-        # ── CHUNKED PIPELINE for full games (>30 min) ──────────────────
-        # Process in 30-min chunks to avoid OOM. Each chunk: extract frames
-        # → OCR/detection → free frames. Merge all results at end.
-        _CHUNK_THRESHOLD = 1800  # 30 minutes
-        _CHUNK_SIZE = 1800  # 30-minute chunks
+        # ── CHUNKED PIPELINE for long videos (>10 min) ─────────────────
+        # Process in 10-min chunks with per-chunk YouTube downloads.
+        # Enables strategy caching: chunk 1 finds working strategy, chunks 2+
+        # reuse it directly. Each chunk: download → extract → OCR → free.
+        _CHUNK_THRESHOLD = 600  # 10 minutes — matches per-chunk download threshold
+        _CHUNK_SIZE = 1800  # Overridden to 600 in _run_chunked_full_game if per-chunk
         if _effective_duration > _CHUNK_THRESHOLD:
             LOGGER.info(
                 "Pipeline: CHUNKED MODE — %.0fs video, processing in %ds chunks",
@@ -602,6 +603,7 @@ async def _run_analyze_pipeline_impl(
                 layer_timings=layer_timings,
                 start_time=start_time,
                 phases_used=phases_used,
+                cancel_event=cancel_event,
             )
 
         # ── Step 2a: Load context-aware models for this request ──────────
@@ -2301,6 +2303,7 @@ async def _run_chunked_full_game(
     layer_timings: dict,
     start_time: float,
     phases_used: list[str],
+    cancel_event: "threading.Event | None" = None,
 ) -> dict[str, Any]:
     """Process full game video in 30-minute chunks to avoid OOM.
 

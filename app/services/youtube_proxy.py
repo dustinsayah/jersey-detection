@@ -107,6 +107,11 @@ _warp_blocked_until: float = 0.0
 _WARP_BLOCK_THRESHOLD = 2  # Block after 2 consecutive full-failures
 _WARP_BLOCK_DURATION = 300  # Skip all WARP strategies for 5 minutes
 
+# Strategy cache: remember which strategy worked for a video to skip failed ones on subsequent chunks
+# Key: video_id, Value: (strategy_name, timestamp)
+_last_successful_strategy: dict[str, tuple[str, float]] = {}
+_STRATEGY_CACHE_TTL = 600  # Cache successful strategy for 10 minutes
+
 # Rate limiting: track last successful YouTube download to prevent 429
 _last_download_time: float = 0.0
 _MIN_DOWNLOAD_INTERVAL = 15  # seconds between download requests
@@ -523,7 +528,7 @@ def download_youtube_sync(
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
-    global _warp_consecutive_failures, _warp_blocked_until
+    global _warp_consecutive_failures, _warp_blocked_until, _last_successful_strategy
 
     # Rate limit: wait if we recently downloaded (prevents YouTube 429)
     _enforce_download_cooldown()
@@ -1178,6 +1183,18 @@ def download_youtube_sync(
         ("render_extract_frames", _s7_render_extract),
     ]
 
+    # ── Strategy cache: try the last successful strategy FIRST ──
+    _video_id = extract_video_id(url) or url
+    _cached = _last_successful_strategy.get(_video_id)
+    if _cached and (time.time() - _cached[1]) < _STRATEGY_CACHE_TTL:
+        _cached_name = _cached[0]
+        # Move the cached strategy to the front of the list
+        _cached_idx = next((i for i, (n, _) in enumerate(strategies) if n == _cached_name), -1)
+        if _cached_idx > 0:
+            LOGGER.info("Strategy cache HIT: trying %s first (cached %.0fs ago)",
+                        _cached_name, time.time() - _cached[1])
+            strategies.insert(0, strategies.pop(_cached_idx))
+
     # ── Run strategies — each wrapped in try/except, NEVER crashes chain ─
     # Track 429 hits so we can add backoff between WARP retries
     _429_hit = False
@@ -1208,6 +1225,8 @@ def download_youtube_sync(
                 _record_download_success()
                 if "warp" in name:
                     _warp_consecutive_failures = 0  # Reset on WARP success
+                # Cache successful strategy for this video
+                _last_successful_strategy[_video_id] = (name, time.time())
                 return result
             # fn returned None — strategy didn't apply or failed gracefully
             err_detail = _errors_detail.get(name, "")

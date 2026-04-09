@@ -478,10 +478,11 @@ async def _run_analyze_pipeline_impl(
     try:
         # ── Step 1: Acquire video ────────────────────────────────────────
         if video_url and is_youtube_url(video_url):
-            # For full games (>30 min), skip upfront download — chunked pipeline
-            # will download each 30-min chunk separately to avoid timeouts
+            # For long videos (>10 min), skip upfront download — chunked pipeline
+            # will download each 10-min chunk separately. This enables strategy caching:
+            # chunk 1 finds the working strategy, chunks 2+ use it directly (saves 60-200s each).
             _requested_duration = (time_range_end - time_range_start) if time_range_end > time_range_start else 0
-            if _requested_duration > 1800:
+            if _requested_duration > 600:
                 LOGGER.info(
                     "Pipeline: SKIPPING upfront download for %.0fs game — will download per-chunk",
                     _requested_duration,

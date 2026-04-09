@@ -601,11 +601,14 @@ def download_youtube_sync(
     _segment_seconds = (end_time - start_time) if end_time > 0 else 0
 
     # Per-strategy timeout: scale with segment length
-    # Short clips: 60s, medium segments (10-30 min): 300s, full games: 600s
+    # Short clips: 60s, medium chunks (5-20 min): 120s, long segments: 300s, full games: 600s
+    # Note: 120s is enough for 10-min chunks — info extraction ~40s + download ~20s + trim ~10s
     if _segment_seconds > 3600:
         _strategy_timeout = 600  # 2hr game = big download, needs time
+    elif _segment_seconds > 1200:
+        _strategy_timeout = 300  # 20-60 min segment at 720p
     elif _segment_seconds >= 300:
-        _strategy_timeout = 300  # 10-30 min chunk at 720p, needs 300s via WARP
+        _strategy_timeout = 120  # 5-20 min chunk — tight but sufficient
     else:
         _strategy_timeout = 60
 
@@ -617,8 +620,13 @@ def download_youtube_sync(
     # a 555MB 360p muxed video takes ~555s. Allow 1200s for safety.
     _decodo_full_timeout = 1200
 
-    # Overall timeout: generous for all videos since full download may be needed
-    _TOTAL_TIMEOUT = 1800 if _segment_seconds > 3600 else 1500
+    # Overall timeout: generous for long videos, tight for chunks
+    if _segment_seconds > 3600:
+        _TOTAL_TIMEOUT = 1800
+    elif _segment_seconds > 1200:
+        _TOTAL_TIMEOUT = 900
+    else:
+        _TOTAL_TIMEOUT = 600  # 10-min chunks should complete in 10 min max
 
     def _total_expired() -> bool:
         elapsed = time.perf_counter() - dl_start

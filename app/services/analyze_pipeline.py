@@ -2364,23 +2364,7 @@ async def _run_chunked_full_game(
 
         # Extract frames for this chunk only
         t0 = time.perf_counter()
-        _vpath_exists = local_video_path.exists() if local_video_path else False
-        _vpath_size = f"{local_video_path.stat().st_size/1024/1024:.1f}MB" if _vpath_exists else "N/A"
-        # Probe video with cv2 to check if it's readable
-        _cv2_ok = False
-        _cv2_fps = 0
-        _cv2_frames = 0
-        if _vpath_exists:
-            _probe_cap = cv2.VideoCapture(str(local_video_path))
-            _cv2_ok = _probe_cap.isOpened()
-            if _cv2_ok:
-                _cv2_fps = _probe_cap.get(cv2.CAP_PROP_FPS)
-                _cv2_frames = int(_probe_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            _probe_cap.release()
-        LOGGER.info("Chunked: chunk %d — path=%s start=%.1f end=%.1f max=%d exists=%s size=%s cv2_ok=%s fps=%.1f total_frames=%d",
-                     chunk_count, local_video_path,
-                     chunk_start, chunk_end, CHUNK_MAX_FRAMES,
-                     _vpath_exists, _vpath_size, _cv2_ok, _cv2_fps, _cv2_frames)
+        # Log chunk info for diagnostics
         chunk_frames = _extract_frames(
             local_video_path,
             fps=1,  # 1fps for full games (capped by max_frames)

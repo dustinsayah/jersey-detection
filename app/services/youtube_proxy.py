@@ -547,13 +547,19 @@ def download_youtube_sync(
 
     # Detect full game (long video) — increase timeouts
     _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
+    _segment_seconds = (end_time - start_time) if end_time > 0 else 0
 
-    # Per-strategy timeout: 60s for quick-try strategies (DASH, sections)
-    _strategy_timeout = 900 if _is_long_video else 60
+    # Per-strategy timeout: scale with segment length
+    # Short clips: 60s, medium segments: 120s, full games: 300s
+    if _segment_seconds > 3600:
+        _strategy_timeout = 300
+    elif _segment_seconds > 600:
+        _strategy_timeout = 120
+    else:
+        _strategy_timeout = 60
 
     # Decodo sectioned timeout: only downloads the requested range
-    # Keep short since sections always invoke ffmpeg which fails through proxy
-    _decodo_sections_timeout = 900 if _is_long_video else 60
+    _decodo_sections_timeout = _strategy_timeout
 
     # Decodo FULL download timeout: downloads the ENTIRE video then trims.
     # Source video may be 2+ hours. At ~1MB/s residential proxy speed,
@@ -895,32 +901,31 @@ def download_youtube_sync(
         """WARP HTTP proxy + muxed (360p fallback, most reliable)."""
         if not _warp_available:
             return None
+        # Use download_ranges to avoid downloading the entire video
+        _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="android_vr",
-                                   start_time=0, end_time=0,
+                                   start_time=start_time, end_time=end_time,
                                    strategy_name="Strategy W0c (WARP HTTP muxed)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=_WARP_HTTP_PROXY, skip_cookies=True,
-                                   timeout=_strategy_timeout, errors_detail=_errors_detail):
-            if has_time_range:
-                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                                   timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="warp_http_muxed")
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_muxed")
         return None
 
     def _s_warp_http_muxed_web() -> DownloadResult | None:
         """WARP HTTP + muxed + web client — widest compatibility."""
         if not _warp_available:
             return None
+        _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="web",
-                                   start_time=0, end_time=0,
+                                   start_time=start_time, end_time=end_time,
                                    strategy_name="Strategy W0d (WARP HTTP muxed web)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=_WARP_HTTP_PROXY, skip_cookies=True,
-                                   timeout=_strategy_timeout, errors_detail=_errors_detail):
-            if has_time_range:
-                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                                   timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="warp_http_muxed_web")
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_muxed_web")
         return None
 
     def _s_warp_socks_dash() -> DownloadResult | None:
@@ -942,16 +947,15 @@ def download_youtube_sync(
         """WARP SOCKS5 + muxed — last WARP fallback."""
         if not _warp_available:
             return None
+        _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="android_vr",
-                                   start_time=0, end_time=0,
+                                   start_time=start_time, end_time=end_time,
                                    strategy_name="Strategy W2 (WARP SOCKS muxed)",
                                    format_override=_MUXED_FORMAT,
                                    proxy=_WARP_PROXY, skip_cookies=True,
-                                   timeout=_strategy_timeout, errors_detail=_errors_detail):
-            if has_time_range:
-                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                                   timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="warp_socks_muxed")
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_socks_muxed")
         return None
 
     def _s_render_early() -> DownloadResult | None:

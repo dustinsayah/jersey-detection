@@ -254,7 +254,7 @@ def extract_clips(
     # Football play = ~5-7s action + ~25-30s dead ball → gap=5 separates plays
     # Basketball = continuous action → gap=4 keeps possessions separate
     if _is_full_game:
-        cluster_gap = 5.0 if sport.lower() == "football" else 4.0
+        cluster_gap = 5.0 if sport.lower() == "football" else 3.0
     elif sport.lower() == "football":
         cluster_gap = FOOTBALL_CLUSTER_GAP
     else:

@@ -837,12 +837,9 @@ def download_youtube_sync(
                             proxy=_WARP_HTTP_PROXY, skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
-                if _is_720p_or_better():
-                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
-                LOGGER.warning("W0: Downloaded but only %dp — saving fallback, trying next", _get_video_height())
-                _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
-                import shutil
-                shutil.move(str(output_path), str(_low_res_fallback_path))
+                h = _get_video_height()
+                LOGGER.info("W0: downloaded %dp", h)
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:
@@ -857,12 +854,9 @@ def download_youtube_sync(
                             proxy=_WARP_HTTP_PROXY, skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
-                if _is_720p_or_better():
-                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_web")
-                LOGGER.warning("W0b: Downloaded but only %dp — trying next", _get_video_height())
-                if not output_path.with_suffix(".360p.mp4").exists():
-                    import shutil
-                    shutil.move(str(output_path), str(output_path.with_suffix(".360p.mp4")))
+                h = _get_video_height()
+                LOGGER.info("W0b: downloaded %dp", h)
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_web")
         return None
 
     def _s_warp_http_dash_pylib() -> DownloadResult | None:

@@ -2531,8 +2531,8 @@ async def _run_chunked_full_game(
     # ── Motion supplement for full games ──
     # Lowered thresholds: with 600 frames/chunk we get enough motion data
     # to reliably detect plays. Previous threshold (30) missed most action.
-    _motion_supp_threshold = 15 if _is_football else 20
-    _motion_supp_audio = 10 if _is_football else 15
+    _motion_supp_threshold = 15 if _is_football else 10
+    _motion_supp_audio = 10 if _is_football else 8
     if 1 <= len(detection_points) <= 120 and all_frame_timestamps:
         _existing_ts = {dp.timestamp for dp in detection_points}
         _supplement_count = 0
@@ -2562,7 +2562,7 @@ async def _run_chunked_full_game(
 
     # ── Motion/audio fallback if no OCR detections ──
     if not detection_points and all_frame_timestamps:
-        motion_threshold = 8 if _is_football else 15
+        motion_threshold = 8 if _is_football else 10
         LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
         for t in all_frame_timestamps:
             motion = all_motion.get(t, 0)

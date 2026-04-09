@@ -520,6 +520,92 @@ def test_warp() -> JSONResponse:
     return JSONResponse(status_code=200, content={**results, "status": "warp_running"})
 
 
+@router.get("/test-dash")
+async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") -> JSONResponse:
+    """Diagnostic: list available YouTube formats per client through WARP.
+
+    Tests android_vr, web, ios, android clients through WARP proxy and reports
+    what resolutions are available for DASH vs muxed. No download — just format listing.
+    """
+    from starlette.concurrency import run_in_threadpool
+    import time
+
+    def _list_formats() -> dict:
+        import yt_dlp
+        clients = ["android_vr", "web", "ios", "android"]
+        # Test each client through WARP HTTP + one direct test
+        tests = []
+        for client in clients:
+            tests.append((client, "warp_http", "http://127.0.0.1:40001"))
+        tests.append(("android_vr", "warp_cookies", "http://127.0.0.1:40001"))
+        tests.append(("android_vr", "direct", ""))
+        results = {}
+
+        for client, proxy_name, proxy_url in tests:
+            key = f"{client}_{proxy_name}"
+            t = time.perf_counter()
+            try:
+                ydl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "no_check_certificate": True,
+                    "extractor_args": {"youtube": {"player_client": [client]}},
+                    "socket_timeout": 15,
+                }
+                if proxy_url:
+                    ydl_opts["proxy"] = proxy_url
+                # Add cookies for non-WARP or warp_cookies test
+                if proxy_name in ("direct", "warp_cookies"):
+                    for cp in ["/app/youtube_cookies.txt", "/app/app/youtube_cookies.txt"]:
+                        if os.path.isfile(cp):
+                            ydl_opts["cookiefile"] = cp
+                            break
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    formats = info.get("formats", [])
+                    video_fmts = []
+                    for f in formats:
+                        h = f.get("height")
+                        if h:
+                            video_fmts.append({
+                                "id": f.get("format_id"),
+                                "ext": f.get("ext"),
+                                "height": h,
+                                "width": f.get("width"),
+                                "vcodec": (f.get("vcodec") or "")[:20],
+                                "acodec": (f.get("acodec") or "")[:20],
+                                "tbr": f.get("tbr"),
+                            })
+                    video_fmts.sort(key=lambda x: x["height"], reverse=True)
+                    max_h = video_fmts[0]["height"] if video_fmts else 0
+                    has_720 = any(f["height"] >= 720 for f in video_fmts)
+                    has_h264_720 = any(
+                        f["height"] >= 720 and f["vcodec"].startswith("avc1")
+                        for f in video_fmts
+                    )
+                    results[key] = {
+                        "status": "ok",
+                        "max_height": max_h,
+                        "has_720p": has_720,
+                        "has_h264_720p": has_h264_720,
+                        "format_count": len(video_fmts),
+                        "formats": video_fmts[:10],
+                        "elapsed_ms": round((time.perf_counter() - t) * 1000),
+                    }
+            except Exception as exc:
+                results[key] = {
+                    "status": "error",
+                    "error": str(exc)[:300],
+                    "elapsed_ms": round((time.perf_counter() - t) * 1000),
+                }
+
+        return results
+
+    results = await run_in_threadpool(_list_formats)
+    return JSONResponse(status_code=200, content=results)
+
+
 @router.get("/test-v7")
 def test_v7() -> JSONResponse:
     """Diagnostic endpoint: check v7 football model availability."""

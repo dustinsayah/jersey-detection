@@ -852,6 +852,83 @@ class YoloDigitDetector:
             return self._best_digit_candidates_in_rois(frame_bgr, rois)
         return {}
 
+    def _read_crop_low_res(self, crop_bgr: np.ndarray):
+        """Enhanced jersey reading for low-resolution (≤480p) video.
+
+        Applies 3 preprocessing variants + 4x4 grid scan of the torso area,
+        upscaling small crops before OCR.
+        """
+        if self.crop_reader is None:
+            return None
+
+        _MIN_CROP_DIM = 128  # upscale crops smaller than this
+        h, w = crop_bgr.shape[:2]
+        if h < 10 or w < 10:
+            return None
+
+        # Upscale small crops
+        scale = max(1, _MIN_CROP_DIM // min(h, w))
+        if scale > 1:
+            crop_bgr = cv2.resize(crop_bgr, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+            h, w = crop_bgr.shape[:2]
+
+        best = None
+
+        # --- Variant 1: Original crop ---
+        result = self.crop_reader.read_crop(crop_bgr)
+        if result.number is not None and (best is None or result.confidence > best.confidence):
+            best = result
+
+        # --- Variant 2: CLAHE enhanced ---
+        lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        lab_enhanced = cv2.merge((clahe.apply(l_ch), a_ch, b_ch))
+        enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+        result = self.crop_reader.read_crop(enhanced)
+        if result.number is not None and (best is None or result.confidence > best.confidence):
+            best = result
+
+        # --- Variant 3: Sharpened ---
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        sharpened = cv2.filter2D(crop_bgr, -1, kernel)
+        result = self.crop_reader.read_crop(sharpened)
+        if result.number is not None and (best is None or result.confidence > best.confidence):
+            best = result
+
+        # --- 4x4 grid scan of torso area ---
+        torso_y1 = int(h * 0.10)
+        torso_y2 = int(h * 0.75)
+        torso_h = torso_y2 - torso_y1
+        torso_w = w
+        if torso_h > 20 and torso_w > 20:
+            grid_rows, grid_cols = 4, 4
+            # Overlapping windows: each cell covers ~50% of torso, stride = 25%
+            cell_h = torso_h // 2
+            cell_w = torso_w // 2
+            stride_h = max(1, (torso_h - cell_h) // (grid_rows - 1)) if grid_rows > 1 else torso_h
+            stride_w = max(1, (torso_w - cell_w) // (grid_cols - 1)) if grid_cols > 1 else torso_w
+            for row in range(grid_rows):
+                for col in range(grid_cols):
+                    gy1 = torso_y1 + row * stride_h
+                    gx1 = col * stride_w
+                    gy2 = min(h, gy1 + cell_h)
+                    gx2 = min(w, gx1 + cell_w)
+                    if gy2 - gy1 < 10 or gx2 - gx1 < 10:
+                        continue
+                    sub_crop = crop_bgr[gy1:gy2, gx1:gx2]
+                    # Upscale grid cell for better OCR
+                    sub_h, sub_w = sub_crop.shape[:2]
+                    if sub_h < _MIN_CROP_DIM or sub_w < _MIN_CROP_DIM:
+                        sub_scale = max(1, _MIN_CROP_DIM // min(sub_h, sub_w))
+                        sub_crop = cv2.resize(sub_crop, (sub_w * sub_scale, sub_h * sub_scale),
+                                              interpolation=cv2.INTER_LANCZOS4)
+                    result = self.crop_reader.read_crop(sub_crop)
+                    if result.number is not None and (best is None or result.confidence > best.confidence):
+                        best = result
+
+        return best
+
     def read_numbers_in_person_crops(
         self,
         *,
@@ -860,6 +937,7 @@ class YoloDigitDetector:
     ) -> dict[int, NumberCandidate]:
         if self.reader_backend == "public_reader_ensemble" and self.crop_reader is not None:
             frame_h, frame_w = frame_bgr.shape[:2]
+            is_low_res = frame_h <= 480
             person_reads: dict[int, NumberCandidate] = {}
             for person_idx, person in enumerate(persons):
                 x1 = max(0, int(person.x1))
@@ -873,13 +951,24 @@ class YoloDigitDetector:
                 if crop.size == 0:
                     continue
 
-                read_result = self.crop_reader.read_crop(crop)
-                if not read_result.readable or read_result.number is None:
-                    continue
+                best_result = None
+
+                if is_low_res:
+                    # Low-res mode: upscale + 3 preprocessing variants + 4x4 grid scan
+                    best_result = self._read_crop_low_res(crop)
+                else:
+                    best_result = self.crop_reader.read_crop(crop)
+
+                if best_result is None or not best_result.readable or best_result.number is None:
+                    # Low-res: accept lower confidence (0.03 threshold)
+                    if is_low_res and best_result is not None and best_result.number is not None and best_result.confidence >= 0.03:
+                        pass  # accept it
+                    else:
+                        continue
 
                 person_reads[person_idx] = NumberCandidate(
-                    number=int(read_result.number),
-                    confidence=_clamp01(read_result.confidence),
+                    number=int(best_result.number),
+                    confidence=_clamp01(best_result.confidence),
                     digits=tuple(),
                     x1=float(person.x1),
                     y1=float(person.y1),

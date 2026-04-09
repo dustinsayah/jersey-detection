@@ -532,16 +532,20 @@ async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") ->
 
     def _list_formats() -> dict:
         import yt_dlp
-        clients = ["android_vr", "web", "ios", "android"]
-        # Test each client through WARP HTTP + one direct test
-        tests = []
-        for client in clients:
-            tests.append((client, "warp_http", "http://127.0.0.1:40001"))
-        tests.append(("android_vr", "warp_cookies", "http://127.0.0.1:40001"))
-        tests.append(("android_vr", "direct", ""))
+        # Test key combinations: client + proxy + cookies
+        tests = [
+            ("android_vr", "warp_http", "http://127.0.0.1:40001", False),
+            ("web", "warp_http", "http://127.0.0.1:40001", False),
+            ("ios", "warp_http", "http://127.0.0.1:40001", False),
+            ("android", "warp_http", "http://127.0.0.1:40001", False),
+            ("android_vr", "warp_cookies", "http://127.0.0.1:40001", True),
+            ("web", "warp_cookies", "http://127.0.0.1:40001", True),
+            ("android_vr", "direct", "", False),
+            ("web", "direct_cookies", "", True),
+        ]
         results = {}
 
-        for client, proxy_name, proxy_url in tests:
+        for client, proxy_name, proxy_url, use_cookies in tests:
             key = f"{client}_{proxy_name}"
             t = time.perf_counter()
             try:
@@ -551,11 +555,12 @@ async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") ->
                     "no_check_certificate": True,
                     "extractor_args": {"youtube": {"player_client": [client]}},
                     "socket_timeout": 15,
+                    # Don't filter formats — list ALL available
+                    "format": "all",
                 }
                 if proxy_url:
                     ydl_opts["proxy"] = proxy_url
-                # Add cookies for non-WARP or warp_cookies test
-                if proxy_name in ("direct", "warp_cookies"):
+                if use_cookies:
                     for cp in ["/app/youtube_cookies.txt", "/app/app/youtube_cookies.txt"]:
                         if os.path.isfile(cp):
                             ydl_opts["cookiefile"] = cp
@@ -567,7 +572,7 @@ async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") ->
                     video_fmts = []
                     for f in formats:
                         h = f.get("height")
-                        if h:
+                        if h and h > 50:  # Skip storyboard thumbnails
                             video_fmts.append({
                                 "id": f.get("format_id"),
                                 "ext": f.get("ext"),
@@ -576,12 +581,13 @@ async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") ->
                                 "vcodec": (f.get("vcodec") or "")[:20],
                                 "acodec": (f.get("acodec") or "")[:20],
                                 "tbr": f.get("tbr"),
+                                "filesize": f.get("filesize"),
                             })
                     video_fmts.sort(key=lambda x: x["height"], reverse=True)
                     max_h = video_fmts[0]["height"] if video_fmts else 0
                     has_720 = any(f["height"] >= 720 for f in video_fmts)
                     has_h264_720 = any(
-                        f["height"] >= 720 and f["vcodec"].startswith("avc1")
+                        f["height"] >= 720 and "avc1" in (f.get("vcodec") or "")
                         for f in video_fmts
                     )
                     results[key] = {
@@ -590,7 +596,7 @@ async def test_dash(url: str = "https://www.youtube.com/watch?v=7cEcpiciADQ") ->
                         "has_720p": has_720,
                         "has_h264_720p": has_h264_720,
                         "format_count": len(video_fmts),
-                        "formats": video_fmts[:10],
+                        "formats": video_fmts[:15],
                         "elapsed_ms": round((time.perf_counter() - t) * 1000),
                     }
             except Exception as exc:

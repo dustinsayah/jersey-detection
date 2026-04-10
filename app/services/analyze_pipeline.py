@@ -235,10 +235,10 @@ def _compute_recruiting_score(
     if not clip_dict.get("jerseyVisible"):
         score -= 5
 
-    # Formation / pre-snap — still shows the player, mild penalty
+    # Formation / pre-snap — still shows the player, very mild penalty
     play_type = clip_dict.get("playType", "game_action")
     if play_type == "formation":
-        score -= 5
+        score -= 3
     elif play_type == "dead_ball":
         score -= 3
 
@@ -2207,7 +2207,7 @@ async def _run_analyze_pipeline_impl(
 
             # Motion/audio fallback (if still too few points)
             if len(detection_points) < 10:
-                motion_threshold = 30
+                motion_threshold = 15
                 LOGGER.info("Pipeline: low detections (%d), using motion/audio fallback "
                             "(threshold=%d, sport=%s)",
                             len(detection_points), motion_threshold, sport)

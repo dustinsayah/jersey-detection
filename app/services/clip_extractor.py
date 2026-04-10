@@ -27,7 +27,7 @@ def segment_plays_from_motion(
     Football rhythm: ~5s of action (snap → whistle) + ~25s dead ball.
     Returns list of (start_time, end_time) play segments.
     """
-    if not motion_scores or sport.lower() != "football":
+    if not motion_scores:
         return []
 
     sorted_ts = sorted(motion_scores.keys())

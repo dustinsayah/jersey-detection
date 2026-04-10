@@ -1943,7 +1943,7 @@ async def _run_analyze_pipeline_impl(
             if resolved_quality == "aggressive" or _is_dark_jersey or _few_detections or _is_full_game_tc:
                 # Match OCR confidence threshold: navy=0.08, dark=0.12.
                 # Previous 0.15 threshold killed valid navy detections.
-                _tc_conf = ocr_confidence if _is_dark_jersey else (0.12 if _is_full_game_tc else 0.15)
+                _tc_conf = ocr_conf if _is_dark_jersey else (0.12 if _is_full_game_tc else 0.15)
                 tc_instance = TemporalConsensus(
                     min_confirmations=1,
                     time_window=5.0 if _is_full_game_tc else 4.0,

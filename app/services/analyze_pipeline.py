@@ -1074,8 +1074,12 @@ async def _run_analyze_pipeline_impl(
             t0 = time.perf_counter()
             try:
                 _v7_time_limit = 60 if _is_full_game else 30  # seconds
-                _v7_max_frames = min(200, len(ocr_frames))
-                _v7_sample = ocr_frames[::max(1, len(ocr_frames) // _v7_max_frames)][:_v7_max_frames]
+                # v7 takes ~5.5s/frame on CPU.  Limit sample to ~6-10 UNIFORMLY
+                # spaced frames so detections cover the whole video, not just
+                # the first few seconds.
+                _v7_budget_frames = max(6, _v7_time_limit // 5)  # ~6 for 30s, ~12 for 60s
+                _v7_step = max(1, len(ocr_frames) // _v7_budget_frames)
+                _v7_sample = ocr_frames[::_v7_step][:_v7_budget_frames * 2]  # 2x budget for headroom
                 _v7_count = 0
                 _v7_navy_count = 0
                 _v7_crops = 0
@@ -1148,13 +1152,12 @@ async def _run_analyze_pipeline_impl(
             roboflow_detector.load()
 
             if ocr_frames:
-                # Sample frames: every 2nd for short, every 3rd for long videos
-                if len(ocr_frames) > 200:
-                    sampled_frames = ocr_frames[::3]  # 500→167 frames
-                elif len(ocr_frames) > 30:
-                    sampled_frames = ocr_frames[::2]
-                else:
-                    sampled_frames = ocr_frames
+                # v5 takes ~2s/frame. Ensure UNIFORM coverage of the video:
+                # With a 60s budget → ~30 frames max. Step through the full
+                # frame list so detections aren't biased to the first N seconds.
+                _v5_budget = max(20, _V5_TIME_LIMIT // 2)  # ~30 for 60s, ~60 for 120s
+                _v5_step = max(1, len(ocr_frames) // _v5_budget)
+                sampled_frames = ocr_frames[::_v5_step]
                 LOGGER.info("Pipeline: v5 OCR layer running on %d/%d frames (sampled)", len(sampled_frames), len(ocr_frames))
                 _is_football = sport.lower() == "football"
                 _v5_oversized_skipped = 0
@@ -3294,7 +3297,11 @@ def _run_chunk_ocr(
 
     # ── v5 player detection → OCR ──
     _player_conf = 0.35 if _is_football else 0.20
-    sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
+    # Uniform coverage: step through frames so time-limited OCR covers
+    # the full chunk, not just the first N seconds.
+    _v5_chunk_budget = max(20, time_limit // 3)
+    _v5_chunk_step = max(1, len(live_frames) // _v5_chunk_budget)
+    sampled = live_frames[::_v5_chunk_step]
     _v5_crops = 0
     _V5_MAX_CROPS = 200  # Per chunk (balanced: speed vs detection rate)
     for ts, frame in sampled:

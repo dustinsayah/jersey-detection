@@ -2194,6 +2194,49 @@ async def _run_analyze_pipeline_impl(
                         ))
                         _existing_play_ts.add(t)
 
+        # ── Football cadence supplement: if still too few points, place
+        # detection points at regular play-cadence intervals (~30s apart).
+        # Football has a predictable rhythm: 1 play every 25-40 seconds.
+        # These are low-confidence but ensure clip coverage across the video.
+        if is_football and len(detection_points) < 15 and video_duration > 30:
+            _existing_play_ts = {dp.timestamp for dp in detection_points}
+            _cadence = 30.0  # one play every ~30s
+            _cadence_added = 0
+            # Place points across the video at play cadence
+            _t_cursor = 5.0  # start 5s in (skip pre-game)
+            while _t_cursor < video_duration - 5.0:
+                # Find the best frame timestamp near this cadence point
+                best_t = None
+                best_motion = -1
+                for ft in _frame_timestamps:
+                    if abs(ft - _t_cursor) < _cadence / 2:
+                        m = motion_scores.get(ft, 0)
+                        if m > best_motion and ft not in _existing_play_ts:
+                            if not any(abs(ft - ets) < 3.0 for ets in _existing_play_ts):
+                                best_t = ft
+                                best_motion = m
+                if best_t is not None:
+                    pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
+                    in_boundary = _in_audio_boundary(audio_result, best_t)
+                    conf = max(0.25, best_motion / 100.0 * 0.5)
+                    if in_boundary:
+                        conf = min(0.8, conf + 0.15)
+                    detection_points.append(DetectionPoint(
+                        timestamp=best_t,
+                        confidence=conf,
+                        jersey_visible=False,
+                        motion_score=best_motion,
+                        pose_action=pose.get("action", "standing"),
+                        crowd_energy=_get_crowd_energy(audio_result, best_t),
+                    ))
+                    _existing_play_ts.add(best_t)
+                    _cadence_added += 1
+                _t_cursor += _cadence
+            if _cadence_added:
+                LOGGER.info("Pipeline: football cadence supplement added %d points "
+                            "every %.0fs (total now %d)",
+                            _cadence_added, _cadence, len(detection_points))
+
         _dp_after_supplement = len(detection_points)
         _supplement_added = _dp_after_supplement - _dp_before_supplement
         if _supplement_added > 0:

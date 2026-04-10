@@ -1941,10 +1941,13 @@ async def _run_analyze_pipeline_impl(
             _few_detections = len(all_layer_dets) < 10
             _is_full_game_tc = video_duration > 1800
             if resolved_quality == "aggressive" or _is_dark_jersey or _few_detections or _is_full_game_tc:
+                # Match OCR confidence threshold: navy=0.08, dark=0.12.
+                # Previous 0.15 threshold killed valid navy detections.
+                _tc_conf = ocr_confidence if _is_dark_jersey else (0.12 if _is_full_game_tc else 0.15)
                 tc_instance = TemporalConsensus(
                     min_confirmations=1,
                     time_window=5.0 if _is_full_game_tc else 4.0,
-                    confidence_threshold=0.12 if _is_full_game_tc else 0.15,
+                    confidence_threshold=_tc_conf,
                 )
             else:
                 tc_instance = TemporalConsensus(
@@ -2046,13 +2049,15 @@ async def _run_analyze_pipeline_impl(
         _supplement_limit = 60 if video_duration > 1800 else 20  # full games need more supplement
         if 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
-            _motion_thresh = 30  # moderate-to-strong motion (basketball avg ~37)
+            # Football at 1fps has lower motion between frames; use lower threshold.
+            _is_football_supp = sport.lower() == "football"
+            _motion_thresh = 15 if _is_football_supp else 30
             _supplement_count = 0
             for t in _frame_timestamps:
                 if t in _existing_ts:
                     continue
                 # Skip if near an existing detection (would merge anyway)
-                _skip_gap = 1.5 if video_duration > 1800 else 3.0
+                _skip_gap = 1.5 if (video_duration > 1800 or _is_football_supp) else 3.0
                 if any(abs(t - ets) < _skip_gap for ets in _existing_ts):
                     continue
                 motion = motion_scores.get(t, 0)

@@ -433,23 +433,20 @@ class RoboflowDetector:
         if is_dark or is_navy_jersey:
             to_load.append("dark_jersey_specialist_v3")
 
-        # Priority 5: v4 outcome models (top 3 per sport to stay under memory limit)
-        # Full set of 5-6 models pushes RSS to 4800+ MB and OOMs.
-        # Keep the highest-impact models only; rule-based detection supplements rest.
+        # Priority 5: v4 outcome models (top 2 per sport — memory-critical)
+        # Each YOLO model adds ~100-150MB RSS. Must stay under 4000MB total.
+        # Rule-based detection (_detect_play_type_rules) supplements missing models.
         _V4_BY_SPORT: dict[str, list[str]] = {
             "football": [
                 "football_touchdown_detector_v4",
                 "football_completion_detector_v4",
-                "football_sack_detector_v4",
             ],
             "basketball": [
                 "basketball_made_shot_v4",
                 "basketball_hoop_detector_v4",
-                "basketball_rebound_v4",
             ],
             "lacrosse": [
                 "lacrosse_goal_detector_v4",
-                "lacrosse_shot_quality_v4",
             ],
         }
         for v4_model in _V4_BY_SPORT.get(sl, []):

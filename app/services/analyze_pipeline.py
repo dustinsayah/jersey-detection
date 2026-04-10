@@ -3271,19 +3271,8 @@ def _run_chunk_ocr(
                 pass
 
     # ── v5 player detection → OCR ──
-    # Football: sample every frame during motion windows (≥2fps effective),
-    # every 3rd frame otherwise.  Other sports: every 2nd frame.
     _player_conf = 0.35 if _is_football else 0.20
-    if _is_football and len(live_frames) > 30:
-        sampled = []
-        for idx, (ts, frame) in enumerate(live_frames):
-            motion = chunk_motion.get(ts, 0)
-            if motion > 15:
-                sampled.append((ts, frame))        # Every frame during action
-            elif idx % 3 == 0:
-                sampled.append((ts, frame))        # Every 3rd frame during lull
-    else:
-        sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
+    sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
     _v5_crops = 0
     _V5_MAX_CROPS = 300  # Per chunk
     for ts, frame in sampled:

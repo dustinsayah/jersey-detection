@@ -3642,6 +3642,22 @@ def _extract_frames(
 
     frame_interval = max(1, int(video_fps / fps))
     cap_limit = max_frames if max_frames > 0 else MAX_FRAMES
+
+    # ── Uniform sampling: if total frames at target FPS exceeds cap,
+    #    increase interval so frames are spread across the FULL video
+    #    instead of being concentrated at the start. ──
+    _range_start = max(start_sec, 0)
+    _range_end = end_sec if end_sec > 0 else video_duration_est
+    _range_frames_at_fps = int((_range_end - _range_start) * video_fps / frame_interval) if frame_interval > 0 else 0
+    if cap_limit > 0 and _range_frames_at_fps > cap_limit:
+        _uniform_skip = max(1, _range_frames_at_fps // cap_limit)
+        frame_interval *= _uniform_skip
+        LOGGER.info(
+            "Frame extraction: uniform sampling skip=%d "
+            "(range_frames=%d, cap=%d, new_interval=%d)",
+            _uniform_skip, _range_frames_at_fps, cap_limit, frame_interval,
+        )
+
     frames: list[tuple[float, np.ndarray]] = []
     frame_idx = 0
 

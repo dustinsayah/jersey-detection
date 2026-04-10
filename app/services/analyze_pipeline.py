@@ -2048,38 +2048,57 @@ async def _run_analyze_pipeline_impl(
         # ── Motion supplement: if we have detections but they cluster into few
         # clips, add high-motion frames as supplementary points.  The player IS
         # in the video (confirmed by OCR), so motion peaks are likely their plays.
-        # Threshold raised from 5→20 because improved v5 OCR now finds 10-15
-        # detections that all chain into a single cluster at 5s gap.
-        _supplement_limit = 60 if video_duration > 1800 else 20  # full games need more supplement
+        #
+        # Uses PERCENTILE-BASED threshold instead of fixed values, so it adapts
+        # to low-resolution video (640x360 from WARP has much lower optical flow
+        # scores than 720p — fixed threshold of 15 misses everything).
+        _supplement_limit = 60 if video_duration > 1800 else 20
         if 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
-            # Football at 1fps has lower motion between frames; use lower threshold.
             _is_football_supp = sport.lower() == "football"
-            _motion_thresh = 15 if _is_football_supp else 30
+
+            # Percentile-based threshold: top 30% of motion scores for football,
+            # top 20% for other sports. Falls back to fixed minimum if percentile
+            # is too low (video is entirely static).
+            _all_motions = sorted(
+                [motion_scores.get(t, 0) for t in _frame_timestamps],
+                reverse=True,
+            )
+            if _all_motions:
+                _pct_idx = max(1, int(len(_all_motions) * (0.30 if _is_football_supp else 0.20)))
+                _pct_thresh = _all_motions[min(_pct_idx, len(_all_motions) - 1)]
+                _motion_thresh = max(5.0 if _is_football_supp else 15.0, _pct_thresh)
+            else:
+                _motion_thresh = 15 if _is_football_supp else 30
+
+            LOGGER.info("Pipeline: motion supplement threshold=%.1f (percentile-based, "
+                        "top scores: %s)", _motion_thresh,
+                        [round(m, 1) for m in _all_motions[:5]])
+
             _supplement_count = 0
             for t in _frame_timestamps:
                 if t in _existing_ts:
                     continue
-                # Skip if near an existing detection (would merge anyway)
                 _skip_gap = 1.5 if (video_duration > 1800 or _is_football_supp) else 3.0
                 if any(abs(t - ets) < _skip_gap for ets in _existing_ts):
                     continue
                 motion = motion_scores.get(t, 0)
                 in_boundary = _in_audio_boundary(audio_result, t)
-                if motion > _motion_thresh or (in_boundary and motion > 25):
+                if motion >= _motion_thresh or (in_boundary and motion > _motion_thresh * 0.6):
                     pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
-                    conf = motion / 100.0 * 0.5  # Lower confidence than direct OCR
+                    conf = motion / 100.0 * 0.5
                     if in_boundary:
                         conf = min(0.8, conf + 0.1)
                     detection_points.append(DetectionPoint(
                         timestamp=t,
                         confidence=conf,
-                        jersey_visible=False,  # Motion-inferred, NOT confirmed by OCR
-                        jersey_number=None,    # Don't stamp requested number on unconfirmed frames
+                        jersey_visible=False,
+                        jersey_number=None,
                         motion_score=motion,
                         pose_action=pose.get("action", "standing"),
                         crowd_energy=_get_crowd_energy(audio_result, t),
                     ))
+                    _existing_ts.add(t)
                     _supplement_count += 1
             if _supplement_count:
                 LOGGER.info("Pipeline: motion supplement added %d high-motion points "
@@ -2134,12 +2153,18 @@ async def _run_analyze_pipeline_impl(
                         LOGGER.info("Pipeline: play segmentation added %d points "
                                     "(total now %d)", _play_added, len(detection_points))
 
-            # Fallback: threshold-based detection (if still too few points)
-            if len(detection_points) < 10:
-                motion_threshold = 10 if is_football else 30
+            # Fallback: percentile-based motion detection (if still too few points)
+            if len(detection_points) < 10 and _frame_timestamps:
+                # Use top 40% of motion scores as threshold (adapts to resolution)
+                _fb_motions = sorted(
+                    [motion_scores.get(t, 0) for t in _frame_timestamps],
+                    reverse=True,
+                )
+                _fb_pct_idx = max(1, int(len(_fb_motions) * 0.40))
+                _fb_thresh = max(3.0, _fb_motions[min(_fb_pct_idx, len(_fb_motions) - 1)])
                 LOGGER.info("Pipeline: low detections (%d), using motion/audio fallback "
-                            "(threshold=%d, sport=%s)",
-                            len(detection_points), motion_threshold, sport)
+                            "(percentile threshold=%.1f, sport=%s)",
+                            len(detection_points), _fb_thresh, sport)
                 for t in _frame_timestamps:
                     if t in _existing_play_ts:
                         continue
@@ -2147,7 +2172,7 @@ async def _run_analyze_pipeline_impl(
                         continue
                     motion = motion_scores.get(t, 0)
                     in_boundary = _in_audio_boundary(audio_result, t)
-                    if motion > motion_threshold or in_boundary:
+                    if motion >= _fb_thresh or in_boundary:
                         pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
                         conf = motion / 100.0 * 0.7
                         if in_boundary:

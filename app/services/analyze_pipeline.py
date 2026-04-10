@@ -809,20 +809,31 @@ async def _run_analyze_pipeline_impl(
                     _db_conf = 0.70  # Moderate — outdoor fields similar to football
                 else:
                     _db_conf = 0.40  # Basketball default — classifier trained on this
-                # Full games: sample every 4th frame for dead ball (saves ~75% time)
-                _db_step = 4 if video_duration > 1800 else 1
-                for idx, (ts, frame) in enumerate(frames):
-                    if idx % _db_step != 0:
-                        # Skip dead ball check — assume live for unsampled frames
-                        _live.append((ts, frame))
-                        continue
-                    db_result = roboflow_detector.classify_dead_ball(frame, conf=_db_conf)
-                    if db_result:
-                        dead_ball_by_ts[ts] = db_result
-                    if db_result == "dead_ball":
-                        dead_ball_count += 1
-                    else:
-                        _live.append((ts, frame))
+                # Football: skip dead ball entirely (classifier unreliable — always
+                # triggers safety bypass, wasting 18+ seconds).
+                # Full games: sample every 4th frame (saves ~75% time).
+                if _sport_lower == "football":
+                    _db_step = 0  # Skip entirely
+                elif video_duration > 1800:
+                    _db_step = 4
+                else:
+                    _db_step = 2  # Every other frame for short/medium videos
+                if _db_step == 0:
+                    # Skip dead ball entirely (e.g. football — classifier unreliable)
+                    _live = list(frames)
+                else:
+                    for idx, (ts, frame) in enumerate(frames):
+                        if idx % _db_step != 0:
+                            # Skip dead ball check — assume live for unsampled frames
+                            _live.append((ts, frame))
+                            continue
+                        db_result = roboflow_detector.classify_dead_ball(frame, conf=_db_conf)
+                        if db_result:
+                            dead_ball_by_ts[ts] = db_result
+                        if db_result == "dead_ball":
+                            dead_ball_count += 1
+                        else:
+                            _live.append((ts, frame))
 
                 _db_sampled = len(frames) // _db_step + (1 if len(frames) % _db_step else 0)
                 dead_ball_ratio = dead_ball_count / _db_sampled if _db_sampled else 0.0
@@ -1062,7 +1073,7 @@ async def _run_analyze_pipeline_impl(
             )
             t0 = time.perf_counter()
             try:
-                _v7_time_limit = 120 if _is_full_game else 60  # seconds
+                _v7_time_limit = 60 if _is_full_game else 30  # seconds
                 _v7_max_frames = min(200, len(ocr_frames))
                 _v7_sample = ocr_frames[::max(1, len(ocr_frames) // _v7_max_frames)][:_v7_max_frames]
                 _v7_count = 0
@@ -1113,7 +1124,7 @@ async def _run_analyze_pipeline_impl(
         # Guardrails: time limit, crop limit scales with frame count, early exit
         # after consecutive FRAMES with zero detections.
         _is_full_game = video_duration > 1800
-        _V5_TIME_LIMIT = 180 if _is_full_game else 90  # seconds — full games need more time
+        _V5_TIME_LIMIT = 120 if _is_full_game else 60  # seconds — reduced from 180/90 for speed
         # Scale crop limit: 200 for short videos, up to 1200 for full games.
         # At ~120ms/crop, 1200 crops ≈ 144s — within the 180s time limit for full games.
         _V5_MAX_CROPS = min(1200 if _is_full_game else 500, max(200, frames_processed))

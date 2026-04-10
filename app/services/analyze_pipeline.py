@@ -2205,16 +2205,17 @@ async def _run_analyze_pipeline_impl(
             # Place points across the video at play cadence
             _t_cursor = 5.0  # start 5s in (skip pre-game)
             while _t_cursor < video_duration - 5.0:
-                # Find the best frame timestamp near this cadence point
+                # Find the best frame timestamp near this cadence point.
+                # No gap check: cadence points are deliberate and evenly
+                # spaced — they represent the expected play rhythm.
                 best_t = None
                 best_motion = -1
                 for ft in _frame_timestamps:
                     if abs(ft - _t_cursor) < _cadence / 2:
                         m = motion_scores.get(ft, 0)
                         if m > best_motion and ft not in _existing_play_ts:
-                            if not any(abs(ft - ets) < 3.0 for ets in _existing_play_ts):
-                                best_t = ft
-                                best_motion = m
+                            best_t = ft
+                            best_motion = m
                 if best_t is not None:
                     pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
                     in_boundary = _in_audio_boundary(audio_result, best_t)

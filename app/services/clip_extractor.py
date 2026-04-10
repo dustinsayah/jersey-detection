@@ -495,14 +495,17 @@ def extract_clips(
     # ── Step 3.5: Quality gate — require at least one meaningful signal ──
     # Clips with no jersey, no v4 outcome, low motion, and no audio event
     # are likely noise from dead ball frames or camera pans.
-    # Football at 640x360: motion scores are 0-10 (mean across full frame),
-    # so use a lower threshold (5 vs 30 for other sports).
-    _motion_gate = 5 if _is_football else 30
+    # Football: skip quality gate entirely — at 640x360, Farneback motion
+    # scores are 0-10 (mean across full frame), too low for any threshold.
+    # Football clips are already gated by score threshold (>=15) later.
     gated: list[ExtractedClip] = []
     for clip in merged:
+        if _is_football:
+            gated.append(clip)
+            continue
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
-        has_motion = (clip.signals.get("motion", 0) or 0) > _motion_gate
+        has_motion = (clip.signals.get("motion", 0) or 0) > 30
         has_audio = bool(clip.signals.get("audio"))
         if has_jersey or has_outcome or has_motion or has_audio:
             gated.append(clip)

@@ -2481,7 +2481,7 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 400  # Up from 200 — more frames = more clips (frames every ~4.5s)
+    CHUNK_MAX_FRAMES = 250  # Balanced: enough for play detection, fast enough for timeout
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2524,12 +2524,18 @@ async def _run_chunked_full_game(
             }
             LOGGER.warning("Chunked: audio analysis failed: %s", exc)
 
-    # ── Load models once for all chunks ──
+    # ── Load models once for all chunks (skip v4 — not used in chunked mode) ──
     try:
         roboflow_detector.reset_request_tracking()
         roboflow_detector._request_jersey_color = jersey_color
         request_models = roboflow_detector.load_for_request(sport, jersey_color)
         LOGGER.info("Chunked: loaded %d models", len(request_models))
+        # Immediately unload v4 models — chunked mode uses rule-based play detection
+        for _attr in dir(roboflow_detector):
+            if "_v4" in _attr and _attr.endswith("_model"):
+                if getattr(roboflow_detector, _attr, None) is not None:
+                    setattr(roboflow_detector, _attr, None)
+        gc.collect()
     except Exception as exc:
         LOGGER.warning("Chunked: load_for_request failed: %s", exc)
 
@@ -2628,6 +2634,11 @@ async def _run_chunked_full_game(
         if not chunk_frames:
             chunk_start = chunk_end
             continue
+
+        # Check cancellation between download and OCR
+        if cancel_event is not None and cancel_event.is_set():
+            LOGGER.warning("Pipeline: CANCELLED before OCR on chunk %d", chunk_count)
+            break
 
         # Reload models if needed (unloaded by previous chunk cleanup)
         try:
@@ -3274,7 +3285,7 @@ def _run_chunk_ocr(
     _player_conf = 0.35 if _is_football else 0.20
     sampled = live_frames[::2] if len(live_frames) > 30 else live_frames
     _v5_crops = 0
-    _V5_MAX_CROPS = 300  # Per chunk
+    _V5_MAX_CROPS = 200  # Per chunk (balanced: speed vs detection rate)
     for ts, frame in sampled:
         if time.perf_counter() - t0 > time_limit:
             break
@@ -3330,21 +3341,11 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
-    # ── v4 outcome detection (every 12th live frame to save memory) ──
+    # ── v4 outcome detection — DISABLED in chunked mode ──
+    # v4 models add ~200MB RSS each and 20-30s per chunk.
+    # Rule-based play detection (_detect_play_type_rules) provides
+    # play types from motion/pose/crowd signals without v4 models.
     chunk_v4_dets: list[dict] = []
-    _v4_sample = live_frames[::12] if len(live_frames) > 20 else live_frames
-    _v4_t0 = time.perf_counter()
-    for ts, frame in _v4_sample:
-        if time.perf_counter() - _v4_t0 > 20:  # Max 20s for v4
-            break
-        try:
-            v4_dets = roboflow_detector.detect_outcome_v4(frame, sport=sport)
-            if v4_dets:
-                for d in v4_dets:
-                    d["timestamp"] = ts
-                    chunk_v4_dets.append(d)
-        except Exception:
-            pass
 
     LOGGER.info(
         "Chunk OCR: %d v5, %d v7, %d v4 outcomes, %d crops, %d motion in %.1fs",

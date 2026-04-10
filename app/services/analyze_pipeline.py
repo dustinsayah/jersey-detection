@@ -2653,7 +2653,7 @@ async def _run_chunked_full_game(
             jersey_color=jersey_color,
             sport=sport,
             ocr_conf=ocr_conf,
-            time_limit=150,  # 2.5 min per chunk max (400 frames)
+            time_limit=90,  # 1.5 min per chunk — keep total under 600s
         )
         all_ocr_dets.extend(ocr_dets)
         all_v7_dets.extend(v7_dets)
@@ -3266,9 +3266,9 @@ def _run_chunk_ocr(
     # ── v7 football OCR ──
     if _is_football:
         _v7_t0 = time.perf_counter()
-        _v7_sample = live_frames[::max(1, len(live_frames) // 100)][:100]
+        _v7_sample = live_frames[::max(1, len(live_frames) // 50)][:50]
         for ts, frame in _v7_sample:
-            if time.perf_counter() - _v7_t0 > 60:
+            if time.perf_counter() - _v7_t0 > 30:
                 break
             try:
                 dets = roboflow_detector.detect_football_jersey_v7(frame, jersey_number, conf=ocr_conf)

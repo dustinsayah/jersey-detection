@@ -2218,9 +2218,11 @@ async def _run_analyze_pipeline_impl(
                 if best_t is not None:
                     pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
                     in_boundary = _in_audio_boundary(audio_result, best_t)
-                    conf = max(0.25, best_motion / 100.0 * 0.5)
+                    # Confidence must be > 0.5 to bypass clip_extractor jitter filter
+                    # (isolated points with conf < 0.5 get removed as false positives)
+                    conf = max(0.55, best_motion / 100.0 * 0.8)
                     if in_boundary:
-                        conf = min(0.8, conf + 0.15)
+                        conf = min(0.9, conf + 0.15)
                     detection_points.append(DetectionPoint(
                         timestamp=best_t,
                         confidence=conf,

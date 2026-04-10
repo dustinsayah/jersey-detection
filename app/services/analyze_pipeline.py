@@ -2049,11 +2049,17 @@ async def _run_analyze_pipeline_impl(
         # clips, add high-motion frames as supplementary points.  The player IS
         # in the video (confirmed by OCR), so motion peaks are likely their plays.
         #
+        # SKIP for football — football uses cadence-based supplement below,
+        # which is more reliable at 640x360 resolution.  Motion supplement adds
+        # many low-quality points (conf 0.05-0.25) that inflate detection_points
+        # count, prevent cadence from firing, then get jitter-filtered anyway.
+        #
         # Uses PERCENTILE-BASED threshold instead of fixed values, so it adapts
         # to low-resolution video (640x360 from WARP has much lower optical flow
         # scores than 720p — fixed threshold of 15 misses everything).
         _supplement_limit = 60 if video_duration > 1800 else 20
-        if 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
+        _skip_motion_supp = sport.lower() == "football"  # football uses cadence
+        if not _skip_motion_supp and 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
             _is_football_supp = sport.lower() == "football"
 

@@ -230,9 +230,23 @@ def extract_clips(
     # ── Step 0: Jitter filter — remove isolated 1-frame false positives ──
     # Full-game mode: wider neighbor window because frames are 8+ seconds
     # apart at 1fps.  Also lower confidence bypass (v5 OCR averages 0.4-0.45).
+    # Standard mode: use adaptive window based on actual detection density.
+    # With uniform frame sampling, frames can be 3s+ apart — fixed 2s window
+    # would filter out almost everything.
     _is_full_game = video_duration > 1800
-    _jitter_window = 10.0 if _is_full_game else 2.0
-    _jitter_conf_bypass = 0.3 if _is_full_game else 0.5
+    if _is_full_game:
+        _jitter_window = 10.0
+        _jitter_conf_bypass = 0.3
+    else:
+        # Adaptive: compute median gap between detections
+        _sorted_ts = sorted(d.timestamp for d in detections)
+        if len(_sorted_ts) >= 2:
+            _gaps = [_sorted_ts[i+1] - _sorted_ts[i] for i in range(len(_sorted_ts)-1)]
+            _median_gap = sorted(_gaps)[len(_gaps) // 2]
+            _jitter_window = max(2.0, _median_gap * 1.5)
+        else:
+            _jitter_window = 4.0
+        _jitter_conf_bypass = 0.4
     sorted_dets = sorted(detections, key=lambda d: d.timestamp)
     if len(sorted_dets) >= 3:
         filtered_dets: list[DetectionPoint] = []

@@ -2104,31 +2104,65 @@ async def _run_analyze_pipeline_impl(
                 LOGGER.info("Pipeline: motion supplement added %d high-motion points "
                             "(total detection_points now %d)", _supplement_count, len(detection_points))
 
-        # If jersey detection found nothing or very few points, supplement
-        # with motion-based play segmentation (football) or motion/audio fallback.
-        # Threshold: <15 means OCR didn't find enough for 20+ clips.
+        # ── Supplement detection points when OCR found too few for good clips.
+        # For football: use cadence-based supplement (1 play every ~30s).
+        # For other sports: motion-based play segmentation + fallback.
         _dp_before_supplement = len(detection_points)
-        _need_motion_supplement = _dp_before_supplement < 15
         is_football = sport.lower() == "football"
 
-        if _need_motion_supplement and _frame_timestamps:
+        if is_football and _dp_before_supplement < 20 and video_duration > 30 and _frame_timestamps:
+            # Football cadence supplement — PRIMARY strategy for football.
+            # Motion scores at 640x360 are too low (0-10 range) for threshold-
+            # based detection. Instead, leverage football's predictable rhythm:
+            # 1 play every 25-40 seconds (snap → whistle → huddle → snap).
+            _existing_play_ts = {dp.timestamp for dp in detection_points}
+            _cadence = 30.0
+            _cadence_added = 0
+            _t_cursor = 5.0
+            while _t_cursor < video_duration - 5.0:
+                best_t = None
+                best_motion = -1
+                for ft in _frame_timestamps:
+                    if abs(ft - _t_cursor) < _cadence / 2:
+                        m = motion_scores.get(ft, 0)
+                        if m > best_motion and ft not in _existing_play_ts:
+                            best_t = ft
+                            best_motion = m
+                if best_t is not None:
+                    pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
+                    in_boundary = _in_audio_boundary(audio_result, best_t)
+                    conf = max(0.55, best_motion / 100.0 * 0.8)
+                    if in_boundary:
+                        conf = min(0.9, conf + 0.15)
+                    detection_points.append(DetectionPoint(
+                        timestamp=best_t,
+                        confidence=conf,
+                        jersey_visible=False,
+                        motion_score=best_motion,
+                        pose_action=pose.get("action", "standing"),
+                        crowd_energy=_get_crowd_energy(audio_result, best_t),
+                    ))
+                    _existing_play_ts.add(best_t)
+                    _cadence_added += 1
+                _t_cursor += _cadence
+            if _cadence_added:
+                LOGGER.info("Pipeline: football cadence supplement added %d points "
+                            "every %.0fs (total now %d)",
+                            _cadence_added, _cadence, len(detection_points))
+
+        elif not is_football and _dp_before_supplement < 15 and _frame_timestamps:
+            # Non-football: play segmentation + motion/audio fallback
             _existing_play_ts = {dp.timestamp for dp in detection_points}
 
-            # Try motion-based play segmentation for football
-            if is_football and motion_scores:
+            if motion_scores:
                 from app.services.clip_extractor import segment_plays_from_motion
                 play_segments = segment_plays_from_motion(motion_scores, sport)
                 if play_segments:
                     _play_added = 0
-                    LOGGER.info("Pipeline: football play segmentation found %d plays "
-                                "(existing detection_points=%d)",
-                                len(play_segments), len(detection_points))
                     for seg_start, seg_end in play_segments:
                         seg_mid = (seg_start + seg_end) / 2
-                        # Skip if too close to an existing detection
                         if any(abs(seg_mid - ets) < 2.0 for ets in _existing_play_ts):
                             continue
-                        # Get peak motion in this play segment
                         seg_motions = [
                             motion_scores.get(t, 0) for t in _frame_timestamps
                             if seg_start <= t <= seg_end
@@ -2153,18 +2187,12 @@ async def _run_analyze_pipeline_impl(
                         LOGGER.info("Pipeline: play segmentation added %d points "
                                     "(total now %d)", _play_added, len(detection_points))
 
-            # Fallback: percentile-based motion detection (if still too few points)
-            if len(detection_points) < 10 and _frame_timestamps:
-                # Use top 40% of motion scores as threshold (adapts to resolution)
-                _fb_motions = sorted(
-                    [motion_scores.get(t, 0) for t in _frame_timestamps],
-                    reverse=True,
-                )
-                _fb_pct_idx = max(1, int(len(_fb_motions) * 0.40))
-                _fb_thresh = max(3.0, _fb_motions[min(_fb_pct_idx, len(_fb_motions) - 1)])
+            # Motion/audio fallback (if still too few points)
+            if len(detection_points) < 10:
+                motion_threshold = 30
                 LOGGER.info("Pipeline: low detections (%d), using motion/audio fallback "
-                            "(percentile threshold=%.1f, sport=%s)",
-                            len(detection_points), _fb_thresh, sport)
+                            "(threshold=%d, sport=%s)",
+                            len(detection_points), motion_threshold, sport)
                 for t in _frame_timestamps:
                     if t in _existing_play_ts:
                         continue
@@ -2172,7 +2200,7 @@ async def _run_analyze_pipeline_impl(
                         continue
                     motion = motion_scores.get(t, 0)
                     in_boundary = _in_audio_boundary(audio_result, t)
-                    if motion >= _fb_thresh or in_boundary:
+                    if motion > motion_threshold or in_boundary:
                         pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
                         conf = motion / 100.0 * 0.7
                         if in_boundary:
@@ -2193,52 +2221,6 @@ async def _run_analyze_pipeline_impl(
                             v4_outcome=fallback_v4,
                         ))
                         _existing_play_ts.add(t)
-
-        # ── Football cadence supplement: if still too few points, place
-        # detection points at regular play-cadence intervals (~30s apart).
-        # Football has a predictable rhythm: 1 play every 25-40 seconds.
-        # These are low-confidence but ensure clip coverage across the video.
-        if is_football and len(detection_points) < 15 and video_duration > 30:
-            _existing_play_ts = {dp.timestamp for dp in detection_points}
-            _cadence = 30.0  # one play every ~30s
-            _cadence_added = 0
-            # Place points across the video at play cadence
-            _t_cursor = 5.0  # start 5s in (skip pre-game)
-            while _t_cursor < video_duration - 5.0:
-                # Find the best frame timestamp near this cadence point.
-                # No gap check: cadence points are deliberate and evenly
-                # spaced — they represent the expected play rhythm.
-                best_t = None
-                best_motion = -1
-                for ft in _frame_timestamps:
-                    if abs(ft - _t_cursor) < _cadence / 2:
-                        m = motion_scores.get(ft, 0)
-                        if m > best_motion and ft not in _existing_play_ts:
-                            best_t = ft
-                            best_motion = m
-                if best_t is not None:
-                    pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
-                    in_boundary = _in_audio_boundary(audio_result, best_t)
-                    # Confidence must be > 0.5 to bypass clip_extractor jitter filter
-                    # (isolated points with conf < 0.5 get removed as false positives)
-                    conf = max(0.55, best_motion / 100.0 * 0.8)
-                    if in_boundary:
-                        conf = min(0.9, conf + 0.15)
-                    detection_points.append(DetectionPoint(
-                        timestamp=best_t,
-                        confidence=conf,
-                        jersey_visible=False,
-                        motion_score=best_motion,
-                        pose_action=pose.get("action", "standing"),
-                        crowd_energy=_get_crowd_energy(audio_result, best_t),
-                    ))
-                    _existing_play_ts.add(best_t)
-                    _cadence_added += 1
-                _t_cursor += _cadence
-            if _cadence_added:
-                LOGGER.info("Pipeline: football cadence supplement added %d points "
-                            "every %.0fs (total now %d)",
-                            _cadence_added, _cadence, len(detection_points))
 
         _dp_after_supplement = len(detection_points)
         _supplement_added = _dp_after_supplement - _dp_before_supplement

@@ -165,38 +165,36 @@ def _compute_recruiting_score(
     sport: str,
     position: str | None,
 ) -> int:
-    """Compute a 0-100 recruiting score for how impressive a clip looks to a college coach.
+    """Compute a 0-100 recruiting score for how impressive a clip looks.
 
     Uses the raw clip score (0-100 from clip_extractor) as the PRIMARY base,
-    then applies modifiers. This ensures clips with different underlying quality
-    get different recruiting scores even when they share the same grade.
+    then applies modifiers.
 
     Positive modifiers (add):
-      +20  jerseyVisible AND jerseyNumberSeen matches target
+      +25  jerseyVisible AND jerseyNumberSeen matches target
+      +12  jerseyVisible only (can see player but not number)
       +15  touchdown / made_shot / goal detected
-      +10  crowd energy > 0.7
-      +10  pose = throwing or jumping (athletic action)
-      +5   audio whistle (end of play confirmed)
+      +10  crowd energy > 0.7 or pose = throwing/jumping
+      +8   motion > 60 (athletic play)
+      +5   motion > 40 or crowd > 0.5 or audio whistle
       +5   completion / sack / qb_scramble / reception_yac
 
     Negative modifiers (subtract):
-      -10  jerseyVisible is false (can't confirm player identity)
-      -15  playType = formation (pre-snap, not action)
-      -20  deadBallRatio > 0.5 (mostly dead ball footage)
-      -5   playType = dead_ball
+      -5   jerseyVisible is false
+      -5   playType = formation
+      -10  deadBallRatio > 0.5
+      -3   playType = dead_ball
     """
-    # Use raw clip score as primary base (already 0-100 from clip_extractor)
-    # Scale it to 0-60 range to leave room for modifiers to push up to 100
     raw_score = clip_dict.get("score", 50)
-    score = int(raw_score * 0.6)  # 0-60 base from clip quality
+    score = int(raw_score * 0.8)  # 0-80 base from clip quality
 
     # ── Positive modifiers ──
 
     # Jersey visibility + number match
     if clip_dict.get("jerseyVisible") and clip_dict.get("jerseyNumberSeen"):
-        score += 20
+        score += 25
     elif clip_dict.get("jerseyVisible"):
-        score += 10
+        score += 12
 
     # v4 outcome boosts
     v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
@@ -218,30 +216,38 @@ def _compute_recruiting_score(
     if pose in ("throwing", "jumping"):
         score += 10
 
-    # Audio whistle — confirms end of play
-    audio = (clip_dict.get("signals") or {}).get("audio")
-    if audio and "whistle" in str(audio).lower():
+    # Motion — rewards athletic plays
+    motion = (clip_dict.get("signals") or {}).get("motion", 0) or 0
+    if motion > 60:
+        score += 8
+    elif motion > 40:
         score += 5
 
-    # ── Negative modifiers ──
+    # Audio — any audio event confirms real play
+    audio = (clip_dict.get("signals") or {}).get("audio")
+    audio_conf = (clip_dict.get("signals") or {}).get("audio_confidence", 0) or 0
+    if audio or audio_conf > 0.3:
+        score += 5
 
-    # No jersey visible — can't confirm player identity
+    # ── Negative modifiers (reduced) ──
+
+    # No jersey visible
     if not clip_dict.get("jerseyVisible"):
-        score -= 10
-
-    # Formation / pre-snap — not actual game action
-    play_type = clip_dict.get("playType", "game_action")
-    if play_type == "formation":
-        score -= 15
-    elif play_type == "dead_ball":
         score -= 5
 
-    # Dead ball ratio — mostly dead ball footage in clip
+    # Formation / pre-snap — still shows the player, mild penalty
+    play_type = clip_dict.get("playType", "game_action")
+    if play_type == "formation":
+        score -= 5
+    elif play_type == "dead_ball":
+        score -= 3
+
+    # Dead ball ratio
     dead_ball_ratio = clip_dict.get("deadBallRatio", 0) or 0
     if dead_ball_ratio > 0.5:
-        score -= 20
-    elif dead_ball_ratio > 0.3:
         score -= 10
+    elif dead_ball_ratio > 0.3:
+        score -= 5
 
     return max(0, min(100, score))
 
@@ -2058,7 +2064,11 @@ async def _run_analyze_pipeline_impl(
         # to low-resolution video (640x360 from WARP has much lower optical flow
         # scores than 720p — fixed threshold of 15 misses everything).
         _supplement_limit = 60 if video_duration > 1800 else 20
-        _skip_motion_supp = sport.lower() == "football"  # football uses cadence
+        # Skip motion supplement for ALL sports — it adds many tightly-spaced
+        # points that merge into one giant cluster in the clip extractor.
+        # Football uses cadence supplement, other sports use play segmentation
+        # (both produce better-separated detection points).
+        _skip_motion_supp = True
         if not _skip_motion_supp and 1 <= len(detection_points) <= _supplement_limit and _frame_timestamps:
             _existing_ts = {dp.timestamp for dp in detection_points}
             _is_football_supp = sport.lower() == "football"
@@ -2158,7 +2168,7 @@ async def _run_analyze_pipeline_impl(
                             "every %.0fs (total now %d)",
                             _cadence_added, _cadence, len(detection_points))
 
-        elif not is_football and _dp_before_supplement < 15 and _frame_timestamps:
+        elif not is_football and _dp_before_supplement < 30 and _frame_timestamps:
             # Non-football: play segmentation + motion/audio fallback
             _existing_play_ts = {dp.timestamp for dp in detection_points}
 
@@ -2268,6 +2278,10 @@ async def _run_analyze_pipeline_impl(
         LOGGER.info("Pipeline: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_dur)
 
         # ── Temporal jersey attribution (standard path) ──
+        # Full-game videos use wider window (120s) because OCR detections
+        # may only appear in certain chunks but the player is on the field
+        # throughout.  Short clips use 15s window.
+        _jersey_attr_window = 120 if video_duration > 600 else 15
         _jersey_ts_std = sorted(
             d["timestamp"] for d in all_layer_dets
             if d.get("number_detected") == jersey_number
@@ -2278,14 +2292,14 @@ async def _run_analyze_pipeline_impl(
                 if clip.jersey_visible:
                     continue
                 for jts in _jersey_ts_std:
-                    if clip.start_time - 15 <= jts <= clip.end_time + 15:
+                    if clip.start_time - _jersey_attr_window <= jts <= clip.end_time + _jersey_attr_window:
                         clip.jersey_visible = True
                         clip.jersey_number_seen = jersey_number
                         _attr_count_std += 1
                         break
             if _attr_count_std:
-                LOGGER.info("Pipeline: temporal jersey attribution: %d clips gained jersey=%d",
-                            _attr_count_std, jersey_number)
+                LOGGER.info("Pipeline: temporal jersey attribution: %d clips gained jersey=%d (window=%ds)",
+                            _attr_count_std, jersey_number, _jersey_attr_window)
 
         # ── Step 9: Stat generation pipeline ───────────────────────────
         stat_result: dict = {"game_stats": {}, "per_clip_stats": [], "actions_detected": []}
@@ -3029,21 +3043,24 @@ async def _run_chunked_full_game(
         d["timestamp"] for d in all_layer_dets
         if d.get("number_detected") == jersey_number
     ) if all_layer_dets else []
+    # Chunked full-game: use 120s attribution window — OCR may only
+    # detect the jersey in a few chunks, but the player is on the field
+    # throughout.  This ensures most clips get jersey_visible=true.
+    _jersey_attr_window_c = 120
     if _jersey_ts and clips:
         _attr_count = 0
         for clip in clips:
             if clip.jersey_visible:
                 continue
-            # Check if any OCR detection of this jersey is within 15s of this clip
             for jts in _jersey_ts:
-                if clip.start_time - 15 <= jts <= clip.end_time + 15:
+                if clip.start_time - _jersey_attr_window_c <= jts <= clip.end_time + _jersey_attr_window_c:
                     clip.jersey_visible = True
                     clip.jersey_number_seen = jersey_number
                     _attr_count += 1
                     break
         if _attr_count:
-            LOGGER.info("Chunked: temporal jersey attribution: %d clips gained jersey=%d",
-                        _attr_count, jersey_number)
+            LOGGER.info("Chunked: temporal jersey attribution: %d clips gained jersey=%d (window=%ds)",
+                        _attr_count, jersey_number, _jersey_attr_window_c)
 
     # ── Unload models ──
     try:

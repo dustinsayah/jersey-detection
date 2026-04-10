@@ -519,7 +519,7 @@ def extract_clips(
             continue
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
-        has_motion = (clip.signals.get("motion", 0) or 0) > 30
+        has_motion = (clip.signals.get("motion", 0) or 0) > 15
         has_audio = bool(clip.signals.get("audio"))
         if has_jersey or has_outcome or has_motion or has_audio:
             gated.append(clip)

@@ -115,14 +115,16 @@ class TemporalConsensus:
         if not detections:
             return []
 
-        # Adaptive threshold for poor-quality video with few detections
+        # Adaptive threshold for poor-quality video with few detections.
+        # Never RAISE above the configured min_confirmations — if the caller
+        # already set min_confirmations=1 (e.g. dark jersey), respect that.
         effective_min = self.min_confirmations
         if adaptive:
             total = len(detections)
             if total < 9:
-                effective_min = 1
+                effective_min = min(effective_min, 1)
             elif total < 18:
-                effective_min = 2
+                effective_min = min(effective_min, 2)
             if effective_min != self.min_confirmations:
                 logger.info(
                     "temporal_consensus: adaptive min_confirmations %d → %d (total=%d)",

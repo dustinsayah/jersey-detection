@@ -1957,8 +1957,10 @@ async def _run_analyze_pipeline_impl(
                 )
 
             if all_layer_dets:
+                # adaptive=False: pipeline already handles its own adaptive
+                # logic (dark jersey, few detections, full game) above.
                 confirmed_dets = tc_instance.filter_detections(
-                    all_layer_dets, jersey_number
+                    all_layer_dets, jersey_number, adaptive=False
                 )
                 confirmed_dets = tc_instance.cross_layer_boost(
                     confirmed_dets
@@ -2081,26 +2083,35 @@ async def _run_analyze_pipeline_impl(
                 LOGGER.info("Pipeline: motion supplement added %d high-motion points "
                             "(total detection_points now %d)", _supplement_count, len(detection_points))
 
-        # If jersey detection found nothing, generate detection points from motion/audio
-        if not detection_points and _frame_timestamps:
-            # Football: use play segmentation first, then fallback to threshold
-            is_football = sport.lower() == "football"
+        # If jersey detection found nothing or very few points, supplement
+        # with motion-based play segmentation (football) or motion/audio fallback.
+        # Threshold: <15 means OCR didn't find enough for 20+ clips.
+        _need_motion_supplement = len(detection_points) < 15
+        is_football = sport.lower() == "football"
+
+        if _need_motion_supplement and _frame_timestamps:
+            _existing_play_ts = {dp.timestamp for dp in detection_points}
 
             # Try motion-based play segmentation for football
             if is_football and motion_scores:
                 from app.services.clip_extractor import segment_plays_from_motion
                 play_segments = segment_plays_from_motion(motion_scores, sport)
                 if play_segments:
-                    LOGGER.info("Pipeline: football play segmentation found %d plays", len(play_segments))
+                    _play_added = 0
+                    LOGGER.info("Pipeline: football play segmentation found %d plays "
+                                "(existing detection_points=%d)",
+                                len(play_segments), len(detection_points))
                     for seg_start, seg_end in play_segments:
                         seg_mid = (seg_start + seg_end) / 2
+                        # Skip if too close to an existing detection
+                        if any(abs(seg_mid - ets) < 2.0 for ets in _existing_play_ts):
+                            continue
                         # Get peak motion in this play segment
                         seg_motions = [
                             motion_scores.get(t, 0) for t in _frame_timestamps
                             if seg_start <= t <= seg_end
                         ]
                         peak_motion = max(seg_motions) if seg_motions else 0
-                        avg_motion = sum(seg_motions) / len(seg_motions) if seg_motions else 0
                         pose = pose_results.get(seg_mid, _nearest_pose(pose_results, seg_mid)) if pose_results else {}
                         in_boundary = _in_audio_boundary(audio_result, seg_mid)
                         conf = min(0.9, peak_motion / 100.0 * 0.8)
@@ -2114,12 +2125,23 @@ async def _run_analyze_pipeline_impl(
                             pose_action=pose.get("action", "standing"),
                             crowd_energy=_get_crowd_energy(audio_result, seg_mid),
                         ))
+                        _existing_play_ts.add(seg_mid)
+                        _play_added += 1
+                    if _play_added:
+                        LOGGER.info("Pipeline: play segmentation added %d points "
+                                    "(total now %d)", _play_added, len(detection_points))
 
-            # Fallback: threshold-based detection (if play segmentation didn't produce points)
-            if not detection_points:
+            # Fallback: threshold-based detection (if still too few points)
+            if len(detection_points) < 10:
                 motion_threshold = 10 if is_football else 30
-                LOGGER.info("Pipeline: no jersey detections, using motion/audio fallback (threshold=%d, sport=%s)", motion_threshold, sport)
+                LOGGER.info("Pipeline: low detections (%d), using motion/audio fallback "
+                            "(threshold=%d, sport=%s)",
+                            len(detection_points), motion_threshold, sport)
                 for t in _frame_timestamps:
+                    if t in _existing_play_ts:
+                        continue
+                    if any(abs(t - ets) < 1.5 for ets in _existing_play_ts):
+                        continue
                     motion = motion_scores.get(t, 0)
                     in_boundary = _in_audio_boundary(audio_result, t)
                     if motion > motion_threshold or in_boundary:
@@ -2142,6 +2164,7 @@ async def _run_analyze_pipeline_impl(
                             crowd_energy=_get_crowd_energy(audio_result, t),
                             v4_outcome=fallback_v4,
                         ))
+                        _existing_play_ts.add(t)
 
         # Extract and rank clips
         clips = extract_clips(

@@ -821,6 +821,7 @@ async def _run_analyze_pipeline_impl(
                 if _db_step == 0:
                     # Skip dead ball entirely (e.g. football — classifier unreliable)
                     _live = list(frames)
+                    dead_ball_ratio = 0.0
                 else:
                     for idx, (ts, frame) in enumerate(frames):
                         if idx % _db_step != 0:
@@ -835,8 +836,9 @@ async def _run_analyze_pipeline_impl(
                         else:
                             _live.append((ts, frame))
 
-                _db_sampled = len(frames) // _db_step + (1 if len(frames) % _db_step else 0)
-                dead_ball_ratio = dead_ball_count / _db_sampled if _db_sampled else 0.0
+                if _db_step > 0:
+                    _db_sampled = len(frames) // _db_step + (1 if len(frames) % _db_step else 0)
+                    dead_ball_ratio = dead_ball_count / _db_sampled if _db_sampled else 0.0
                 live_ratio = len(_live) / len(frames) if frames else 1.0
 
                 # Safety: if dead ball ratio > 50% OR less than 30% of frames survive,
@@ -2086,7 +2088,8 @@ async def _run_analyze_pipeline_impl(
         # If jersey detection found nothing or very few points, supplement
         # with motion-based play segmentation (football) or motion/audio fallback.
         # Threshold: <15 means OCR didn't find enough for 20+ clips.
-        _need_motion_supplement = len(detection_points) < 15
+        _dp_before_supplement = len(detection_points)
+        _need_motion_supplement = _dp_before_supplement < 15
         is_football = sport.lower() == "football"
 
         if _need_motion_supplement and _frame_timestamps:
@@ -2165,6 +2168,15 @@ async def _run_analyze_pipeline_impl(
                             v4_outcome=fallback_v4,
                         ))
                         _existing_play_ts.add(t)
+
+        _dp_after_supplement = len(detection_points)
+        _supplement_added = _dp_after_supplement - _dp_before_supplement
+        if _supplement_added > 0:
+            LOGGER.info("Pipeline: motion/play supplement added %d points "
+                        "(%d → %d detection_points)",
+                        _supplement_added, _dp_before_supplement, _dp_after_supplement)
+        LOGGER.info("Pipeline: total detection_points before clip extraction: %d",
+                    _dp_after_supplement)
 
         # Extract and rank clips
         clips = extract_clips(
@@ -2436,6 +2448,9 @@ async def _run_analyze_pipeline_impl(
             "layers_that_contributed": layers_that_contributed,
             "layer_breakdown": layer_timings,
             "temporal_consensus": tc_stats,
+            "detection_points_total": _dp_after_supplement,
+            "detection_points_from_ocr": _dp_before_supplement,
+            "detection_points_from_supplement": _supplement_added,
             "cross_layer_agreements": cross_layer_agreements,
             "models_called": request_summary.get("models_called", []),
             "detections_per_model": request_summary.get("detections_per_model", {}),

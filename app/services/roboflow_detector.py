@@ -433,33 +433,27 @@ class RoboflowDetector:
         if is_dark or is_navy_jersey:
             to_load.append("dark_jersey_specialist_v3")
 
-        # Priority 5: v4 outcome models (sport-specific play detection)
-        # These are critical for play type classification and recruiting scores.
+        # Priority 5: v4 outcome models (top 3 per sport to stay under memory limit)
+        # Full set of 5-6 models pushes RSS to 4800+ MB and OOMs.
+        # Keep the highest-impact models only; rule-based detection supplements rest.
         _V4_BY_SPORT: dict[str, list[str]] = {
             "football": [
-                "football_completion_detector_v4",
                 "football_touchdown_detector_v4",
+                "football_completion_detector_v4",
                 "football_sack_detector_v4",
-                "football_reception_yac_v4",
-                "football_qb_scramble_v4",
             ],
             "basketball": [
                 "basketball_made_shot_v4",
                 "basketball_hoop_detector_v4",
-                "basketball_scoring_zone_v4",
-                "basketball_dribble_drive_v4",
                 "basketball_rebound_v4",
             ],
             "lacrosse": [
                 "lacrosse_goal_detector_v4",
                 "lacrosse_shot_quality_v4",
-                "lacrosse_ground_ball_v4",
             ],
         }
         for v4_model in _V4_BY_SPORT.get(sl, []):
             to_load.append(v4_model)
-        # Cross-sport: crowd energy detector
-        to_load.append("crowd_energy_detector_v4")
 
         loaded_models: list[str] = []
         for model_name in to_load:

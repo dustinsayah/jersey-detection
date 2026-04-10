@@ -3341,12 +3341,12 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
-    # ── v4 outcome detection (every 6th live frame for speed) ──
+    # ── v4 outcome detection (every 12th live frame to save memory) ──
     chunk_v4_dets: list[dict] = []
-    _v4_sample = live_frames[::6] if len(live_frames) > 20 else live_frames
+    _v4_sample = live_frames[::12] if len(live_frames) > 20 else live_frames
     _v4_t0 = time.perf_counter()
     for ts, frame in _v4_sample:
-        if time.perf_counter() - _v4_t0 > 30:  # Max 30s for v4
+        if time.perf_counter() - _v4_t0 > 20:  # Max 20s for v4
             break
         try:
             v4_dets = roboflow_detector.detect_outcome_v4(frame, sport=sport)

@@ -2169,76 +2169,45 @@ async def _run_analyze_pipeline_impl(
                             _cadence_added, _cadence, len(detection_points))
 
         elif not is_football and _dp_before_supplement < 30 and _frame_timestamps:
-            # Non-football: play segmentation + motion/audio fallback
+            # Non-football: cadence-based supplement.
+            # Basketball has 24s shot clock → ~1 possession every 18s.
+            # Lacrosse has similar fast-paced action.
+            # Use cadence approach (like football) to create well-separated
+            # detection points that won't merge into one giant cluster.
             _existing_play_ts = {dp.timestamp for dp in detection_points}
-
-            if motion_scores:
-                from app.services.clip_extractor import segment_plays_from_motion
-                play_segments = segment_plays_from_motion(motion_scores, sport)
-                if play_segments:
-                    _play_added = 0
-                    for seg_start, seg_end in play_segments:
-                        seg_mid = (seg_start + seg_end) / 2
-                        if any(abs(seg_mid - ets) < 2.0 for ets in _existing_play_ts):
-                            continue
-                        seg_motions = [
-                            motion_scores.get(t, 0) for t in _frame_timestamps
-                            if seg_start <= t <= seg_end
-                        ]
-                        peak_motion = max(seg_motions) if seg_motions else 0
-                        pose = pose_results.get(seg_mid, _nearest_pose(pose_results, seg_mid)) if pose_results else {}
-                        in_boundary = _in_audio_boundary(audio_result, seg_mid)
-                        conf = min(0.9, peak_motion / 100.0 * 0.8)
-                        if in_boundary:
-                            conf = min(1.0, conf + 0.15)
-                        detection_points.append(DetectionPoint(
-                            timestamp=seg_mid,
-                            confidence=conf,
-                            jersey_visible=False,
-                            motion_score=peak_motion,
-                            pose_action=pose.get("action", "standing"),
-                            crowd_energy=_get_crowd_energy(audio_result, seg_mid),
-                        ))
-                        _existing_play_ts.add(seg_mid)
-                        _play_added += 1
-                    if _play_added:
-                        LOGGER.info("Pipeline: play segmentation added %d points "
-                                    "(total now %d)", _play_added, len(detection_points))
-
-            # Motion/audio fallback (if still too few points)
-            if len(detection_points) < 10:
-                motion_threshold = 15
-                LOGGER.info("Pipeline: low detections (%d), using motion/audio fallback "
-                            "(threshold=%d, sport=%s)",
-                            len(detection_points), motion_threshold, sport)
-                for t in _frame_timestamps:
-                    if t in _existing_play_ts:
-                        continue
-                    if any(abs(t - ets) < 1.5 for ets in _existing_play_ts):
-                        continue
-                    motion = motion_scores.get(t, 0)
-                    in_boundary = _in_audio_boundary(audio_result, t)
-                    if motion > motion_threshold or in_boundary:
-                        pose = pose_results.get(t, _nearest_pose(pose_results, t)) if pose_results else {}
-                        conf = motion / 100.0 * 0.7
-                        if in_boundary:
-                            conf = min(1.0, conf + 0.15)
-                        fallback_v4 = ""
-                        if v4_outcomes_by_ts:
-                            for ts_key, outcome in v4_outcomes_by_ts.items():
-                                if abs(ts_key - t) < 2.0:
-                                    fallback_v4 = outcome
-                                    break
-                        detection_points.append(DetectionPoint(
-                            timestamp=t,
-                            confidence=conf,
-                            jersey_visible=False,
-                            motion_score=motion,
-                            pose_action=pose.get("action", "standing"),
-                            crowd_energy=_get_crowd_energy(audio_result, t),
-                            v4_outcome=fallback_v4,
-                        ))
-                        _existing_play_ts.add(t)
+            _nf_cadence = 18.0  # Basketball/lacrosse cadence
+            _nf_cadence_added = 0
+            _t_cursor = 5.0
+            while _t_cursor < video_duration - 5.0:
+                best_t = None
+                best_motion = -1
+                for ft in _frame_timestamps:
+                    if abs(ft - _t_cursor) < _nf_cadence / 2:
+                        m = motion_scores.get(ft, 0)
+                        if m > best_motion and ft not in _existing_play_ts:
+                            best_t = ft
+                            best_motion = m
+                if best_t is not None:
+                    pose = pose_results.get(best_t, _nearest_pose(pose_results, best_t)) if pose_results else {}
+                    in_boundary = _in_audio_boundary(audio_result, best_t)
+                    conf = max(0.50, best_motion / 100.0 * 0.8)
+                    if in_boundary:
+                        conf = min(0.9, conf + 0.15)
+                    detection_points.append(DetectionPoint(
+                        timestamp=best_t,
+                        confidence=conf,
+                        jersey_visible=False,
+                        motion_score=best_motion,
+                        pose_action=pose.get("action", "standing"),
+                        crowd_energy=_get_crowd_energy(audio_result, best_t),
+                    ))
+                    _existing_play_ts.add(best_t)
+                    _nf_cadence_added += 1
+                _t_cursor += _nf_cadence
+            if _nf_cadence_added:
+                LOGGER.info("Pipeline: %s cadence supplement added %d points "
+                            "every %.0fs (total now %d)",
+                            sport, _nf_cadence_added, _nf_cadence, len(detection_points))
 
         _dp_after_supplement = len(detection_points)
         _supplement_added = _dp_after_supplement - _dp_before_supplement

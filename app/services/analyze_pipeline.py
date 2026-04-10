@@ -2116,13 +2116,15 @@ async def _run_analyze_pipeline_impl(
         _dp_before_supplement = len(detection_points)
         is_football = sport.lower() == "football"
 
-        if is_football and _dp_before_supplement < 20 and video_duration > 30 and _frame_timestamps:
+        if is_football and _dp_before_supplement < 30 and video_duration > 30 and _frame_timestamps:
             # Football cadence supplement — PRIMARY strategy for football.
             # Motion scores at 640x360 are too low (0-10 range) for threshold-
             # based detection. Instead, leverage football's predictable rhythm:
             # 1 play every 25-40 seconds (snap → whistle → huddle → snap).
+            # Use 22s cadence to target 20+ clips for 600s video (28 cadence
+            # points + OCR = ~35, minus merging = 20-25 clips).
             _existing_play_ts = {dp.timestamp for dp in detection_points}
-            _cadence = 30.0
+            _cadence = 22.0
             _cadence_added = 0
             _t_cursor = 5.0
             while _t_cursor < video_duration - 5.0:

@@ -321,6 +321,11 @@ def _yt_dlp_download(
             env["HTTPS_PROXY"] = proxy
             env["http_proxy"] = proxy
             env["https_proxy"] = proxy
+    else:
+        # CRITICAL: Explicitly remove proxy env vars when no proxy is intended.
+        # Previous strategies may have contaminated os.environ with proxy URLs.
+        for _pk in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            env.pop(_pk, None)
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -402,6 +407,11 @@ def _yt_dlp_python_download(
             os.environ["HTTPS_PROXY"] = http_proxy
             os.environ["http_proxy"] = http_proxy
             os.environ["https_proxy"] = http_proxy
+        else:
+            # CRITICAL: Remove any stale proxy env vars so yt-dlp/ffmpeg don't
+            # accidentally route through a dead proxy from a previous strategy.
+            for _pk in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                os.environ.pop(_pk, None)
 
         if not skip_cookies:
             cookie_file = _get_cookie_file()
@@ -434,10 +444,13 @@ def _yt_dlp_python_download(
             else:
                 os.environ[k] = v
 
+    # Use a non-blocking executor to avoid ThreadPoolExecutor.__exit__ blocking
+    # on shutdown(wait=True) when the download thread hangs after timeout.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_download)
-            return future.result(timeout=timeout)
+        future = executor.submit(_do_download)
+        result = future.result(timeout=timeout)
+        return result
     except concurrent.futures.TimeoutError:
         LOGGER.warning("%s: TIMED OUT after %ds (Python lib, client=%s)", strategy_name, timeout, client)
         if errors_detail is not None:
@@ -450,6 +463,10 @@ def _yt_dlp_python_download(
         return False
     finally:
         _restore_env()
+        # Don't wait for the thread — let it die in background.
+        # shutdown(wait=True) would block until the download finishes,
+        # which defeats the purpose of the timeout.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _render_server_download(
@@ -529,6 +546,13 @@ def download_youtube_sync(
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
     global _warp_consecutive_failures, _warp_blocked_until, _last_successful_strategy
+
+    # CRITICAL: Clear any stale proxy env vars from previous requests/strategies.
+    # _yt_dlp_python_download sets os.environ["HTTP_PROXY"] for ffmpeg, and if the
+    # thread times out or the restore races, the env var can leak to subsequent
+    # strategies (e.g., cookie-only C0/C1 that should use NO proxy).
+    for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(_proxy_key, None)
 
     # Rate limit: wait if we recently downloaded (prevents YouTube 429)
     _enforce_download_cooldown()

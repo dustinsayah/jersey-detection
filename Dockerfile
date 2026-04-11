@@ -71,10 +71,12 @@ RUN python /app/scripts/bootstrap_public_reader.py
 RUN pip install --upgrade --pre yt-dlp \
     || pip install --upgrade yt-dlp
 
-# PO Token provider plugin — auto-generates proof-of-origin tokens for YouTube
-# Reduces cookie dependency; tokens cached 6hrs. Framework + bgutil provider.
-RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider \
-    || echo "PO Token provider install failed (non-fatal)"
+# NOTE: PO Token provider (bgutil-ytdlp-pot-provider) requires a running
+# bgutil HTTP server as a sidecar service. Do NOT install without the server
+# — the plugin intercepts all requests and fails without a handler.
+# To enable: deploy brainicism/bgutil-ytdlp-pot-provider as a Railway service,
+# then uncomment and set POT_SERVER_URL env var.
+# RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider
 
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
 # This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).

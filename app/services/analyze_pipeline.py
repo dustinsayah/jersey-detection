@@ -426,7 +426,8 @@ def _build_player_summary(
     """
     total = len(clips_out)
     jersey_clips = [c for c in clips_out if c.get("jerseyVisible")]
-    scoring_plays = [c for c in clips_out if c.get("v4Outcome") in ("touchdown", "made_shot", "goal")]
+    _scoring_types = ("touchdown", "made_shot", "goal", "three_pointer", "dunk")
+    scoring_plays = [c for c in clips_out if c.get("v4Outcome") in _scoring_types or c.get("playType") in _scoring_types]
     recruiting_scores = [c.get("recruitingScore", 0) for c in clips_out]
 
     # Play type breakdown
@@ -3181,17 +3182,23 @@ async def _run_chunked_full_game(
             clip_crowd = sigs.get("crowd", 0) or 0
             clip_v4 = sigs.get("v4_outcome", "")
             clip_pose = sigs.get("pose", "standing")
-            # QB-indicative signals: throwing/running pose, meaningful motion,
-            # or crowd reaction — any 2 of these 3 conditions
+            clip_pt = clip.play_type or ""
+            # Selective QB boost — only real active plays, not formation/low-energy
+            # Requires: throwing/running pose, strong motion, AND meaningful crowd
             _throwing_or_running = clip_pose in ("throwing", "running")
-            _active_play = clip_motion > 30
-            _crowd_react = clip_crowd > 0.2
+            _active_play = clip_motion > 45  # Higher bar (was 30)
+            _crowd_react = clip_crowd > 0.4  # Stronger crowd signal (was 0.2)
+            _is_formation = clip_pt in ("formation", "dead_ball")
             _has_v4_outcome = clip_v4 in (
                 "pass_play", "qb_scramble", "completion", "sack",
-                "touchdown", "game_action",
+                "touchdown",
             )
+            # Must have throwing/running pose + active motion + crowd,
+            # OR a confirmed v4 outcome (not formation)
             _signal_count = sum([_throwing_or_running, _active_play, _crowd_react])
-            if _signal_count >= 2 or _has_v4_outcome:
+            if _is_formation:
+                continue  # Never QB-boost formation clips
+            if (_throwing_or_running and _active_play) or (_signal_count >= 2 and _crowd_react) or _has_v4_outcome:
                 clip.jersey_visible = True
                 clip.jersey_number_seen = jersey_number
                 if clip.signals is None:

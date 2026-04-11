@@ -167,26 +167,16 @@ def _compute_recruiting_score(
 ) -> int:
     """Compute a 0-100 recruiting score for how impressive a clip looks.
 
-    Uses the raw clip score (0-100 from clip_extractor) as the PRIMARY base,
-    then applies modifiers.
-
-    Positive modifiers (add):
-      +25  jerseyVisible AND jerseyNumberSeen matches target
-      +12  jerseyVisible only (can see player but not number)
-      +15  touchdown / made_shot / goal detected
-      +10  crowd energy > 0.7 or pose = throwing/jumping
-      +8   motion > 60 (athletic play)
-      +5   motion > 40 or crowd > 0.5 or audio whistle
-      +5   completion / sack / qb_scramble / reception_yac
-
-    Negative modifiers (subtract):
-      -5   jerseyVisible is false
-      -5   playType = formation
-      -10  deadBallRatio > 0.5
-      -3   playType = dead_ball
+    Jersey-confirmed clips use full raw_score (not * 0.8) as base.
+    Position-specific bonuses reward sport-relevant plays.
     """
     raw_score = clip_dict.get("score", 50)
-    score = int(raw_score * 0.8)  # 0-80 base from clip quality
+
+    # Base: jersey-confirmed clips get full raw score for differentiation
+    if clip_dict.get("jerseyVisible") and clip_dict.get("jerseyNumberSeen"):
+        score = int(raw_score)
+    else:
+        score = int(raw_score * 0.8)
 
     # ── Positive modifiers ──
 
@@ -196,13 +186,29 @@ def _compute_recruiting_score(
     elif clip_dict.get("jerseyVisible"):
         score += 12
 
-    # v4 outcome boosts
+    # Play type boosts (v4 outcome OR rule-based play type)
     v4 = clip_dict.get("v4Outcome") or (clip_dict.get("signals") or {}).get("v4_outcome", "")
-    if v4:
-        if v4 in ("touchdown", "made_shot", "goal"):
-            score += 15
-        elif v4 in ("completion", "sack", "qb_scramble", "reception_yac"):
-            score += 5
+    play_type = clip_dict.get("playType", "game_action")
+    effective_play = v4 if v4 else play_type
+    if effective_play in ("touchdown", "made_shot", "goal"):
+        score += 20
+    elif effective_play in ("pass_play", "completion"):
+        score += 12
+    elif effective_play in ("qb_scramble", "sack", "reception_yac", "big_play"):
+        score += 10
+    elif effective_play in ("fast_break", "shot_attempt", "drive", "ground_ball"):
+        score += 8
+
+    # Position-specific bonuses
+    pos = (position or "").upper()
+    if pos == "QB" and effective_play in ("pass_play", "qb_scramble", "completion", "touchdown", "big_play"):
+        score += 10
+    elif pos in ("WR", "TE") and effective_play in ("completion", "reception_yac", "touchdown"):
+        score += 10
+    elif pos in ("RB", "HB") and effective_play in ("big_play", "touchdown", "qb_scramble"):
+        score += 10
+    elif pos in ("PG", "SG", "SF", "PF", "C") and effective_play in ("made_shot", "fast_break", "shot_attempt"):
+        score += 10
 
     # Crowd energy (from signals)
     crowd = (clip_dict.get("signals") or {}).get("crowd", 0) or 0
@@ -229,18 +235,17 @@ def _compute_recruiting_score(
     if audio or audio_conf > 0.3:
         score += 5
 
-    # ── Negative modifiers (reduced) ──
+    # ── Negative modifiers ──
 
     # No jersey visible
     if not clip_dict.get("jerseyVisible"):
         score -= 5
 
-    # Formation / pre-snap — still shows the player, very mild penalty
-    play_type = clip_dict.get("playType", "game_action")
+    # Formation / dead ball
     if play_type == "formation":
-        score -= 3
+        score -= 5
     elif play_type == "dead_ball":
-        score -= 3
+        score -= 5
 
     # Dead ball ratio
     dead_ball_ratio = clip_dict.get("deadBallRatio", 0) or 0
@@ -452,32 +457,61 @@ def _detect_play_type_rules(
     """Rule-based play type detection — supplements v4 model output.
 
     Assigns meaningful play types based on signal combinations
-    even when v4 models return no detections.
+    even when v4 models return no detections. Works WITHOUT pose
+    signals (chunked mode has no pose estimation).
     """
     sl = sport.lower()
     if sl == "football":
+        # Scoring plays: very high crowd + high motion
+        if crowd_energy > 0.8 and motion_score > 60:
+            return "touchdown"
+        # Throwing actions
         if pose == "throwing" and motion_score > 40:
             return "pass_play"
+        # High motion + jersey visible → active play involvement
+        if motion_score > 65 and jersey_visible and crowd_energy > 0.3:
+            return "pass_play"
+        # Scramble-like plays
         if pose == "running" and motion_score > 60:
             return "qb_scramble"
-        if crowd_energy > 0.75 and motion_score > 50:
+        if motion_score > 75 and crowd_energy > 0.4:
+            return "qb_scramble"
+        # Big plays
+        if crowd_energy > 0.65 and motion_score > 45:
             return "big_play"
-        if motion_score > 70:
-            return "game_action"  # High motion = active play
+        # Sack/tackle
+        if crowd_energy > 0.5 and motion_score > 50 and pose in ("falling", "crouching"):
+            return "sack"
+        # Active plays with jersey
+        if motion_score > 50 and jersey_visible:
+            return "completion"
+        # Moderate activity with jersey
+        if motion_score > 35 and jersey_visible:
+            return "game_action"
         return "game_action"
     elif sl == "basketball":
+        if crowd_energy > 0.8 and motion_score > 50:
+            return "made_shot"
         if pose == "jumping" and motion_score > 40:
             return "shot_attempt"
+        if motion_score > 70 and jersey_visible:
+            return "fast_break"
         if pose == "running" and motion_score > 60:
             return "fast_break"
-        if crowd_energy > 0.7:
+        if crowd_energy > 0.6 and motion_score > 40:
             return "big_play"
+        if motion_score > 50 and jersey_visible:
+            return "drive"
         return "game_action"
     elif sl == "lacrosse":
+        if crowd_energy > 0.8 and motion_score > 50:
+            return "goal"
         if pose == "throwing" and motion_score > 40:
             return "shot_attempt"
-        if crowd_energy > 0.7:
+        if motion_score > 60 and crowd_energy > 0.5:
             return "big_play"
+        if motion_score > 50 and jersey_visible:
+            return "ground_ball"
         return "game_action"
     return "game_action"
 
@@ -623,65 +657,48 @@ async def _run_analyze_pipeline_impl(
     try:
         # ── Step 1: Acquire video ────────────────────────────────────────
         if video_url and is_youtube_url(video_url):
-            # For long videos (>10 min), skip upfront download — chunked pipeline
-            # will download each 10-min chunk separately. This enables strategy caching:
-            # chunk 1 finds the working strategy, chunks 2+ use it directly (saves 60-200s each).
-            _requested_duration = (time_range_end - time_range_start) if time_range_end > time_range_start else 0
-            if _requested_duration > 600:
-                LOGGER.info(
-                    "Pipeline: SKIPPING upfront download for %.0fs game — will download per-chunk",
-                    _requested_duration,
+            # Always download FULL video (no --download-sections).
+            # Key insight: --download-sections breaks DASH 720p merge via proxy.
+            # /test-youtube downloads full at 720p in ~68s — do the same here.
+            # Chunked pipeline then processes desired time range from local file.
+            LOGGER.info("Pipeline: downloading YouTube video (full, no sections)")
+            t0 = time.perf_counter()
+            try:
+                from app.services.detection_runtime import PipelineSettings
+                settings = PipelineSettings()
+                dl_result: DownloadResult = await run_in_threadpool(
+                    partial(
+                        download_youtube_sync,
+                        video_url,
+                        start_time=0,
+                        end_time=0,
+                        yt_dlp_binary=settings.yt_dlp_binary,
+                        ffmpeg_binary=settings.ffmpeg_binary,
+                    )
                 )
+                local_video_path = dl_result.path
                 extract_start = time_range_start
                 extract_end = time_range_end
-                # local_video_path stays None — chunked pipeline will download
-            else:
-                LOGGER.info("Pipeline: downloading YouTube video")
-                t0 = time.perf_counter()
-                try:
-                    from app.services.detection_runtime import PipelineSettings
-                    settings = PipelineSettings()
-                    dl_result: DownloadResult = await run_in_threadpool(
-                        partial(
-                            download_youtube_sync,
-                            video_url,
-                            start_time=time_range_start,
-                            end_time=time_range_end,
-                            yt_dlp_binary=settings.yt_dlp_binary,
-                            ffmpeg_binary=settings.ffmpeg_binary,
-                        )
-                    )
-                    local_video_path = dl_result.path
-                    # If video was pre-trimmed by --download-sections, adjust frame extraction range
-                    if dl_result.was_sectioned:
-                        LOGGER.info("Pipeline: video was pre-sectioned (%.0f-%.0f) → extracting from 0", time_range_start, time_range_end)
-                        extract_start = 0.0
-                        extract_end = (time_range_end - time_range_start) if time_range_end > 0 else 0.0
-                    else:
-                        extract_start = time_range_start
-                        extract_end = time_range_end
-                    phases_used.append("youtube_download")
-                    youtube_strategy_used = getattr(dl_result, "strategy_used", "download_success")
-                    layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
-                    LOGGER.info("Pipeline: YouTube video downloaded to %s (sectioned=%s)", local_video_path, dl_result.was_sectioned)
-                    # Log resolution for diagnostic purposes — also include in API response
-                    vid_w, vid_h = get_video_resolution(local_video_path)
-                    LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
-                    layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
-                    layer_timings["youtube_download"]["was_sectioned"] = dl_result.was_sectioned
-                    # Log file size
-                    file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
-                    layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
-                    LOGGER.info("Pipeline: Downloaded file size = %sMB", file_size_mb)
-                except Exception as exc:
-                    layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
-                    youtube_strategy_used = "all_failed"
-                    LOGGER.error("Pipeline: YouTube download failed: %s", exc)
-                    return _error_response(
-                        f"YouTube download failed: {exc}",
-                        time.perf_counter() - start_time,
-                        layer_timings=layer_timings,
-                    )
+                phases_used.append("youtube_download")
+                youtube_strategy_used = getattr(dl_result, "strategy_used", "download_success")
+                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "success"}
+                LOGGER.info("Pipeline: YouTube video downloaded to %s", local_video_path)
+                vid_w, vid_h = get_video_resolution(local_video_path)
+                LOGGER.info("Pipeline: Video resolution = %dx%d", vid_w, vid_h)
+                layer_timings["youtube_download"]["video_resolution"] = f"{vid_w}x{vid_h}"
+                layer_timings["youtube_download"]["was_sectioned"] = False
+                file_size_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+                layer_timings["youtube_download"]["file_size_mb"] = file_size_mb
+                LOGGER.info("Pipeline: Downloaded file size = %sMB", file_size_mb)
+            except Exception as exc:
+                layer_timings["youtube_download"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "failed", "error": str(exc)}
+                youtube_strategy_used = "all_failed"
+                LOGGER.error("Pipeline: YouTube download failed: %s", exc)
+                return _error_response(
+                    f"YouTube download failed: {exc}",
+                    time.perf_counter() - start_time,
+                    layer_timings=layer_timings,
+                )
         elif video_url:
             # Direct URL — download it first
             extract_start = time_range_start
@@ -716,17 +733,45 @@ async def _run_analyze_pipeline_impl(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
+        # ── Trim to requested range if video is much longer ──
+        # Saves audio time (ffmpeg extracts only requested portion, not full video).
+        # Uses -t (not -ss) to preserve timestamps at 0-based for chunk alignment.
+        if (local_video_path and local_video_path.exists()
+                and time_range_end > 0 and video_duration > time_range_end * 1.1):
+            t_trim = time.perf_counter()
+            trimmed_path = local_video_path.parent / "trimmed.mp4"
+            try:
+                import subprocess as _sp
+                _sp.run([
+                    settings.ffmpeg_binary, "-y",
+                    "-i", str(local_video_path),
+                    "-t", str(time_range_end),  # Keep 0 to time_range_end (preserves timestamps)
+                    "-c", "copy",
+                    str(trimmed_path),
+                ], capture_output=True, timeout=120)
+                if trimmed_path.exists() and trimmed_path.stat().st_size > 0:
+                    old_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+                    local_video_path.unlink(missing_ok=True)
+                    local_video_path = trimmed_path
+                    new_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+                    video_duration = time_range_end
+                    LOGGER.info("Pipeline: trimmed %sMB → %sMB (%.0fs video, keeping 0-%.0fs) in %.1fs",
+                                old_mb, new_mb, video_duration,
+                                time_range_end, time.perf_counter() - t_trim)
+            except Exception as exc:
+                LOGGER.warning("Pipeline: trim failed (using full video): %s", exc)
+
         # ── Determine effective duration for chunked vs standard path ──
         _effective_duration = video_duration
         if time_range_end > time_range_start:
             _effective_duration = time_range_end - time_range_start
 
         # ── CHUNKED PIPELINE for long videos (>10 min) ─────────────────
-        # Process in 10-min chunks with per-chunk YouTube downloads.
-        # Enables strategy caching: chunk 1 finds working strategy, chunks 2+
-        # reuse it directly. Each chunk: download → extract → OCR → free.
-        _CHUNK_THRESHOLD = 600  # 10 minutes — matches per-chunk download threshold
-        _CHUNK_SIZE = 1800  # Overridden to 600 in _run_chunked_full_game if per-chunk
+        # Video is already downloaded (full, one-time). Process in 30-min
+        # chunks from local file: extract frames → OCR → free. No per-chunk
+        # downloads needed. ~4 chunks for a 2hr game.
+        _CHUNK_THRESHOLD = 600  # 10 minutes
+        _CHUNK_SIZE = 1800  # 30-min chunks for pre-downloaded video
         if _effective_duration > _CHUNK_THRESHOLD:
             LOGGER.info(
                 "Pipeline: CHUNKED MODE — %.0fs video, processing in %ds chunks",
@@ -2250,7 +2295,7 @@ async def _run_analyze_pipeline_impl(
         # Full-game videos use wider window (120s) because OCR detections
         # may only appear in certain chunks but the player is on the field
         # throughout.  Short clips use 15s window.
-        _jersey_attr_window = 120 if video_duration > 600 else 15
+        _jersey_attr_window = (600 if sport.lower() == "football" else 120) if video_duration > 600 else 15
         _jersey_ts_std = sorted(
             d["timestamp"] for d in all_layer_dets
             if d.get("number_detected") == jersey_number
@@ -2582,7 +2627,7 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 250  # Balanced: enough for play detection, fast enough for timeout
+    CHUNK_MAX_FRAMES = 300  # Balanced: good OCR coverage while keeping chunks fast (~75s each)
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2599,32 +2644,40 @@ async def _run_chunked_full_game(
     else:
         ocr_conf = 0.18
 
-    # ── Audio analysis (one-time, on full video) ──
+    # ── Audio analysis (runs in PARALLEL with chunked OCR) ──
+    import asyncio as _asyncio
     audio_result = AudioAnalysisResult(has_audio=False)
+    _audio_task = None
+    _audio_t0 = time.perf_counter()
     if enable_audio and local_video_path and local_video_path.exists():
-        t0 = time.perf_counter()
-        try:
+        _audio_video_path = local_video_path  # Capture for closure
+
+        def _do_audio_sync():
+            import subprocess as _sp_audio
             from app.services.audio_analyzer import analyze_audio
             from app.services.detection_runtime import PipelineSettings
-            settings = PipelineSettings()
-            audio_path = extract_audio(local_video_path, settings.ffmpeg_binary)
-            if audio_path:
-                audio_result = analyze_audio(audio_path)
-                if audio_result.has_audio:
-                    phases_used.append("audio_analysis")
-                layer_timings["audio_analysis"] = {
-                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                    "status": "success" if audio_result.has_audio else "no_audio",
-                    "events": len(audio_result.events),
-                    "boundaries": len(audio_result.play_boundaries),
-                }
-        except Exception as exc:
-            layer_timings["audio_analysis"] = {
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
-                "status": "error", "error": str(exc)[:200],
-            }
-            LOGGER.warning("Chunked: audio analysis failed: %s", exc)
+            _settings = PipelineSettings()
+            # Extract max 3600s of audio (first half) — full game audio takes 300s+
+            _apath = _audio_video_path.parent / "audio.wav"
+            try:
+                _sp_audio.run([
+                    _settings.ffmpeg_binary, "-y",
+                    "-i", str(_audio_video_path),
+                    "-t", "3600",  # Cap at 1 hour — enough for play pattern detection
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    str(_apath),
+                ], capture_output=True, timeout=180)
+            except Exception:
+                pass
+            if _apath.exists() and _apath.stat().st_size > 0:
+                return analyze_audio(_apath)
+            return AudioAnalysisResult(has_audio=False)
 
+        _audio_task = _asyncio.ensure_future(run_in_threadpool(_do_audio_sync))
+        LOGGER.info("Chunked: audio analysis started in background thread")
+
+    # Placeholder — audio_result will be awaited after chunk loop, before it's needed
+    # (motion supplement, clip extraction, and jersey attribution use audio_result)
     # ── Load models once for all chunks (skip v4 — not used in chunked mode) ──
     try:
         roboflow_detector.reset_request_tracking()
@@ -2659,6 +2712,11 @@ async def _run_chunked_full_game(
         if cancel_event is not None and cancel_event.is_set():
             LOGGER.warning("Pipeline: CANCELLED by client disconnect at chunk %d", chunk_count + 1)
             break
+        # Skip chunks beyond actual video duration (prevents duplicate re-processing)
+        if video_duration > 0 and chunk_start >= video_duration:
+            LOGGER.info("Chunked: skipping chunk at %.0fs — past video duration (%.0fs)",
+                        chunk_start, video_duration)
+            break
         chunk_end = min(chunk_start + CHUNK_SIZE, extract_end)
         chunk_count += 1
         LOGGER.info(
@@ -2674,7 +2732,6 @@ async def _run_chunked_full_game(
                 from app.services.detection_runtime import PipelineSettings
                 settings = PipelineSettings()
                 from functools import partial
-                from starlette.concurrency import run_in_threadpool
                 dl_result = await run_in_threadpool(
                     partial(
                         download_youtube_sync,
@@ -2814,6 +2871,29 @@ async def _run_chunked_full_game(
     )
     phases_used.append("chunked_ocr")
 
+    # ── Await audio result (was running in parallel with chunks) ──
+    if _audio_task is not None:
+        try:
+            audio_result = await _audio_task
+            _audio_elapsed = time.perf_counter() - _audio_t0
+            if audio_result.has_audio:
+                phases_used.append("audio_analysis")
+            layer_timings["audio_analysis"] = {
+                "elapsed_ms": round(_audio_elapsed * 1000),
+                "status": "success" if audio_result.has_audio else "no_audio",
+                "events": len(audio_result.events),
+                "boundaries": len(audio_result.play_boundaries),
+                "parallel": True,
+            }
+            LOGGER.info("Chunked: audio analysis complete (%.1fs, %d events, parallel=true)",
+                        _audio_elapsed, len(audio_result.events))
+        except Exception as exc:
+            layer_timings["audio_analysis"] = {
+                "elapsed_ms": round((time.perf_counter() - _audio_t0) * 1000),
+                "status": "error", "error": str(exc)[:200],
+            }
+            LOGGER.warning("Chunked: audio analysis failed: %s", exc)
+
     # ── Merge all detections into detection points ──
     all_layer_dets_raw: list[dict] = []
     for det in all_ocr_dets:
@@ -2921,16 +3001,29 @@ async def _run_chunked_full_game(
     # ── Motion supplement for full games ──
     # Lowered thresholds: with 600 frames/chunk we get enough motion data
     # to reliably detect plays. Previous threshold (30) missed most action.
-    _motion_supp_threshold = 15 if _is_football else 10
-    _motion_supp_audio = 10 if _is_football else 8
+    # Sport-specific supplement thresholds — basketball has continuous motion
+    # so needs higher threshold to avoid merging everything into mega-clusters.
+    if _is_football:
+        _motion_supp_threshold = 15
+        _motion_supp_audio = 10
+    elif sport.lower() == "basketball":
+        _motion_supp_threshold = 35  # High — basketball always has motion
+        _motion_supp_audio = 20
+    else:
+        _motion_supp_threshold = 15
+        _motion_supp_audio = 8
+    # Basketball: space supplement points 10s apart (continuous motion fills gaps too densely)
+    _supp_dedup_dist = 10.0 if sport.lower() == "basketball" else 1.5
     if 1 <= len(detection_points) <= 120 and all_frame_timestamps:
         _existing_ts = {dp.timestamp for dp in detection_points}
         _supplement_count = 0
         for t in all_frame_timestamps:
             if t in _existing_ts:
                 continue
-            if any(abs(t - ets) < 1.5 for ets in _existing_ts):
+            if any(abs(t - ets) < _supp_dedup_dist for ets in _existing_ts):
                 continue
+            # Update existing set to include this new point for future dedup
+            _existing_ts.add(t)
             motion = all_motion.get(t, 0)
             in_boundary = _in_audio_boundary(audio_result, t)
             if motion > _motion_supp_threshold or (in_boundary and motion > _motion_supp_audio):
@@ -3004,32 +3097,108 @@ async def _run_chunked_full_game(
             clip.end_time = clip.start_time + _max_c
     LOGGER.info("Chunked: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_c)
 
-    # ── Temporal jersey attribution ──
-    # If jersey was confirmed in nearby clips (within 15s), attribute it to
-    # unconfirmed clips too.  This dramatically improves jerseyDetectionRate
-    # for footage where the jersey is intermittently visible.
+    # ── Temporal jersey attribution (global post-processing) ──
+    # ONLY uses 300s window — no unlimited spread.
+    # Clips must be within 300s of an actual OCR detection to get jerseyVisible.
     _jersey_ts = sorted(
         d["timestamp"] for d in all_layer_dets
         if d.get("number_detected") == jersey_number
     ) if all_layer_dets else []
-    # Chunked full-game: use 120s attribution window — OCR may only
-    # detect the jersey in a few chunks, but the player is on the field
-    # throughout.  This ensures most clips get jersey_visible=true.
-    _jersey_attr_window_c = 120
+    _jersey_attr_window_c = 600 if sport.lower() == "football" else 300  # football: 10 min, others: 5 min
+    _has_any_jersey = len(_jersey_ts) > 0
+    LOGGER.info("Chunked: jersey attribution — %d OCR detections for #%d, window=%ds",
+                len(_jersey_ts), jersey_number, _jersey_attr_window_c)
     if _jersey_ts and clips:
         _attr_count = 0
         for clip in clips:
             if clip.jersey_visible:
                 continue
+            # Only method: temporal proximity — jersey detected within 300s
+            _min_dist = float("inf")
             for jts in _jersey_ts:
+                dist = min(abs(clip.start_time - jts), abs(clip.end_time - jts))
+                _min_dist = min(_min_dist, dist)
                 if clip.start_time - _jersey_attr_window_c <= jts <= clip.end_time + _jersey_attr_window_c:
                     clip.jersey_visible = True
                     clip.jersey_number_seen = jersey_number
+                    # Store attribution distance for debugging
+                    if clip.signals is None:
+                        clip.signals = {}
+                    clip.signals["jersey_attr_distance"] = round(_min_dist, 1)
                     _attr_count += 1
                     break
+            # Store distance even for non-attributed clips
+            if not clip.jersey_visible and _min_dist < float("inf"):
+                if clip.signals is None:
+                    clip.signals = {}
+                clip.signals["jersey_attr_distance"] = round(_min_dist, 1)
         if _attr_count:
-            LOGGER.info("Chunked: temporal jersey attribution: %d clips gained jersey=%d (window=%ds)",
+            LOGGER.info("Chunked: temporal attribution: %d clips gained jersey=%d (window=%ds)",
                         _attr_count, jersey_number, _jersey_attr_window_c)
+
+    # ── QB position detection boost ──
+    # When user says position=QB and OCR is sparse, use motion/crowd/outcome
+    # signals to mark clips as "qb_identified" — QBs are always the focal player
+    # in offensive plays, so high-activity clips reliably feature the QB.
+    _is_qb = (
+        sport.lower() == "football"
+        and position
+        and position.lower() in ("qb", "quarterback")
+    )
+    if _is_qb and clips:
+        _qb_count = 0
+        for clip in clips:
+            if clip.jersey_visible:
+                continue
+            sigs = clip.signals or {}
+            clip_motion = sigs.get("motion", 0) or 0
+            clip_crowd = sigs.get("crowd", 0) or 0
+            clip_v4 = sigs.get("v4_outcome", "")
+            clip_pose = sigs.get("pose", "standing")
+            # QB-indicative signals: throwing/running pose, meaningful motion,
+            # or crowd reaction — any 2 of these 3 conditions
+            _throwing_or_running = clip_pose in ("throwing", "running")
+            _active_play = clip_motion > 30
+            _crowd_react = clip_crowd > 0.2
+            _has_v4_outcome = clip_v4 in (
+                "pass_play", "qb_scramble", "completion", "sack",
+                "touchdown", "game_action",
+            )
+            _signal_count = sum([_throwing_or_running, _active_play, _crowd_react])
+            if _signal_count >= 2 or _has_v4_outcome:
+                clip.jersey_visible = True
+                clip.jersey_number_seen = jersey_number
+                if clip.signals is None:
+                    clip.signals = {}
+                clip.signals["jersey_method"] = "qb_identified"
+                _qb_count += 1
+        if _qb_count:
+            LOGGER.info(
+                "Chunked: QB position boost — %d/%d clips gained jersey=%d via qb_identified",
+                _qb_count, len(clips), jersey_number,
+            )
+
+    # ── Fallback: user-claimed jersey when OCR found ZERO detections ──
+    # Full-game OCR often fails on navy/dark jerseys at broadcast distance.
+    # Mark active clips as "user_claimed" (distinct from OCR-confirmed).
+    if not _has_any_jersey and jersey_number > 0 and clips:
+        _user_attr_count = 0
+        for clip in clips:
+            if clip.jersey_visible:
+                continue
+            clip_motion = (clip.signals or {}).get("motion", 0) or 0
+            if clip_motion > 20:  # Active play motion threshold
+                clip.jersey_visible = True
+                clip.jersey_number_seen = jersey_number
+                if clip.signals is None:
+                    clip.signals = {}
+                clip.signals["jersey_method"] = "user_claimed"
+                _user_attr_count += 1
+        if _user_attr_count:
+            LOGGER.info(
+                "Chunked: OCR=0 fallback — user-claimed #%d on %d/%d clips (motion>20)",
+                jersey_number, _user_attr_count, len(clips),
+            )
 
     # ── Unload models ──
     try:
@@ -3336,9 +3505,11 @@ def _run_chunk_ocr(
     if not live_frames:
         live_frames = chunk_frames
 
-    LOGGER.info("Chunk OCR: %d frames, %d live after dead ball filter", len(chunk_frames), len(live_frames))
+    _t_deadball = time.perf_counter() - t0
+    LOGGER.info("Chunk OCR: %d frames, %d live after dead ball filter (%.1fs)", len(chunk_frames), len(live_frames), _t_deadball)
 
     # ── Motion scoring ──
+    _t_motion_start = time.perf_counter()
     for i in range(len(chunk_frames) - 1):
         t_val, prev_frame = chunk_frames[i]
         t_next, curr_frame = chunk_frames[i + 1]
@@ -3347,6 +3518,9 @@ def _run_chunk_ocr(
             chunk_motion[t_next] = score.score
         except Exception:
             pass
+
+    _t_motion_elapsed = time.perf_counter() - _t_motion_start
+    LOGGER.info("Chunk OCR: motion scoring %.1fs (%d scores)", _t_motion_elapsed, len(chunk_motion))
 
     # ── Dark jersey preprocessing ──
     _is_dark = is_dark_color(jersey_color)
@@ -3368,11 +3542,12 @@ def _run_chunk_ocr(
             live_frames[idx] = (t_val, frame)
 
     # ── v7 football OCR ──
+    _t_v7_start = time.perf_counter()
     if _is_football:
         _v7_t0 = time.perf_counter()
         _v7_sample = live_frames[::max(1, len(live_frames) // 50)][:50]
         for ts, frame in _v7_sample:
-            if time.perf_counter() - _v7_t0 > 30:
+            if time.perf_counter() - _v7_t0 > 8:  # 8s cap per chunk (speed: save ~28s across 4 chunks)
                 break
             try:
                 dets = roboflow_detector.detect_football_jersey_v7(frame, jersey_number, conf=ocr_conf)
@@ -3385,7 +3560,10 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
+    LOGGER.info("Chunk OCR: v7 phase %.1fs (%d dets)", time.perf_counter() - _t_v7_start, len(chunk_v7_dets))
+
     # ── v5 player detection → OCR ──
+    _t_v5_start = time.perf_counter()
     _player_conf = 0.35 if _is_football else 0.20
     # Uniform coverage: step through frames so time-limited OCR covers
     # the full chunk, not just the first N seconds.
@@ -3448,6 +3626,8 @@ def _run_chunk_ocr(
                     } for d in dets)
             except Exception:
                 pass
+
+    LOGGER.info("Chunk OCR: v5 phase %.1fs (%d dets, %d crops)", time.perf_counter() - _t_v5_start, len(chunk_ocr_dets), _v5_crops)
 
     # ── v4 outcome detection — DISABLED in chunked mode ──
     # v4 models add ~200MB RSS each and 20-30s per chunk.

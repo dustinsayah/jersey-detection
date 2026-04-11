@@ -190,12 +190,12 @@ def _center_crop(image_bgr: np.ndarray, *, width_ratio: float, height_ratio: flo
     return image_bgr[y1:y2, x1:x2]
 
 
-def _clahe_enhance(image_bgr: np.ndarray) -> np.ndarray:
+def _clahe_enhance(image_bgr: np.ndarray, clip_limit: float = 3.0) -> np.ndarray:
     if image_bgr.size == 0:
         return image_bgr
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(4, 4))
     enhanced = clahe.apply(l_channel)
     merged = cv2.merge((enhanced, a_channel, b_channel))
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
@@ -204,12 +204,18 @@ def _clahe_enhance(image_bgr: np.ndarray) -> np.ndarray:
 def _fallback_variants(player_crop_bgr: np.ndarray) -> list[tuple[str, np.ndarray]]:
     torso = _torso_crop(player_crop_bgr)
     centered = _center_crop(torso if torso.size else player_crop_bgr, width_ratio=0.80, height_ratio=0.90)
+    base = torso if torso.size else player_crop_bgr
     variants: list[tuple[str, np.ndarray]] = []
     for name, image in (
         ("torso", torso),
         ("torso_center", centered),
-        ("torso_clahe", _clahe_enhance(torso if torso.size else player_crop_bgr)),
+        ("torso_clahe", _clahe_enhance(base)),
         ("full_crop", player_crop_bgr),
+        # Dark/navy jersey variants: invert colors so white-on-dark becomes
+        # dark-on-white (standard OCR format). CLAHE+invert is the best
+        # combo for navy jerseys with white numbers per OCR research.
+        ("torso_inverted", cv2.bitwise_not(base) if base.size else base),
+        ("torso_clahe_inverted", cv2.bitwise_not(_clahe_enhance(base)) if base.size else base),
     ):
         if image.size == 0:
             continue

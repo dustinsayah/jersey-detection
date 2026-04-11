@@ -71,6 +71,11 @@ RUN python /app/scripts/bootstrap_public_reader.py
 RUN pip install --upgrade --pre yt-dlp \
     || pip install --upgrade yt-dlp
 
+# PO Token provider plugin — auto-generates proof-of-origin tokens for YouTube
+# Reduces cookie dependency; tokens cached 6hrs. Framework + bgutil provider.
+RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider \
+    || echo "PO Token provider install failed (non-fatal)"
+
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
 # This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).
 RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_client=android_vr" \

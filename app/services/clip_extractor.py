@@ -233,7 +233,7 @@ def extract_clips(
     # Standard mode: use adaptive window based on actual detection density.
     # With uniform frame sampling, frames can be 3s+ apart — fixed 2s window
     # would filter out almost everything.
-    _is_full_game = video_duration > 1800
+    _is_full_game = video_duration > 600  # > 10 min = full game (matches chunked pipeline threshold)
     if _is_full_game:
         _jitter_window = 10.0
         _jitter_conf_bypass = 0.3
@@ -301,9 +301,6 @@ def extract_clips(
             if boundary.start_time - 3 <= first_t and last_t <= boundary.end_time + 3:
                 audio_bounded = True
                 audio_confidence = boundary.confidence
-                # Use audio boundary for clip edges if tighter
-                first_t = min(first_t, boundary.start_time)
-                last_t = max(last_t, boundary.end_time)
                 break
 
         # Aggregate signals from all detections in cluster
@@ -459,16 +456,24 @@ def extract_clips(
 
     # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
     # Merge clips that overlap OR are within gap of each other.
-    # Football: tighter gap (2s) — plays are well-separated by 25-30s dead ball,
-    # and expansion already adds 2.5s before + 5s after = 7.5s buffer.
-    # Other sports: 5s gap for continuous action.
-    PROXIMITY_GAP = 2.0 if sport.lower() == "football" else 5.0
+    # Football: tighter gap (2s) — plays are well-separated by 25-30s dead ball.
+    # Full-game basketball: tighter gap (2s) — supplement points ~10s apart,
+    # expansion 4.5s leaves only 5.5s gap which cascades with 5s proximity.
+    # Short clips / other sports: 5s gap for continuous action.
+    if sport.lower() == "football" or (_is_full_game and sport.lower() == "basketball"):
+        PROXIMITY_GAP = 2.0
+    else:
+        PROXIMITY_GAP = 5.0
     MOTION_SIMILARITY = 20.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []
+    _merge_count = 0
 
     for clip in clips:
-        if merged:
+        if merged and not _is_full_game:
+            # Merge step: only for short clips / non-full-game.
+            # Full-game clips are already well-separated by dedup distance
+            # and merging causes chain collapse across entire video.
             prev = merged[-1]
             gap = clip.start_time - prev.end_time
             overlaps = gap < 0
@@ -481,6 +486,7 @@ def extract_clips(
             )
 
             if overlaps or adjacent_similar:
+                _merge_count += 1
                 # Merge — keep the higher-scoring one's metadata
                 if clip.score > prev.score:
                     merged[-1] = ExtractedClip(
@@ -513,13 +519,16 @@ def extract_clips(
     # scores are 0-10 (mean across full frame), too low for any threshold.
     # Football clips are already gated by score threshold (>=15) later.
     gated: list[ExtractedClip] = []
+    # Full games: skip quality gate — clips already filtered by motion/score thresholds
+    # in chunked pipeline. Quality gate at motion>15 was too aggressive for basketball
+    # where motion is continuous (not spike-based like football).
     for clip in merged:
-        if _is_football:
+        if _is_football or _is_full_game:
             gated.append(clip)
             continue
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
-        has_motion = (clip.signals.get("motion", 0) or 0) > 15
+        has_motion = (clip.signals.get("motion", 0) or 0) > 8  # Lowered from 15
         has_audio = bool(clip.signals.get("audio"))
         if has_jersey or has_outcome or has_motion or has_audio:
             gated.append(clip)
@@ -537,12 +546,18 @@ def extract_clips(
     merged.sort(key=lambda c: c.score, reverse=True)
 
     # Filter out low-quality clips
-    # Full-game mode: lower cut threshold to include more clips (target 20+)
-    # Football: keep more clips — lower threshold + ensure at least 15 returned
+    # Full-game mode: sport-specific cut thresholds
+    # Basketball: scores average 16-20 without jersey/outcome → threshold 10
+    # Football: QB boosts push scores higher → threshold 15
+    # Other: threshold 15
     _is_football = sport.lower() == "football"
+    _is_basketball = sport.lower() == "basketball"
     _FOOTBALL_MIN_CLIPS = 15  # Target minimum for football
     if _is_full_game:
-        result = [c for c in merged if c.score >= 20]
+        _full_game_thresh = 10 if _is_basketball else 15 if _is_football else 15
+        result = [c for c in merged if c.score >= _full_game_thresh]
+        LOGGER.info("Full-game score filter: %d/%d clips pass threshold %d (sport=%s)",
+                    len(result), len(merged), _full_game_thresh, sport)
     elif _is_football:
         # Football: keep clips with score >= 15 (lower than other sports)
         result = [c for c in merged if c.score >= 15]
@@ -553,19 +568,20 @@ def extract_clips(
     else:
         result = [c for c in merged if c.grade != "Cut"]
 
-    # ── Football clip target: ensure at least 15 clips ──────────────────
-    # If football has fewer clips than target, pull in top remaining clips
-    if _is_football and len(result) < _FOOTBALL_MIN_CLIPS and len(merged) > len(result):
+    # ── Sport clip targets: ensure minimum clips for full games ─────────
+    _SPORT_MIN_CLIPS = {"football": 15, "basketball": 15, "lacrosse": 10}
+    _min_clips = _SPORT_MIN_CLIPS.get(sport.lower(), 10) if _is_full_game else 0
+    if _min_clips and len(result) < _min_clips and len(merged) > len(result):
         remaining = [c for c in merged if c not in result]
         remaining.sort(key=lambda c: c.score, reverse=True)
-        needed = _FOOTBALL_MIN_CLIPS - len(result)
+        needed = _min_clips - len(result)
         for clip in remaining[:needed]:
             clip.grade = "Decent"
             result.append(clip)
         result.sort(key=lambda c: c.score, reverse=True)
         LOGGER.info(
-            "Football clip target: added %d clips to reach %d (target=%d)",
-            min(needed, len(remaining)), len(result), _FOOTBALL_MIN_CLIPS,
+            "%s clip target: added %d clips to reach %d (target=%d)",
+            sport, min(needed, len(remaining)), len(result), _min_clips,
         )
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
@@ -585,8 +601,8 @@ def extract_clips(
     result = _select_best_clips(result, video_duration)
 
     LOGGER.info(
-        "Extracted %d clips from %d detections (%d clusters, %d after cap)",
-        len(result), len(detections), len(clusters), len(result),
+        "Extracted %d clips from %d detections (%d clusters, %d merged, %d after cap)",
+        len(result), len(detections), len(clusters), len(merged), len(result),
     )
 
     return result

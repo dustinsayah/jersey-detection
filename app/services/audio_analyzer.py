@@ -31,8 +31,8 @@ WHISTLE_MIN_DURATION = 0.3
 WHISTLE_MAX_DURATION = 2.0
 WHISTLE_THRESHOLD = 0.3
 
-# Audio chunk size for YAMNet (seconds)
-YAMNET_CHUNK_SECONDS = 30
+# Audio chunk size for YAMNet (seconds) — 60s halves inference count vs 30s
+YAMNET_CHUNK_SECONDS = 60
 
 # YAMNet class indices for sports-relevant sounds
 YAMNET_WHISTLE_CLASSES = {399, 400, 401}  # Whistle, Steam whistle

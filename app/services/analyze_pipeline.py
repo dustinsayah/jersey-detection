@@ -68,6 +68,22 @@ ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
 # Hard cap on total frames — 0 means use adaptive cap from _get_adaptive_fps()
 MAX_FRAMES = int(os.getenv("MAX_FRAMES", "0"))
 
+def _check_cookie_warning() -> str | None:
+    """Return cookie expiry warning if cookies expire within 2 days."""
+    cookie_paths = [Path("/app/app/youtube_cookies.txt"), Path("app/youtube_cookies.txt")]
+    for cp in cookie_paths:
+        if cp.exists():
+            age_days = (time.time() - cp.stat().st_mtime) / 86400
+            remaining = max(0, 3.0 - age_days)
+            if remaining < 2.0:
+                return (
+                    f"Cookies expire in {remaining:.1f} days. "
+                    f"Refresh: curl -X POST https://jersey-detection-production-d8d8.up.railway.app"
+                    f"/upload-cookies --data-binary @cookies.txt"
+                )
+    return None
+
+
 # ── Blocker 3: Request semaphore — only 1 concurrent analyze request ──
 import asyncio as _asyncio
 _REQUEST_SEMAPHORE = _asyncio.Semaphore(1)
@@ -201,7 +217,7 @@ def _compute_recruiting_score(
 
     # Position-specific bonuses
     pos = (position or "").upper()
-    if pos == "QB" and effective_play in ("pass_play", "qb_scramble", "completion", "touchdown", "big_play"):
+    if pos == "QB" and effective_play in ("pass_play", "qb_scramble", "completion", "touchdown", "big_play", "big_gain"):
         score += 10
     elif pos in ("WR", "TE") and effective_play in ("completion", "reception_yac", "touchdown"):
         score += 10
@@ -2554,7 +2570,7 @@ async def _run_analyze_pipeline_impl(
             clips_out, jersey_number, sport, position, video_duration, elapsed,
         )
 
-        return {
+        result = {
             "playerSummary": player_summary,
             "clips": clips_out,
             "layerUsed": layer_used,
@@ -2568,6 +2584,13 @@ async def _run_analyze_pipeline_impl(
             "actionsDetected": stat_result.get("actions_detected", []),
             "debug": debug,
         }
+
+        # Add cookie warning if expiring within 2 days
+        _cookie_warn = _check_cookie_warning()
+        if _cookie_warn:
+            result["cookie_warning"] = _cookie_warn
+
+        return result
 
     finally:
         # ── Post-request cleanup (Blocker 3) ──
@@ -2627,7 +2650,7 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 300  # Balanced: good OCR coverage while keeping chunks fast (~75s each)
+    CHUNK_MAX_FRAMES = 200  # Reduced from 300 → chunks ~50s each instead of ~75s
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2657,13 +2680,16 @@ async def _run_chunked_full_game(
             from app.services.audio_analyzer import analyze_audio
             from app.services.detection_runtime import PipelineSettings
             _settings = PipelineSettings()
-            # Extract max 3600s of audio (first half) — full game audio takes 300s+
+            # Extract max 1200s (20 min) of audio — sufficient for play pattern
+            # detection while keeping YAMNet processing under 200s on CPU.
+            # Full-game audio (3600s) took 625s; 1200s should take ~208s.
+            _audio_cap = 1200
             _apath = _audio_video_path.parent / "audio.wav"
             try:
                 _sp_audio.run([
                     _settings.ffmpeg_binary, "-y",
                     "-i", str(_audio_video_path),
-                    "-t", "3600",  # Cap at 1 hour — enough for play pattern detection
+                    "-t", str(_audio_cap),
                     "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                     str(_apath),
                 ], capture_output=True, timeout=180)
@@ -3104,7 +3130,7 @@ async def _run_chunked_full_game(
         d["timestamp"] for d in all_layer_dets
         if d.get("number_detected") == jersey_number
     ) if all_layer_dets else []
-    _jersey_attr_window_c = 600 if sport.lower() == "football" else 300  # football: 10 min, others: 5 min
+    _jersey_attr_window_c = 900 if sport.lower() == "football" else 300  # football: 15 min, others: 5 min
     _has_any_jersey = len(_jersey_ts) > 0
     LOGGER.info("Chunked: jersey attribution — %d OCR detections for #%d, window=%ds",
                 len(_jersey_ts), jersey_number, _jersey_attr_window_c)
@@ -3564,10 +3590,10 @@ def _run_chunk_ocr(
 
     # ── v5 player detection → OCR ──
     _t_v5_start = time.perf_counter()
-    _player_conf = 0.35 if _is_football else 0.20
+    _player_conf = 0.25 if _is_football else 0.20
     # Uniform coverage: step through frames so time-limited OCR covers
     # the full chunk, not just the first N seconds.
-    _v5_chunk_budget = max(20, time_limit // 3)
+    _v5_chunk_budget = max(30, time_limit // 2)
     _v5_chunk_step = max(1, len(live_frames) // _v5_chunk_budget)
     sampled = live_frames[::_v5_chunk_step]
     _v5_crops = 0
@@ -3585,7 +3611,8 @@ def _run_chunk_ocr(
             continue
         if not players:
             continue
-        for player in players[:3]:
+        _max_players = 5 if _is_football else 3
+        for player in players[:_max_players]:
             if _v5_crops >= _V5_MAX_CROPS:
                 break
             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
@@ -3627,7 +3654,8 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
-    LOGGER.info("Chunk OCR: v5 phase %.1fs (%d dets, %d crops)", time.perf_counter() - _t_v5_start, len(chunk_ocr_dets), _v5_crops)
+    LOGGER.info("Chunk OCR: v5 phase %.1fs (%d dets, %d crops, %d frames sampled, step=%d)",
+                time.perf_counter() - _t_v5_start, len(chunk_ocr_dets), _v5_crops, len(sampled), _v5_chunk_step)
 
     # ── v4 outcome detection — DISABLED in chunked mode ──
     # v4 models add ~200MB RSS each and 20-30s per chunk.

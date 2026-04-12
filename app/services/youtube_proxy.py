@@ -3,6 +3,7 @@
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
 # also REQUIRED to unlock any DASH formats. Strategy order:
+#   HP. Home proxy (FREE — 720p+, Dustin's PC via Cloudflare Tunnel)
 #   W0. WARP HTTP + android_vr DASH (FREE — 720p, no cookies needed)
 #   W0b. WARP HTTP + web client DASH (FREE — different fingerprint)
 #   CW0. WARP + Cookies DASH (FREE — auth fallback if bot-detected)
@@ -706,6 +707,72 @@ def download_youtube_sync(
 
     # ── Strategy functions — each returns DownloadResult | None ───────────
 
+    def _s_home_proxy() -> DownloadResult | None:
+        """Home proxy: Dustin's PC downloads at residential IP quality (720p+).
+
+        Railway sends HTTP POST to the home proxy (via Cloudflare Tunnel).
+        The proxy runs yt-dlp locally at residential quality, returns the file.
+        Falls through instantly if HOME_PROXY_URL is not set or proxy is offline.
+        """
+        _hp_url = os.environ.get("HOME_PROXY_URL", "").strip().rstrip("/")
+        _hp_secret = os.environ.get("HOME_PROXY_SECRET", "clipt-home-proxy-2026")
+        if not _hp_url:
+            return None
+
+        try:
+            # Quick health check (3s timeout — don't waste time if offline)
+            _health = httpx.get(f"{_hp_url}/health", timeout=3.0)
+            if _health.status_code != 200:
+                LOGGER.info("Home proxy unhealthy: %d", _health.status_code)
+                return None
+            LOGGER.info("Home proxy ONLINE: %s", _health.json())
+        except Exception as e:
+            LOGGER.info("Home proxy offline: %s", e)
+            return None
+
+        try:
+            # POST download request — stream the response to disk
+            LOGGER.info("Home proxy: downloading %s [%s-%s]", url, start_time, end_time)
+            with httpx.stream(
+                "POST",
+                f"{_hp_url}/download",
+                json={
+                    "url": url,
+                    "start_sec": start_time,
+                    "end_sec": end_time,
+                    "quality": 720,
+                    "secret": _hp_secret,
+                },
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+            ) as resp:
+                if resp.status_code != 200:
+                    body = resp.read().decode(errors="replace")[:300]
+                    LOGGER.warning("Home proxy error %d: %s", resp.status_code, body)
+                    _errors_detail["home_proxy"] = f"HTTP {resp.status_code}: {body[:100]}"
+                    return None
+
+                # Stream file to disk
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+
+                _height_str = resp.headers.get("x-video-height", "0")
+                _dl_time = resp.headers.get("x-download-time", "?")
+
+            if _file_valid():
+                _h = _get_video_height()
+                LOGGER.info("Home proxy SUCCESS: %dp, file=%s, proxy_dl=%ss",
+                            _h, output_path.stat().st_size, _dl_time)
+                return _make_result(output_path, sectioned=has_time_range, strategy="home_proxy_720p")
+            else:
+                LOGGER.warning("Home proxy: file too small or missing")
+                return None
+
+        except Exception as e:
+            LOGGER.warning("Home proxy download failed: %s", e)
+            _errors_detail["home_proxy"] = str(e)[:200]
+            return None
+
     def _s_cookies_dash() -> DownloadResult | None:
         """Cookie-authenticated DASH H.264 (720p+ without proxy).
 
@@ -1173,6 +1240,7 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
+    #   HP.     Home proxy — Dustin's PC via Cloudflare Tunnel (FREE — 720p+)
     #   W0-W0b. WARP + android_vr (FREE — 720p via DASH, no cookies needed)
     #   CW0.    WARP + Cookies (FREE — auth fallback for bot detection)
     #   W0e-W2. WARP pylib/muxed/SOCKS fallbacks
@@ -1180,6 +1248,8 @@ def download_youtube_sync(
     #   0-0c.   Decodo residential proxy (PAID)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
+        # Home proxy: Dustin's PC at residential IP — 720p+ (FREE, best quality)
+        ("home_proxy", _s_home_proxy),
         # WARP + android_vr: FREE — gets 720p DASH, no cookies needed
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),

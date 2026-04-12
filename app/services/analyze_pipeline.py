@@ -2663,7 +2663,11 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 75  # v8.14.1: 75 frames/chunk (was 100). 4 chunks × 75 = 300 total
+    # v8.14.2: adaptive per-chunk frame cap based on video length.
+    # Long games (>1hr): 50 frames/chunk → 4×50=200 total → ~340s chunks
+    # Shorter videos: 100 frames/chunk → 2×100=200 total → ~170s chunks
+    _effective_dur = extract_end - extract_start
+    CHUNK_MAX_FRAMES = 50 if _effective_dur > 3600 else 100
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)

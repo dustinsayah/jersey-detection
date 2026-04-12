@@ -94,13 +94,16 @@ _MEMORY_THRESHOLD_MB = 5000
 def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple[int, int]:
     """Return (fps, max_frames) based on video duration.
 
-    Strategy — more frames for longer videos to avoid missing plays:
+    Strategy — balance quality vs speed:
       - Short clips (<120s): 2 fps, 150 frames → full coverage
       - Medium clips (120-600s): 1 fps, 200 frames → every second for ~3 min
       - Long videos (600-1800s): 1 fps, 300 frames → one per second, 5 min
-      - Full games (1800-3600s): 1 fps, 600 frames → every ~3-6s over 30-60 min
-      - Long games (3600-7200s): 1 fps, 750 frames → every ~5-10s over 1-2 hrs
-      - Extra long (>7200s): 1 fps, 900 frames → every ~8s+ over 2+ hrs
+      - Full games (1800-3600s): 1 fps, 500 frames → every ~4-7s over 30-60 min
+      - Long games (3600-7200s): 1 fps, 500 frames → every ~7-14s over 1-2 hrs
+      - Extra long (>7200s): 1 fps, 500 frames → every ~15s over 2+ hrs
+
+    v8.14: Reduced from 600/750/900 to 500 for games >30min.
+    Cuts chunked processing from 620s to ~310s while retaining clip quality.
     """
     if video_duration <= 120:
         return 2, 150
@@ -109,11 +112,11 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
     elif video_duration <= 1800:
         return 1, 300
     elif video_duration <= 3600:
-        return 1, 600
+        return 1, 500
     elif video_duration <= 7200:
-        return 1, 750
+        return 1, 500
     else:
-        return 1, 900
+        return 1, 500
 
 
 def _generate_clip_caption(
@@ -2660,7 +2663,7 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 200  # Reduced from 300 → chunks ~50s each instead of ~75s
+    CHUNK_MAX_FRAMES = 100  # v8.14: 100 frames/chunk (was 200). 5 chunks × 100 = 500 total
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)

@@ -71,11 +71,24 @@ RUN python /app/scripts/bootstrap_public_reader.py
 RUN pip install --upgrade --pre yt-dlp \
     || pip install --upgrade yt-dlp
 
-# PO Token provider: bgutil server deployed as Railway sidecar service.
-# Automatically provides PO tokens to yt-dlp via plugin system.
-# PO_TOKEN_SERVER env var must point to http://bgutil-ytdlp-pot-provider.railway.internal:4416
+# PO Token provider: bgutil server generates Proof-of-Origin tokens for yt-dlp.
+# Required for web/mweb/android clients to bypass bot detection.
+# Server runs on port 4416, yt-dlp-get-pot plugin connects automatically.
 RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider \
     || echo "PO Token plugin install failed (non-fatal)"
+
+# Install Node.js for bgutil PO Token server
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "Node.js install failed (non-fatal, PO tokens disabled)"
+
+# Clone and build bgutil PO Token server
+RUN git clone --single-branch --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-pot \
+    && cd /app/bgutil-pot/server \
+    && npm ci \
+    && npx tsc \
+    || echo "bgutil-pot build failed (non-fatal, PO tokens disabled)"
 
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
 # This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).
@@ -87,7 +100,7 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
 RUN mkdir -p /app/app/model
 
 # Cache bust for code changes (update this on each deploy)
-ARG CACHE_BUST=v8.12.0
+ARG CACHE_BUST=v8.12.1
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

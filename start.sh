@@ -38,6 +38,22 @@ pip install --upgrade --pre yt-dlp 2>/dev/null \
   && echo "yt-dlp updated: $(yt-dlp --version)" \
   || echo "yt-dlp update failed (using build version: $(yt-dlp --version))"
 
+# ── Start bgutil PO Token server (required for web/mweb clients) ──
+if [ -f "/app/bgutil-pot/server/build/main.js" ]; then
+  echo "Starting bgutil PO Token server on port 4416..."
+  node /app/bgutil-pot/server/build/main.js -p 4416 &
+  POT_PID=$!
+  sleep 2
+  if kill -0 $POT_PID 2>/dev/null; then
+    echo "PO Token server running (PID=$POT_PID)"
+    export YT_DLP_POT_PROVIDER_PORT=4416
+  else
+    echo "PO Token server failed to start"
+  fi
+else
+  echo "bgutil PO Token server not found, skipping"
+fi
+
 # ── Start Cloudflare WARP proxy (non-fatal) ──
 WARP_OK=false
 if [ -n "$WARP_WG_CONFIG" ]; then

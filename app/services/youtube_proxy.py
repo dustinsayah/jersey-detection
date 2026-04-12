@@ -11,7 +11,7 @@
 #   W1/W1b. WARP muxed (FREE — 480p fallback)
 #   WS. WARP SOCKS5 DASH/muxed (fallback if HTTP proxy issues)
 #   CW1. WARP + Cookies muxed
-#   TV/MC/AM/AC. Alt clients no-proxy (tv_embedded, mediaconnect, android_music, android_creator)
+#   TV/WE. Alt clients no-proxy (tv, web_embedded — no PO token required)
 #   C0/C1. Cookie-only DASH/muxed (datacenter IP — usually 360p)
 #   0.  Decodo residential proxy DASH (PAID)
 #   0a-0c. Decodo muxed/range/full fallbacks
@@ -812,58 +812,33 @@ def download_youtube_sync(
         return None
 
     # ── Alternative client strategies (no proxy) ────────────────────────
-    # These clients use different YouTube API endpoints that may bypass
-    # datacenter IP quality restrictions. Tested locally: all get 1080p
-    # from residential IP. On datacenter they may still get 720p+ because
-    # YouTube applies different rules per client type.
-    # Order: tv_embedded → mediaconnect → android_music
+    # These clients don't require PO tokens (unlike web/android/mweb).
+    # Valid yt-dlp clients as of 2026.03: tv, web_embedded, android_vr.
+    # android_vr is already used by WARP strategies above.
+    # tv may have DRM issues on some sessions; web_embedded has limited formats.
 
-    def _s_tv_embedded_dash() -> DownloadResult | None:
-        """tv_embedded client — YouTube TV API, different quality rules."""
+    def _s_tv_dash() -> DownloadResult | None:
+        """tv client (TVHTML5) — no PO token required, supports cookies."""
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="tv_embedded", start_time=start_time, end_time=end_time,
+                            client="tv", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout,
-                            strategy_name="Strategy TV (tv_embedded DASH+EJS)",
+                            strategy_name="Strategy TV (tv DASH+EJS)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy="", errors_detail=_errors_detail):
             if _file_valid() and _is_720p_or_better():
-                return _make_result(output_path, sectioned=has_time_range, strategy="tv_embedded_dash_720p")
+                return _make_result(output_path, sectioned=has_time_range, strategy="tv_dash_720p")
         return None
 
-    def _s_mediaconnect_dash() -> DownloadResult | None:
-        """mediaconnect client — Cast/smart TV API, often less restricted."""
+    def _s_web_embedded_dash() -> DownloadResult | None:
+        """web_embedded client — no PO token required, supports cookies."""
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="mediaconnect", start_time=start_time, end_time=end_time,
+                            client="web_embedded", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout,
-                            strategy_name="Strategy MC (mediaconnect DASH+EJS)",
+                            strategy_name="Strategy WE (web_embedded DASH+EJS)",
                             format_override=_DASH_H264_FORMAT,
                             use_ejs=True, proxy="", errors_detail=_errors_detail):
             if _file_valid() and _is_720p_or_better():
-                return _make_result(output_path, sectioned=has_time_range, strategy="mediaconnect_dash_720p")
-        return None
-
-    def _s_android_music_dash() -> DownloadResult | None:
-        """android_music client — YouTube Music API, different rate limits."""
-        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="android_music", start_time=start_time, end_time=end_time,
-                            timeout=_strategy_timeout,
-                            strategy_name="Strategy AM (android_music DASH+EJS)",
-                            format_override=_DASH_H264_FORMAT,
-                            use_ejs=True, proxy="", errors_detail=_errors_detail):
-            if _file_valid() and _is_720p_or_better():
-                return _make_result(output_path, sectioned=has_time_range, strategy="android_music_dash_720p")
-        return None
-
-    def _s_android_creator_dash() -> DownloadResult | None:
-        """android_creator client — YouTube Studio API."""
-        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
-                            client="android_creator", start_time=start_time, end_time=end_time,
-                            timeout=_strategy_timeout,
-                            strategy_name="Strategy AC (android_creator DASH+EJS)",
-                            format_override=_DASH_H264_FORMAT,
-                            use_ejs=True, proxy="", errors_detail=_errors_detail):
-            if _file_valid() and _is_720p_or_better():
-                return _make_result(output_path, sectioned=has_time_range, strategy="android_creator_dash_720p")
+                return _make_result(output_path, sectioned=has_time_range, strategy="web_embedded_dash_720p")
         return None
 
     # ── WARP + Cookies strategies (web client) ──────────────────────────
@@ -1324,10 +1299,8 @@ def download_youtube_sync(
         ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
         # Alternative clients (NO proxy) — 720p fallback when WARP is blocked
         # These use different YouTube API endpoints with potentially different quality rules
-        ("tv_embedded_dash", _s_tv_embedded_dash),
-        ("mediaconnect_dash", _s_mediaconnect_dash),
-        ("android_music_dash", _s_android_music_dash),
-        ("android_creator_dash", _s_android_creator_dash),
+        ("tv_dash", _s_tv_dash),
+        ("web_embedded_dash", _s_web_embedded_dash),
         # Cookie-only (no WARP) — datacenter IP, usually 360p
         ("cookies_dash_ejs", _s_cookies_dash),
         ("cookies_muxed_pylib", _s_cookies_muxed),

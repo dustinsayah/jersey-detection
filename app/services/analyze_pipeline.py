@@ -2660,14 +2660,20 @@ async def _run_chunked_full_game(
     from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
 
     # Per-chunk download uses 10-min chunks (fits in WARP 300s timeout at 720p)
-    # Pre-downloaded video uses 30-min chunks (no download timeout concern)
+    # Pre-downloaded video: chunk size based on duration.
+    # v8.14.3: Per-chunk overhead ~120s regardless of frame count.
+    # Fewer chunks = faster total time. Use 1hr chunks for long games.
     _per_chunk_download = (video_url is not None and local_video_path is None)
-    CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    # v8.14.2: adaptive per-chunk frame cap based on video length.
-    # Long games (>1hr): 50 frames/chunk → 4×50=200 total → ~340s chunks
-    # Shorter videos: 100 frames/chunk → 2×100=200 total → ~170s chunks
     _effective_dur = extract_end - extract_start
-    CHUNK_MAX_FRAMES = 50 if _effective_dur > 3600 else 100
+    if _per_chunk_download:
+        CHUNK_SIZE = 600  # 10-min chunks for per-chunk downloads
+    elif _effective_dur > 3600:
+        CHUNK_SIZE = 3600  # 1hr chunks — 2 chunks for 2hr game (was 4 × 30min)
+    else:
+        CHUNK_SIZE = 1800  # 30-min chunks for shorter videos
+    # Frame cap per chunk: 100 frames gives good quality/speed balance.
+    # 2 chunks × 100 = 200 frames for 2hr games (1 every 36s).
+    CHUNK_MAX_FRAMES = 100
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)

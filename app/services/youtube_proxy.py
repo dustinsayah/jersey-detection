@@ -639,8 +639,8 @@ def download_youtube_sync(
         start_time = url_start_seconds
 
     has_time_range = start_time > 0 or end_time > 0
-    LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s, proxy=%s",
-                RENDER_SERVER_URL, start_time, end_time, bool(_get_proxy()))
+    LOGGER.info("youtube_proxy_sync: RENDER_SERVER_URL=%s, time=%s-%s, proxy=%s, has_time_range=%s",
+                RENDER_SERVER_URL, start_time, end_time, bool(_get_proxy()), has_time_range)
     dl_start = time.perf_counter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="clipt_yt_sync_"))
     output_path = tmp_dir / "video.mp4"
@@ -695,13 +695,16 @@ def download_youtube_sync(
         )
 
     # Detect full game (long video) — increase timeouts
-    _is_long_video = (end_time - start_time > 1800) if end_time > 0 else False
+    # When no time range is specified (full game), _segment_seconds=0 is treated as "full game"
+    _is_long_video = (end_time - start_time > 1800) if end_time > 0 else (end_time == 0)
     _segment_seconds = (end_time - start_time) if end_time > 0 else 0
+    _is_full_game = (start_time == 0 and end_time == 0)  # No time range = downloading entire video
 
     # Per-strategy timeout: scale with segment length
-    # Short clips: 60s, medium chunks (5-20 min): 120s, long segments: 300s, full games: 600s
-    # Note: 120s is enough for 10-min chunks — info extraction ~40s + download ~20s + trim ~10s
-    if _segment_seconds > 3600:
+    # Full game (no time range): 600s, 1hr+: 600s, 20-60min: 300s, 5-20min: 120s, <5min: 60s
+    if _is_full_game:
+        _strategy_timeout = 600  # Full game download = could be 2+ hours of video
+    elif _segment_seconds > 3600:
         _strategy_timeout = 600  # 2hr game = big download, needs time
     elif _segment_seconds > 1200:
         _strategy_timeout = 300  # 20-60 min segment at 720p
@@ -719,7 +722,9 @@ def download_youtube_sync(
     _decodo_full_timeout = 1200
 
     # Overall timeout: generous for long videos, tight for chunks
-    if _segment_seconds > 3600:
+    if _is_full_game:
+        _TOTAL_TIMEOUT = 1800  # Full game = up to 30 min total
+    elif _segment_seconds > 3600:
         _TOTAL_TIMEOUT = 1800
     elif _segment_seconds > 1200:
         _TOTAL_TIMEOUT = 900
@@ -1474,11 +1479,13 @@ def download_youtube_sync(
             if "warp" in name and name != "warp_cookies_dash_web":
                 # Don't count CW0 (it often gets 360p which is "fail" for 720p but not a block)
                 _warp_consecutive_failures += 1
-                if _warp_consecutive_failures >= _WARP_BLOCK_THRESHOLD * 3:
-                    # Multiple WARP strategies failed = WARP IP is blocked
+                # With pool rotation (3 IPs), need more failures before blocking globally
+                _pool_size = max(1, len(_get_warp_pool()))
+                _block_at = _WARP_BLOCK_THRESHOLD * 3 * _pool_size  # 6 per instance in pool
+                if _warp_consecutive_failures >= _block_at:
                     _warp_blocked_until = time.time() + _WARP_BLOCK_DURATION
-                    LOGGER.warning("WARP IP blocked by YouTube (%d failures) — skipping WARP for %ds",
-                                   _warp_consecutive_failures, _WARP_BLOCK_DURATION)
+                    LOGGER.warning("WARP pool blocked by YouTube (%d failures, %d instances) — skipping WARP for %ds",
+                                   _warp_consecutive_failures, _pool_size, _WARP_BLOCK_DURATION)
         except Exception as exc:
             strategy_errors.append(f"{name}={type(exc).__name__}")
             LOGGER.warning("Strategy %s EXCEPTION: %s: %s", name, type(exc).__name__, str(exc)[:200])

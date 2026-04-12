@@ -2663,7 +2663,7 @@ async def _run_chunked_full_game(
     # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
     CHUNK_SIZE = 600 if _per_chunk_download else 1800
-    CHUNK_MAX_FRAMES = 100  # v8.14: 100 frames/chunk (was 200). 5 chunks × 100 = 500 total
+    CHUNK_MAX_FRAMES = 75  # v8.14.1: 75 frames/chunk (was 100). 4 chunks × 75 = 300 total
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2690,13 +2690,14 @@ async def _run_chunked_full_game(
 
         def _do_audio_sync():
             import subprocess as _sp_audio
+            import time as _atime
             from app.services.audio_analyzer import analyze_audio
             from app.services.detection_runtime import PipelineSettings
             _settings = PipelineSettings()
-            # Extract max 1200s (20 min) of audio — sufficient for play pattern
-            # detection while keeping YAMNet processing under 200s on CPU.
-            # Full-game audio (3600s) took 625s; 1200s should take ~208s.
-            _audio_cap = 1200
+            _a_t0 = _atime.perf_counter()
+            # v8.14.1: 600s audio cap (10 min) — fast DSP needs far less than YAMNet.
+            # ffmpeg extraction of 600s from 3.6GB file takes ~30-60s.
+            _audio_cap = 600
             _apath = _audio_video_path.parent / "audio.wav"
             try:
                 _sp_audio.run([
@@ -2705,12 +2706,14 @@ async def _run_chunked_full_game(
                     "-t", str(_audio_cap),
                     "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                     str(_apath),
-                ], capture_output=True, timeout=180)
+                ], capture_output=True, timeout=120)
             except Exception:
                 pass
+            _result = AudioAnalysisResult(has_audio=False)
             if _apath.exists() and _apath.stat().st_size > 0:
-                return analyze_audio(_apath)
-            return AudioAnalysisResult(has_audio=False)
+                _result = analyze_audio(_apath)
+            _result._actual_elapsed_ms = round((_atime.perf_counter() - _a_t0) * 1000)
+            return _result
 
         _audio_task = _asyncio.ensure_future(run_in_threadpool(_do_audio_sync))
         LOGGER.info("Chunked: audio analysis started in background thread")
@@ -2914,18 +2917,21 @@ async def _run_chunked_full_game(
     if _audio_task is not None:
         try:
             audio_result = await _audio_task
-            _audio_elapsed = time.perf_counter() - _audio_t0
+            _audio_wall = time.perf_counter() - _audio_t0
+            # Use actual work time from inside the thread (excludes await wait)
+            _audio_actual_ms = getattr(audio_result, "_actual_elapsed_ms", round(_audio_wall * 1000))
             if audio_result.has_audio:
                 phases_used.append("audio_analysis")
             layer_timings["audio_analysis"] = {
-                "elapsed_ms": round(_audio_elapsed * 1000),
+                "elapsed_ms": _audio_actual_ms,
                 "status": "success" if audio_result.has_audio else "no_audio",
                 "events": len(audio_result.events),
                 "boundaries": len(audio_result.play_boundaries),
                 "parallel": True,
+                "wall_clock_ms": round(_audio_wall * 1000),
             }
-            LOGGER.info("Chunked: audio analysis complete (%.1fs, %d events, parallel=true)",
-                        _audio_elapsed, len(audio_result.events))
+            LOGGER.info("Chunked: audio analysis complete (actual=%.1fs, wall=%.1fs, %d events, parallel=true)",
+                        _audio_actual_ms / 1000, _audio_wall, len(audio_result.events))
         except Exception as exc:
             layer_timings["audio_analysis"] = {
                 "elapsed_ms": round((time.perf_counter() - _audio_t0) * 1000),

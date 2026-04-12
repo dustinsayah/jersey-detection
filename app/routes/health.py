@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.12.1",
+        "version": "v8.13.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.12.1",
+        "version": "v8.13.0",
     })
 
 
@@ -274,13 +274,20 @@ def health(request: Request) -> JSONResponse:
     decodo_pass = os.getenv("DECODO_PASSWORD", "").strip()
     decodo_configured = bool(decodo_user and decodo_pass)
 
-    # Check Cloudflare WARP proxy status
-    import socket
+    # Check Cloudflare WARP proxy pool status
     try:
-        with socket.create_connection(("127.0.0.1", 40000), timeout=2):
-            warp_running = True
-    except (ConnectionRefusedError, OSError, TimeoutError):
-        warp_running = False
+        from app.services.youtube_proxy import get_warp_pool_status
+        _warp_status = get_warp_pool_status()
+        warp_running = _warp_status["pool_size"] > 0
+        warp_pool_size = _warp_status["pool_size"]
+    except Exception:
+        import socket
+        try:
+            with socket.create_connection(("127.0.0.1", 40000), timeout=2):
+                warp_running = True
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            warp_running = False
+        warp_pool_size = 1 if warp_running else 0
 
     # Check YouTube cookie file health
     cookie_health: dict = {"exists": False, "has_auth_tokens": False}
@@ -336,10 +343,11 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.12.1",
+            "version": "v8.13.0",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
+            "warp_pool_size": warp_pool_size,
             "cookie_health": cookie_health,
             "memory_rss_mb": memory_rss_mb,
         },
@@ -463,6 +471,51 @@ def test_proxy() -> JSONResponse:
             "elapsed_ms": round((time.perf_counter() - t) * 1000),
         }
 
+    return JSONResponse(status_code=200, content=results)
+
+
+@router.get("/test-warp-pool")
+def test_warp_pool() -> JSONResponse:
+    """Diagnostic: test all WARP proxy instances in the pool."""
+    import time
+    import httpx
+
+    from app.services.youtube_proxy import get_warp_pool_status
+
+    pool_status = get_warp_pool_status()
+    results: dict = {"pool": pool_status, "connectivity": []}
+
+    for inst in pool_status["instances"]:
+        if inst.get("status") == "not_running":
+            results["connectivity"].append({
+                "label": inst["label"],
+                "status": "not_running",
+            })
+            continue
+        # Test SOCKS5 connectivity
+        t = time.perf_counter()
+        try:
+            resp = httpx.get(
+                "https://httpbin.org/ip",
+                proxy=inst["socks"],
+                timeout=httpx.Timeout(15),
+            )
+            results["connectivity"].append({
+                "label": inst["label"],
+                "status": "ok",
+                "ip": resp.text.strip()[:100],
+                "elapsed_ms": round((time.perf_counter() - t) * 1000),
+            })
+        except Exception as exc:
+            results["connectivity"].append({
+                "label": inst["label"],
+                "status": "error",
+                "error": str(exc)[:200],
+                "elapsed_ms": round((time.perf_counter() - t) * 1000),
+            })
+
+    ok_count = sum(1 for c in results["connectivity"] if c["status"] == "ok")
+    results["summary"] = f"{ok_count}/{len(results['connectivity'])} instances connected"
     return JSONResponse(status_code=200, content=results)
 
 

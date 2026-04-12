@@ -96,9 +96,86 @@ def _get_cookie_file() -> str:
 def _get_proxy() -> str:
     return os.getenv("YT_DLP_PROXY", "").strip()
 
-# Cloudflare WARP proxies — wireproxy exposes both SOCKS5 and HTTP
-# SOCKS5 on :40000 for yt-dlp (native support), HTTP on :40001 for ffmpeg
-# (ffmpeg doesn't support SOCKS5, so DASH merge needs HTTP proxy)
+# ── Cloudflare WARP proxy pool ──────────────────────────────────────
+# start.sh launches up to 3 wireproxy instances on separate port pairs.
+# Each gets its own Cloudflare WARP account → different IP.
+# Pool rotates round-robin so YouTube rate-limits hit different IPs.
+#   Instance 1: SOCKS5 :40000 / HTTP :40001 (WARP_WG_CONFIG)
+#   Instance 2: SOCKS5 :40002 / HTTP :40003 (WARP_WG_CONFIG_2)
+#   Instance 3: SOCKS5 :40004 / HTTP :40005 (WARP_WG_CONFIG_3)
+
+import threading as _threading
+
+_WARP_POOL: list[dict] = []  # Populated at first use by _build_warp_pool()
+_warp_pool_idx: int = 0
+_warp_pool_lock = _threading.Lock()
+
+# Per-instance rate-limit tracking
+_warp_instance_blocked: dict[int, float] = {}  # port → blocked_until timestamp
+
+def _build_warp_pool() -> list[dict]:
+    """Discover running wireproxy instances and build the proxy pool."""
+    import socket
+    pool = []
+    for socks_port, http_port, label in [(40000, 40001, "warp1"),
+                                          (40002, 40003, "warp2"),
+                                          (40004, 40005, "warp3")]:
+        try:
+            with socket.create_connection(("127.0.0.1", socks_port), timeout=2):
+                pool.append({
+                    "socks": f"socks5://127.0.0.1:{socks_port}",
+                    "http": f"http://127.0.0.1:{http_port}",
+                    "socks_port": socks_port,
+                    "http_port": http_port,
+                    "label": label,
+                })
+                LOGGER.info("WARP pool: %s alive (SOCKS:%d, HTTP:%d)", label, socks_port, http_port)
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            LOGGER.debug("WARP pool: %s not running (port %d)", label, socks_port)
+    return pool
+
+
+def _get_warp_pool() -> list[dict]:
+    """Return the WARP proxy pool, building it on first call."""
+    global _WARP_POOL
+    if not _WARP_POOL:
+        _WARP_POOL = _build_warp_pool()
+    return _WARP_POOL
+
+
+def _get_next_warp_proxy() -> dict | None:
+    """Round-robin select the next non-blocked WARP proxy from the pool.
+
+    Returns dict with 'socks', 'http', 'label' keys, or None if all blocked/empty.
+    """
+    global _warp_pool_idx
+    pool = _get_warp_pool()
+    if not pool:
+        return None
+    now = time.time()
+    with _warp_pool_lock:
+        # Try each instance in round-robin order
+        for _ in range(len(pool)):
+            idx = _warp_pool_idx % len(pool)
+            _warp_pool_idx += 1
+            entry = pool[idx]
+            blocked_until = _warp_instance_blocked.get(entry["socks_port"], 0)
+            if now >= blocked_until:
+                LOGGER.info("WARP pool: selected %s (idx=%d/%d)", entry["label"], idx, len(pool))
+                return entry
+            LOGGER.debug("WARP pool: %s blocked for %.0fs more", entry["label"], blocked_until - now)
+    LOGGER.warning("WARP pool: ALL %d instances blocked", len(pool))
+    return None
+
+
+def _block_warp_instance(proxy_entry: dict, duration: float = 300) -> None:
+    """Block a specific WARP instance after repeated failures."""
+    port = proxy_entry["socks_port"]
+    _warp_instance_blocked[port] = time.time() + duration
+    LOGGER.warning("WARP pool: blocked %s for %ds", proxy_entry["label"], duration)
+
+
+# Legacy aliases for backward compatibility with strategies
 _WARP_PROXY = "socks5://127.0.0.1:40000"
 _WARP_HTTP_PROXY = "http://127.0.0.1:40001"
 
@@ -134,13 +211,8 @@ def _record_download_success() -> None:
     _last_download_time = time.time()
 
 def _is_warp_running() -> bool:
-    """Check if wireproxy WARP SOCKS5 proxy is listening on port 40000."""
-    import socket
-    try:
-        with socket.create_connection(("127.0.0.1", 40000), timeout=2):
-            return True
-    except (ConnectionRefusedError, OSError, TimeoutError):
-        return False
+    """Check if any wireproxy WARP instance is listening."""
+    return len(_get_warp_pool()) > 0
 
 _YT_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/live/)([A-Za-z0-9_-]{11})"
@@ -850,21 +922,24 @@ def download_youtube_sync(
         """WARP proxy + cookies + web client — DASH 720p."""
         if not (_warp_available and _has_cookies):
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         # Try multiple clients that support cookies: web, android, ios
         for _client in ("web", "android", "ios"):
             if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                                 client=_client, start_time=start_time, end_time=end_time,
                                 timeout=_strategy_timeout,
-                                strategy_name=f"Strategy CW0 (WARP+Cookies DASH {_client})",
+                                strategy_name=f"Strategy CW0 (WARP+Cookies DASH {_client} via {_wp['label']})",
                                 format_override=_DASH_H264_FORMAT, use_ejs=True,
-                                proxy=_WARP_HTTP_PROXY, skip_cookies=False,
+                                proxy=_wp["http"], skip_cookies=False,
                                 errors_detail=_errors_detail):
                 if _file_valid():
                     if _is_720p_or_better():
                         return _make_result(output_path, sectioned=has_time_range,
-                                            strategy=f"warp_cookies_dash_{_client}")
-                    LOGGER.warning("CW0 (%s): Downloaded but only %dp — trying next client",
-                                   _client, _get_video_height())
+                                            strategy=f"warp_cookies_dash_{_client}_{_wp['label']}")
+                    LOGGER.warning("CW0 (%s via %s): Downloaded but only %dp — trying next client",
+                                   _client, _wp["label"], _get_video_height())
         # Save the last download as fallback if it exists
         if _file_valid():
             _low_res_fallback_path = output_path.with_suffix(".360p.mp4")
@@ -876,6 +951,9 @@ def download_youtube_sync(
         """WARP proxy + cookies — muxed fallback (skip if 720p needed)."""
         if not (_warp_available and _has_cookies):
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         # Skip muxed (360p) — we already have a 360p fallback from CW0
         _low_res_fb = output_path.with_suffix(".360p.mp4")
         if _low_res_fb.exists():
@@ -883,12 +961,12 @@ def download_youtube_sync(
             return None
         if _yt_dlp_python_download(url, output_path, client="web",
                                    start_time=start_time, end_time=end_time,
-                                   strategy_name="Strategy CW1 (WARP+Cookies muxed web)",
+                                   strategy_name=f"Strategy CW1 (WARP+Cookies muxed web via {_wp['label']})",
                                    format_override=_MUXED_FORMAT,
-                                   proxy=_WARP_HTTP_PROXY, skip_cookies=False,
+                                   proxy=_wp["http"], skip_cookies=False,
                                    timeout=_strategy_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_muxed_web")
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_cookies_muxed_web_{_wp['label']}")
         return None
 
     def _s0_decodo_sections() -> DownloadResult | None:
@@ -996,159 +1074,181 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib_full_trim")
         return None
 
-    # ── Cloudflare WARP strategies ─────────────────────────────────────
+    # ── Cloudflare WARP strategies (with proxy pool rotation) ────────
     # WARP routes through Cloudflare's consumer VPN network (millions of users),
     # so YouTube treats WARP IPs as residential — FREE 720p from datacenter.
-    # Strategy: prefer HTTP proxy (40001) over SOCKS5 (40000) because HTTP
-    # works natively with both yt-dlp AND ffmpeg (no SOCKS conversion needed).
+    # Pool rotates across up to 3 WARP accounts so rate-limits hit different IPs.
     _warp_available = _is_warp_running()
+    _warp_pool = _get_warp_pool()
     if _warp_available:
-        LOGGER.info("WARP proxy detected on %s (HTTP: %s) — will try WARP strategies",
-                     _WARP_PROXY, _WARP_HTTP_PROXY)
+        LOGGER.info("WARP proxy pool: %d instances available — will try WARP strategies",
+                     len(_warp_pool))
 
     def _s_warp_http_dash() -> DownloadResult | None:
         """WARP HTTP proxy + DASH H.264 + EJS — best quality, ffmpeg-compatible.
 
-        YouTube intermittently blocks android_vr (LOGIN_REQUIRED), so we retry
-        up to 3 times with short delays. This is the ONLY path to 720p DASH.
-        Skips entirely if android_vr has been rate-limited recently.
+        Uses pool rotation: each retry picks the next WARP instance so
+        YouTube rate-limits hit different IPs.
         """
         global _warp_consecutive_failures, _warp_blocked_until
         if not _warp_available:
             return None
-        # Skip if WARP IP was recently rate-limited by YouTube
+        # Skip if ALL WARP IPs were recently rate-limited
         if time.time() < _warp_blocked_until:
             LOGGER.info("W0: SKIPPED — WARP blocked for %.0fs more",
                         _warp_blocked_until - time.time())
             return None
-        _max_retries = 1 if _segment_seconds > 1200 else 3  # Less retries for 20min+ segments
+        _max_retries = 1 if _segment_seconds > 1200 else 3
         for _retry in range(_max_retries):
+            _wp = _get_next_warp_proxy()
+            if not _wp:
+                LOGGER.info("W0: no available WARP proxy in pool")
+                return None
             if _retry > 0:
-                LOGGER.info("W0: retry %d/%d after 5s backoff", _retry + 1, _max_retries)
+                LOGGER.info("W0: retry %d/%d via %s after 5s backoff", _retry + 1, _max_retries, _wp["label"])
                 time.sleep(5)
             if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                                 client="android_vr", start_time=start_time, end_time=end_time,
                                 timeout=_strategy_timeout,
-                                strategy_name=f"Strategy W0 (WARP HTTP DASH+EJS, attempt {_retry+1}/{_max_retries})",
+                                strategy_name=f"Strategy W0 (WARP HTTP DASH+EJS via {_wp['label']}, attempt {_retry+1}/{_max_retries})",
                                 format_override=_DASH_H264_FORMAT, use_ejs=True,
-                                proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                proxy=_wp["http"], skip_cookies=True,
                                 errors_detail=_errors_detail):
                 if _file_valid():
                     h = _get_video_height()
-                    LOGGER.info("W0: downloaded %dp (attempt %d)", h, _retry + 1)
-                    _warp_consecutive_failures = 0  # Reset on success
-                    return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_ejs")
-        # All retries failed — will be counted by the WARP block logic below
+                    LOGGER.info("W0: downloaded %dp via %s (attempt %d)", h, _wp["label"], _retry + 1)
+                    _warp_consecutive_failures = 0
+                    return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_http_dash_ejs_{_wp['label']}")
         return None
 
     def _s_warp_http_dash_web() -> DownloadResult | None:
         """WARP HTTP + DASH + web client — different fingerprint for YouTube."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="web", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout,
-                            strategy_name="Strategy W0b (WARP HTTP DASH web)",
+                            strategy_name=f"Strategy W0b (WARP HTTP DASH web via {_wp['label']})",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
-                            proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                            proxy=_wp["http"], skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
                 h = _get_video_height()
-                LOGGER.info("W0b: downloaded %dp", h)
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_web")
+                LOGGER.info("W0b: downloaded %dp via %s", h, _wp["label"])
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_http_dash_web_{_wp['label']}")
         return None
 
     def _s_warp_http_dash_pylib() -> DownloadResult | None:
         """WARP HTTP + DASH via Python library — 720p, no EJS needed."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         if _yt_dlp_python_download(url, output_path, client="android_vr",
                                    start_time=0, end_time=0,
-                                   strategy_name="Strategy W0e (WARP HTTP DASH pylib)",
+                                   strategy_name=f"Strategy W0e (WARP HTTP DASH pylib via {_wp['label']})",
                                    format_override=_DASH_H264_FORMAT,
-                                   proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                   proxy=_wp["http"], skip_cookies=True,
                                    timeout=_strategy_timeout, errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="warp_http_dash_pylib")
+                return _make_result(output_path, sectioned=False, strategy=f"warp_http_dash_pylib_{_wp['label']}")
         return None
 
     def _s_warp_http_dash_pylib_web() -> DownloadResult | None:
         """WARP HTTP + DASH via Python library + web client — 720p alt."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         if _yt_dlp_python_download(url, output_path, client="web",
                                    start_time=0, end_time=0,
-                                   strategy_name="Strategy W0f (WARP HTTP DASH pylib web)",
+                                   strategy_name=f"Strategy W0f (WARP HTTP DASH pylib web via {_wp['label']})",
                                    format_override=_DASH_H264_FORMAT,
-                                   proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                   proxy=_wp["http"], skip_cookies=True,
                                    timeout=_strategy_timeout, errors_detail=_errors_detail):
             if has_time_range:
                 _trim_video(output_path, start_time, end_time, ffmpeg_binary)
             if _file_valid():
-                return _make_result(output_path, sectioned=False, strategy="warp_http_dash_pylib_web")
+                return _make_result(output_path, sectioned=False, strategy=f"warp_http_dash_pylib_web_{_wp['label']}")
         return None
 
     def _s_warp_http_muxed() -> DownloadResult | None:
         """WARP HTTP proxy + muxed (360p fallback, most reliable)."""
         if not _warp_available:
             return None
-        # Use download_ranges to avoid downloading the entire video
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="android_vr",
                                    start_time=start_time, end_time=end_time,
-                                   strategy_name="Strategy W0c (WARP HTTP muxed)",
+                                   strategy_name=f"Strategy W0c (WARP HTTP muxed via {_wp['label']})",
                                    format_override=_MUXED_FORMAT,
-                                   proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                   proxy=_wp["http"], skip_cookies=True,
                                    timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_muxed")
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_http_muxed_{_wp['label']}")
         return None
 
     def _s_warp_http_muxed_web() -> DownloadResult | None:
         """WARP HTTP + muxed + web client — widest compatibility."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="web",
                                    start_time=start_time, end_time=end_time,
-                                   strategy_name="Strategy W0d (WARP HTTP muxed web)",
+                                   strategy_name=f"Strategy W0d (WARP HTTP muxed web via {_wp['label']})",
                                    format_override=_MUXED_FORMAT,
-                                   proxy=_WARP_HTTP_PROXY, skip_cookies=True,
+                                   proxy=_wp["http"], skip_cookies=True,
                                    timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_muxed_web")
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_http_muxed_web_{_wp['label']}")
         return None
 
     def _s_warp_socks_dash() -> DownloadResult | None:
         """WARP SOCKS5 + DASH H.264 — fallback if HTTP proxy has issues."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
                             client="android_vr", start_time=start_time, end_time=end_time,
                             timeout=_strategy_timeout,
-                            strategy_name="Strategy W1 (WARP SOCKS DASH)",
+                            strategy_name=f"Strategy W1 (WARP SOCKS DASH via {_wp['label']})",
                             format_override=_DASH_H264_FORMAT, use_ejs=True,
-                            proxy=_WARP_PROXY, skip_cookies=True,
+                            proxy=_wp["socks"], skip_cookies=True,
                             errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_socks_dash")
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_socks_dash_{_wp['label']}")
         return None
 
     def _s_warp_socks_muxed() -> DownloadResult | None:
         """WARP SOCKS5 + muxed — last WARP fallback."""
         if not _warp_available:
             return None
+        _wp = _get_next_warp_proxy()
+        if not _wp:
+            return None
         _muxed_timeout = max(_strategy_timeout, 300) if _is_long_video else _strategy_timeout
         if _yt_dlp_python_download(url, output_path, client="android_vr",
                                    start_time=start_time, end_time=end_time,
-                                   strategy_name="Strategy W2 (WARP SOCKS muxed)",
+                                   strategy_name=f"Strategy W2 (WARP SOCKS muxed via {_wp['label']})",
                                    format_override=_MUXED_FORMAT,
-                                   proxy=_WARP_PROXY, skip_cookies=True,
+                                   proxy=_wp["socks"], skip_cookies=True,
                                    timeout=_muxed_timeout, errors_detail=_errors_detail):
             if _file_valid():
-                return _make_result(output_path, sectioned=has_time_range, strategy="warp_socks_muxed")
+                return _make_result(output_path, sectioned=has_time_range, strategy=f"warp_socks_muxed_{_wp['label']}")
         return None
 
     def _s_render_early() -> DownloadResult | None:
@@ -1430,6 +1530,40 @@ async def download_youtube(
             ffmpeg_binary=ffmpeg_binary,
         )
     )
+
+
+def get_warp_pool_status() -> dict:
+    """Return the status of all WARP proxy instances for health checks."""
+    import socket
+    pool = _get_warp_pool()
+    now = time.time()
+    instances = []
+    for entry in pool:
+        blocked_until = _warp_instance_blocked.get(entry["socks_port"], 0)
+        instances.append({
+            "label": entry["label"],
+            "socks": entry["socks"],
+            "http": entry["http"],
+            "blocked": now < blocked_until,
+            "blocked_remaining_s": max(0, round(blocked_until - now)),
+        })
+    # Also check ports that might not be in the pool (not running)
+    for socks_port, http_port, label in [(40000, 40001, "warp1"),
+                                          (40002, 40003, "warp2"),
+                                          (40004, 40005, "warp3")]:
+        if not any(e["socks_port"] == socks_port for e in pool):
+            instances.append({
+                "label": label,
+                "socks": f"socks5://127.0.0.1:{socks_port}",
+                "http": f"http://127.0.0.1:{http_port}",
+                "blocked": False,
+                "status": "not_running",
+            })
+    return {
+        "pool_size": len(pool),
+        "current_idx": _warp_pool_idx,
+        "instances": instances,
+    }
 
 
 def test_youtube_download_sync(

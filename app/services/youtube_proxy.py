@@ -11,6 +11,7 @@
 #   W1/W1b. WARP muxed (FREE — 480p fallback)
 #   WS. WARP SOCKS5 DASH/muxed (fallback if HTTP proxy issues)
 #   CW1. WARP + Cookies muxed
+#   TV/MC/AM/AC. Alt clients no-proxy (tv_embedded, mediaconnect, android_music, android_creator)
 #   C0/C1. Cookie-only DASH/muxed (datacenter IP — usually 360p)
 #   0.  Decodo residential proxy DASH (PAID)
 #   0a-0c. Decodo muxed/range/full fallbacks
@@ -810,6 +811,61 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="cookies_muxed_pylib")
         return None
 
+    # ── Alternative client strategies (no proxy) ────────────────────────
+    # These clients use different YouTube API endpoints that may bypass
+    # datacenter IP quality restrictions. Tested locally: all get 1080p
+    # from residential IP. On datacenter they may still get 720p+ because
+    # YouTube applies different rules per client type.
+    # Order: tv_embedded → mediaconnect → android_music
+
+    def _s_tv_embedded_dash() -> DownloadResult | None:
+        """tv_embedded client — YouTube TV API, different quality rules."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="tv_embedded", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy TV (tv_embedded DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy="", errors_detail=_errors_detail):
+            if _file_valid() and _is_720p_or_better():
+                return _make_result(output_path, sectioned=has_time_range, strategy="tv_embedded_dash_720p")
+        return None
+
+    def _s_mediaconnect_dash() -> DownloadResult | None:
+        """mediaconnect client — Cast/smart TV API, often less restricted."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="mediaconnect", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy MC (mediaconnect DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy="", errors_detail=_errors_detail):
+            if _file_valid() and _is_720p_or_better():
+                return _make_result(output_path, sectioned=has_time_range, strategy="mediaconnect_dash_720p")
+        return None
+
+    def _s_android_music_dash() -> DownloadResult | None:
+        """android_music client — YouTube Music API, different rate limits."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_music", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy AM (android_music DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy="", errors_detail=_errors_detail):
+            if _file_valid() and _is_720p_or_better():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_music_dash_720p")
+        return None
+
+    def _s_android_creator_dash() -> DownloadResult | None:
+        """android_creator client — YouTube Studio API."""
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="android_creator", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy AC (android_creator DASH+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy="", errors_detail=_errors_detail):
+            if _file_valid() and _is_720p_or_better():
+                return _make_result(output_path, sectioned=has_time_range, strategy="android_creator_dash_720p")
+        return None
+
     # ── WARP + Cookies strategies (web client) ──────────────────────────
     # Combines Cloudflare WARP residential IP with cookie authentication.
     # Uses 'web' client because 'android_vr' does not support cookies.
@@ -1266,6 +1322,12 @@ def download_youtube_sync(
         ("warp_socks_muxed", _s_warp_socks_muxed),
         # WARP + Cookies muxed: auth + muxed last WARP attempt
         ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
+        # Alternative clients (NO proxy) — 720p fallback when WARP is blocked
+        # These use different YouTube API endpoints with potentially different quality rules
+        ("tv_embedded_dash", _s_tv_embedded_dash),
+        ("mediaconnect_dash", _s_mediaconnect_dash),
+        ("android_music_dash", _s_android_music_dash),
+        ("android_creator_dash", _s_android_creator_dash),
         # Cookie-only (no WARP) — datacenter IP, usually 360p
         ("cookies_dash_ejs", _s_cookies_dash),
         ("cookies_muxed_pylib", _s_cookies_muxed),

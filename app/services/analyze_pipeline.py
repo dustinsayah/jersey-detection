@@ -426,8 +426,17 @@ def _build_player_summary(
     """
     total = len(clips_out)
     jersey_clips = [c for c in clips_out if c.get("jerseyVisible")]
-    _scoring_types = ("touchdown", "made_shot", "goal", "three_pointer", "dunk")
-    scoring_plays = [c for c in clips_out if c.get("v4Outcome") in _scoring_types or c.get("playType") in _scoring_types]
+    _scoring_types = ("touchdown", "made_shot", "goal", "three_pointer", "dunk", "layup")
+    scoring_plays = []
+    for c in clips_out:
+        pt = c.get("playType", "")
+        if c.get("v4Outcome") in _scoring_types or pt in _scoring_types:
+            scoring_plays.append(c)
+        elif sport == "basketball" and pt in ("drive", "fast_break"):
+            # Basketball: high-crowd drives/fast breaks near the basket likely scored
+            sigs = c.get("signals", {})
+            if sigs.get("crowd", 0) > 0.5 and sigs.get("motion", 0) > 60:
+                scoring_plays.append(c)
     recruiting_scores = [c.get("recruitingScore", 0) for c in clips_out]
 
     # Play type breakdown

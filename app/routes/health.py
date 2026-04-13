@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.14.3",
+        "version": "v8.15.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.14.3",
+        "version": "v8.15.0",
     })
 
 
@@ -343,7 +343,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.14.3",
+            "version": "v8.15.0",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
@@ -827,3 +827,81 @@ async def upload_cookies(request: Request) -> JSONResponse:
         "estimated_days_remaining": 3.0,
         "next_refresh": "Upload new cookies in ~3 days",
     })
+
+
+@router.get("/test-basketball")
+async def test_basketball(request: Request) -> Any:
+    """Test endpoint — runs full detection on a known-good public basketball game.
+
+    Uses a public NCAA basketball highlight that doesn't require cookies.
+    Returns full detection result for testing without needing fresh cookies.
+    """
+    from starlette.responses import StreamingResponse
+    import json
+    import time
+    import threading
+
+    # Known-good public basketball highlight (NCAA March Madness official channel)
+    TEST_URL = "https://www.youtube.com/watch?v=puzER6mJ5c4"
+
+    if not getattr(request.app.state, "detector_ready", False):
+        return JSONResponse(status_code=503, content={
+            "error": "Detector not ready",
+            "version": "v8.15.0",
+        })
+
+    started_at = time.perf_counter()
+    result_holder: dict = {}
+    error_holder: list = []
+    done = threading.Event()
+    cancel = threading.Event()
+
+    def _run():
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from app.services.analyze_pipeline import run_analyze_pipeline
+            result = loop.run_until_complete(run_analyze_pipeline(
+                video_url=TEST_URL,
+                jersey_number=0,
+                jersey_color="white",
+                sport="basketball",
+                time_range_start=0,
+                time_range_end=60,
+                enable_audio=True,
+                enable_tracking=False,
+                enable_pose=False,
+                quality_mode="auto",
+                cancel_event=cancel,
+            ))
+            result_holder["data"] = result
+        except Exception as exc:
+            error_holder.append(exc)
+        finally:
+            loop.close()
+            done.set()
+
+    async def _stream():
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        main_loop = asyncio.get_event_loop()
+        while not done.is_set():
+            finished = await main_loop.run_in_executor(None, done.wait, 15)
+            if not finished:
+                elapsed = round(time.perf_counter() - started_at, 1)
+                yield (json.dumps({"keepalive": True, "elapsed": elapsed}) + "\n").encode()
+        t.join(timeout=10)
+        if error_holder:
+            yield (json.dumps({"error": str(error_holder[0])[:200]}) + "\n").encode()
+        elif "data" in result_holder:
+            yield (json.dumps(result_holder["data"]) + "\n").encode()
+        else:
+            yield (json.dumps({"error": "No result"}) + "\n").encode()
+
+    import asyncio
+    return StreamingResponse(
+        _stream(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )

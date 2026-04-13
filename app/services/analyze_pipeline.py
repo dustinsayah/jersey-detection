@@ -2578,15 +2578,20 @@ async def _run_analyze_pipeline_impl(
             "memory_rss_mb": memory_rss_mb,
         }
 
+        # v8.15: Temporal smoothing for jersey numbers
+        clips_out = _smooth_jersey_numbers(clips_out, jersey_number)
+
         # Player summary for coaches
         player_summary = _build_player_summary(
             clips_out, jersey_number, sport, position, video_duration, elapsed,
         )
 
+        cookie_warning = _check_cookie_warning()
         result = {
             "playerSummary": player_summary,
             "clips": clips_out,
             "layerUsed": layer_used,
+            "error_type": "success",
             "elapsed": round(elapsed, 1),
             "videoDuration": round(video_duration, 1),
             "framesProcessed": frames_processed,
@@ -2599,9 +2604,8 @@ async def _run_analyze_pipeline_impl(
         }
 
         # Add cookie warning if expiring within 2 days
-        _cookie_warn = _check_cookie_warning()
-        if _cookie_warn:
-            result["cookie_warning"] = _cookie_warn
+        if cookie_warning:
+            result["cookies_warning"] = cookie_warning
 
         return result
 
@@ -3415,15 +3419,19 @@ async def _run_chunked_full_game(
         "chunks_processed": chunk_count,
     }
 
+    # v8.15: Temporal smoothing for jersey numbers
+    clips_out = _smooth_jersey_numbers(clips_out, jersey_number)
+
     # Player summary for coaches
     player_summary = _build_player_summary(
         clips_out, jersey_number, sport, position, video_duration, elapsed,
     )
 
-    return {
+    result = {
         "playerSummary": player_summary,
         "clips": clips_out,
         "layerUsed": "+".join(phases_used),
+        "error_type": "success",
         "elapsed": round(elapsed, 1),
         "videoDuration": round(video_duration, 1),
         "framesProcessed": total_frames,
@@ -3434,6 +3442,10 @@ async def _run_chunked_full_game(
         "actionsDetected": [],
         "debug": debug,
     }
+    cookie_warning = _check_cookie_warning()
+    if cookie_warning:
+        result["cookies_warning"] = cookie_warning
+    return result
 
 
 def _run_jersey_detection(
@@ -3979,14 +3991,84 @@ def _in_audio_boundary(audio_result: AudioAnalysisResult, timestamp: float) -> b
     return False
 
 
+def _smooth_jersey_numbers(clips: list[dict], target_jersey: int) -> list[dict]:
+    """Temporal smoothing for jersey number assignment.
+
+    v8.15: When a target jersey is specified, boost clips where the target
+    number was seen in adjacent clips (within 30s window). This prevents
+    flickering jersey assignments caused by single-frame OCR errors.
+
+    Also: if >60% of clips see the same jersey number, assign it to clips
+    where no jersey was detected (likely same player, OCR just missed).
+    """
+    if not clips or target_jersey <= 0:
+        return clips
+
+    # Count jersey number occurrences
+    jersey_counts: dict[int, int] = {}
+    for clip in clips:
+        jn = clip.get("jerseyNumberSeen")
+        if jn and jn > 0:
+            jersey_counts[jn] = jersey_counts.get(jn, 0) + 1
+
+    if not jersey_counts:
+        return clips
+
+    # Find dominant jersey number
+    dominant_jersey = max(jersey_counts, key=lambda k: jersey_counts[k])
+    dominant_ratio = jersey_counts[dominant_jersey] / len(clips) if clips else 0
+
+    # If target jersey is dominant (>40% of clips), fill in gaps
+    if dominant_jersey == target_jersey and dominant_ratio >= 0.4:
+        for clip in clips:
+            if not clip.get("jerseyNumberSeen") and clip.get("jerseyVisible"):
+                clip["jerseyNumberSeen"] = target_jersey
+                clip["jerseySmoothed"] = True
+                LOGGER.debug(
+                    "Jersey smoothing: assigned #%d to clip at %.1f-%.1f",
+                    target_jersey, clip.get("startTime", 0), clip.get("endTime", 0),
+                )
+
+    # Adjacent clip smoothing: if neighboring clips (within 30s) both see the
+    # target jersey but a middle clip doesn't, assign the target number
+    for i in range(1, len(clips) - 1):
+        clip = clips[i]
+        if clip.get("jerseyNumberSeen"):
+            continue
+        prev_jn = clips[i - 1].get("jerseyNumberSeen")
+        next_jn = clips[i + 1].get("jerseyNumberSeen")
+        if prev_jn == target_jersey and next_jn == target_jersey:
+            time_gap = clips[i + 1].get("startTime", 0) - clips[i - 1].get("endTime", 0)
+            if time_gap <= 30:
+                clip["jerseyNumberSeen"] = target_jersey
+                clip["jerseySmoothed"] = True
+
+    return clips
+
+
+def _classify_error_type(message: str) -> str:
+    """Classify error into frontend-friendly type."""
+    msg = message.lower()
+    if "download" in msg or "youtube" in msg or "yt-dlp" in msg or "403" in msg or "sign in" in msg:
+        return "download_blocked"
+    if "timeout" in msg or "timed out" in msg or "deadline" in msg:
+        return "timeout"
+    if "detection" in msg or "ocr" in msg or "jersey" in msg or "model" in msg:
+        return "detection_failed"
+    return "detection_failed"
+
+
 def _error_response(
     message: str,
     elapsed: float,
     layer_timings: dict | None = None,
+    error_type: str | None = None,
 ) -> dict:
-    return {
+    cookie_warning = _check_cookie_warning()
+    result: dict = {
         "clips": [],
         "layerUsed": "none",
+        "error_type": error_type or _classify_error_type(message),
         "elapsed": round(elapsed, 1),
         "videoDuration": 0,
         "framesProcessed": 0,
@@ -4026,3 +4108,6 @@ def _error_response(
         },
         "error": message,
     }
+    if cookie_warning:
+        result["cookies_warning"] = cookie_warning
+    return result

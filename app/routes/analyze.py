@@ -8,6 +8,10 @@
 # Client disconnect detection: when the client drops the connection,
 # the cancel_event is set to signal the pipeline to abort. This prevents
 # zombie pipeline threads from holding the lock and blocking new requests.
+#
+# POST /analyze-async + GET /analyze-jobs/{job_id} — async polling pattern
+# for clients that hit serverless timeouts (Vercel Hobby = 60s). Uses the
+# same _PIPELINE_LOCK so still only 1 pipeline runs at a time.
 
 from __future__ import annotations
 
@@ -16,9 +20,10 @@ import json
 import logging
 import threading
 import time
+import uuid
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
@@ -32,6 +37,10 @@ _KEEPALIVE_INTERVAL = 15
 
 # Ensure only 1 pipeline runs at a time (thread-safe, unlike asyncio.Semaphore)
 _PIPELINE_LOCK = threading.Lock()
+
+# In-memory async job store for /analyze-async polling
+_jobs: dict[str, dict] = {}
+_JOB_TTL_SECONDS = 1800  # reap finished jobs after 30 min
 
 
 @router.post("/analyze")
@@ -172,3 +181,146 @@ async def analyze(
             "Cache-Control": "no-cache",
         },
     )
+
+
+# ── Async polling endpoints ────────────────────────────────────────────────
+
+def _reap_stale_jobs() -> None:
+    """Drop finished jobs older than _JOB_TTL_SECONDS to bound memory."""
+    now = time.time()
+    stale = [
+        jid for jid, job in _jobs.items()
+        if (now - job.get("created", now)) > _JOB_TTL_SECONDS
+    ]
+    for jid in stale:
+        _jobs.pop(jid, None)
+
+
+def _run_analyze_job_in_thread(job_id: str, pipeline_params: dict) -> None:
+    """Background worker for /analyze-async. Mirrors the same lock+thread pattern as /analyze."""
+    job = _jobs.get(job_id)
+    if not job:
+        return
+
+    cancel_event = job["cancel_event"]
+    started_at = time.perf_counter()
+
+    job["status"] = "queued"
+    job["message"] = "Waiting for pipeline lock"
+
+    # Wait up to 5 minutes for the lock — long enough that a previous job finishes
+    acquired = _PIPELINE_LOCK.acquire(timeout=300)
+    if not acquired:
+        job["status"] = "failed"
+        job["error"] = "Server busy — another analysis is in progress"
+        job["progress"] = 100
+        return
+    if cancel_event.is_set():
+        _PIPELINE_LOCK.release()
+        job["status"] = "failed"
+        job["error"] = "Cancelled before start"
+        job["progress"] = 100
+        return
+
+    try:
+        job["status"] = "processing"
+        job["progress"] = 10
+        job["message"] = "Downloading video and loading models"
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from app.services.analyze_pipeline import run_analyze_pipeline
+            result = loop.run_until_complete(
+                run_analyze_pipeline(**pipeline_params, cancel_event=cancel_event)
+            )
+            elapsed_s = round(time.perf_counter() - started_at, 2)
+            clip_count = len(result.get("clips", []))
+            job["status"] = "complete"
+            job["progress"] = 100
+            job["result"] = result
+            job["message"] = f"Found {clip_count} highlights in {elapsed_s}s"
+            LOGGER.info("analyze-async.complete job_id=%s clips=%d elapsed=%.2fs",
+                        job_id, clip_count, elapsed_s)
+        except Exception as exc:
+            LOGGER.exception("analyze-async.failed job_id=%s", job_id)
+            job["status"] = "failed"
+            job["progress"] = 100
+            job["error"] = str(exc)[:300]
+            job["message"] = f"Analysis failed: {str(exc)[:200]}"
+        finally:
+            loop.close()
+    finally:
+        _PIPELINE_LOCK.release()
+
+
+@router.post("/analyze-async")
+async def analyze_async(
+    request: Request,
+    analyze_request: AnalyzeRequest,
+) -> JSONResponse:
+    """Start an analyze job in the background. Returns job_id immediately for polling."""
+    if not getattr(request.app.state, "detector_ready", False):
+        detail = getattr(request.app.state, "startup_error", "Detector warm-up not complete.")
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"Detection service is not ready: {detail}"},
+        )
+
+    _reap_stale_jobs()
+
+    pipeline_params = dict(
+        video_url=analyze_request.video_url,
+        video_path=analyze_request.video_path,
+        jersey_number=analyze_request.jersey_number,
+        jersey_color=analyze_request.jersey_color,
+        sport=analyze_request.sport,
+        position=analyze_request.position,
+        time_range_start=analyze_request.time_range_start,
+        time_range_end=analyze_request.time_range_end,
+        enable_audio=analyze_request.enable_audio,
+        enable_tracking=analyze_request.enable_tracking,
+        enable_pose=analyze_request.enable_pose,
+        quality_mode=analyze_request.quality_mode,
+    )
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "Job queued",
+        "result": None,
+        "error": None,
+        "created": time.time(),
+        "cancel_event": threading.Event(),
+    }
+
+    # Start a real background thread (not BackgroundTasks) so the response returns immediately
+    thread = threading.Thread(
+        target=_run_analyze_job_in_thread,
+        args=(job_id, pipeline_params),
+        daemon=True,
+        name=f"analyze-job-{job_id[:8]}",
+    )
+    thread.start()
+
+    LOGGER.info("analyze-async.queued job_id=%s sport=%s jersey=%s",
+                job_id, analyze_request.sport, analyze_request.jersey_number)
+    return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+
+@router.get("/analyze-jobs/{job_id}")
+async def get_analyze_job(job_id: str) -> JSONResponse:
+    """Poll an analyze job. Returns status, progress, and result (when complete)."""
+    if job_id not in _jobs:
+        return JSONResponse(status_code=404, content={"status": "not_found", "job_id": job_id})
+    job = _jobs[job_id]
+    return JSONResponse(content={
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "message": job.get("message", ""),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    })

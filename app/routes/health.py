@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.17.0",
+        "version": "v8.18.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.17.0",
+        "version": "v8.18.0",
     })
 
 
@@ -353,7 +353,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.17.0",
+            "version": "v8.18.0",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
@@ -921,7 +921,7 @@ async def test_basketball(request: Request) -> Any:
     if not getattr(request.app.state, "detector_ready", False):
         return JSONResponse(status_code=503, content={
             "error": "Detector not ready",
-            "version": "v8.17.0",
+            "version": "v8.18.0",
         })
 
     started_at = time.perf_counter()
@@ -979,3 +979,82 @@ async def test_basketball(request: Request) -> Any:
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
+
+
+# ── Test endpoints for Decodo residential proxy ─────────────────────────────
+
+@router.get("/test-decodo")
+async def test_decodo() -> JSONResponse:
+    """Test Decodo proxy connectivity — returns IP info."""
+    import subprocess
+    from urllib.parse import quote
+
+    user = os.getenv("DECODO_USERNAME", "").strip()
+    passwd = os.getenv("DECODO_PASSWORD", "").strip()
+
+    if not user or not passwd:
+        return JSONResponse(content={"success": False, "error": "DECODO_USERNAME or DECODO_PASSWORD not set"})
+
+    encoded_user = quote(user, safe="")
+    encoded_passwd = quote(passwd, safe="")
+    proxy_url = f"http://{encoded_user}:{encoded_passwd}@gate.decodo.com:10001"
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--proxy", proxy_url, "--max-time", "15", "https://ipinfo.io/json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode != 0:
+            return JSONResponse(content={"success": False, "error": result.stderr[:200]})
+
+        import json as _json
+        data = _json.loads(result.stdout)
+        return JSONResponse(content={
+            "success": True,
+            "ip": data.get("ip"),
+            "org": data.get("org"),
+            "country": data.get("country"),
+            "region": data.get("region"),
+            "city": data.get("city"),
+        })
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)[:200]})
+
+
+@router.get("/test-decodo-youtube")
+async def test_decodo_youtube() -> JSONResponse:
+    """Test yt-dlp through Decodo proxy — tries to get video title."""
+    import subprocess
+    from urllib.parse import quote
+
+    user = os.getenv("DECODO_USERNAME", "").strip()
+    passwd = os.getenv("DECODO_PASSWORD", "").strip()
+
+    if not user or not passwd:
+        return JSONResponse(content={"success": False, "error": "DECODO_USERNAME or DECODO_PASSWORD not set"})
+
+    encoded_user = quote(user, safe="")
+    encoded_passwd = quote(passwd, safe="")
+    proxy_url = f"http://{encoded_user}:{encoded_passwd}@gate.decodo.com:10001"
+
+    try:
+        result = subprocess.run(
+            [
+                "python3", "-m", "yt_dlp",
+                "--proxy", proxy_url,
+                "--skip-download",
+                "--print", "title",
+                "--no-warnings",
+                "--socket-timeout", "30",
+                "https://www.youtube.com/watch?v=x0bZnfVHDx4",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        title = result.stdout.strip()
+        return JSONResponse(content={
+            "success": result.returncode == 0,
+            "title": title[:100] if title else None,
+            "stderr": result.stderr[:300] if result.returncode != 0 else None,
+        })
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)[:200]})

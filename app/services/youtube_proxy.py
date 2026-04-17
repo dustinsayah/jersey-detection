@@ -1423,49 +1423,39 @@ def download_youtube_sync(
         return None
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
-    # Order (Apr 2026):
-    #   W0-W0b. WARP + android_vr/web (FREE — 720p via DASH, no cookies needed)
-    #   W0g-h.  WARP + tv_embedded/mweb (FREE — less bot detection, PO token enhanced)
-    #   CW0.    WARP + Cookies (FREE — auth fallback for bot detection)
-    #   W0e-W2. WARP pylib/muxed/SOCKS fallbacks
-    #   C0-C1.  Cookie-only, no proxy (datacenter, 360p last resort)
-    #   0-0c.   Decodo residential proxy (PAID)
+    # Order (Apr 2026 — Decodo first, residential IPs most trusted):
+    #   0-0c.   Decodo residential proxy (PAID — most reliable, try first)
+    #   C0-C1.  Cookie-only, no proxy (datacenter IP, auth helps)
+    #   W0-W2.  WARP fallbacks (FREE — datacenter VPN, often blocked)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # WARP + android_vr: FREE — gets 720p DASH, no PO tokens needed
-        ("warp_http_dash_ejs", _s_warp_http_dash),
-        ("warp_http_dash_web", _s_warp_http_dash_web),
-        # WARP + web_creator/web_embedded: less bot detection (Apr 2026)
-        ("warp_web_creator", _s_warp_web_creator),
-        ("warp_web_embedded", _s_warp_web_embedded),
-        # WARP + tv_embedded/mweb: FREE — less bot detection, PO token enhanced
-        ("warp_http_dash_tv_embedded", _s_warp_http_dash_tv_embedded),
-        ("warp_http_dash_mweb", _s_warp_http_dash_mweb),
-        # WARP + Cookies: FREE — auth fallback if android_vr gets bot-detected
-        ("warp_cookies_dash_web", _s_warp_cookies_dash),
-        ("warp_cookies_web_creator", _s_warp_cookies_web_creator),
-        # WARP pylib: FREE — no EJS needed
-        ("warp_http_dash_pylib", _s_warp_http_dash_pylib),
-        ("warp_http_dash_pylib_web", _s_warp_http_dash_pylib_web),
-        # WARP muxed: FREE — 480p fallback
-        ("warp_http_muxed", _s_warp_http_muxed),
-        ("warp_http_muxed_web", _s_warp_http_muxed_web),
-        # WARP SOCKS5: fallback if HTTP proxy has issues
-        ("warp_socks_dash", _s_warp_socks_dash),
-        ("warp_socks_muxed", _s_warp_socks_muxed),
-        # WARP + Cookies muxed: auth + muxed last WARP attempt
-        ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
-        # Cookie-only (no WARP) — datacenter IP
-        ("cookies_tv_downgraded", _s_cookies_tv_downgraded),
-        ("cookies_web_creator", _s_cookies_web_creator),
-        ("cookies_dash_ejs", _s_cookies_dash),
-        ("cookies_muxed_pylib", _s_cookies_muxed),
-        # Decodo residential proxy — paid but reliable
-        ("decodo_dash_sections", _s0_decodo_sections),
+        # Decodo residential proxy — PAID, most reliable, try FIRST
         ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
+        ("decodo_dash_sections", _s0_decodo_sections),
         ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
         ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
         ("decodo_dash_full_trim", _s0b_decodo_full_trim),
+        # Cookie-only (no proxy) — datacenter IP but auth tokens help
+        ("cookies_web_creator", _s_cookies_web_creator),
+        ("cookies_dash_ejs", _s_cookies_dash),
+        ("cookies_muxed_pylib", _s_cookies_muxed),
+        ("cookies_tv_downgraded", _s_cookies_tv_downgraded),
+        # WARP fallbacks — FREE but often blocked by YouTube
+        ("warp_http_dash_ejs", _s_warp_http_dash),
+        ("warp_http_dash_web", _s_warp_http_dash_web),
+        ("warp_web_creator", _s_warp_web_creator),
+        ("warp_web_embedded", _s_warp_web_embedded),
+        ("warp_http_dash_tv_embedded", _s_warp_http_dash_tv_embedded),
+        ("warp_http_dash_mweb", _s_warp_http_dash_mweb),
+        ("warp_cookies_dash_web", _s_warp_cookies_dash),
+        ("warp_cookies_web_creator", _s_warp_cookies_web_creator),
+        ("warp_http_dash_pylib", _s_warp_http_dash_pylib),
+        ("warp_http_dash_pylib_web", _s_warp_http_dash_pylib_web),
+        ("warp_http_muxed", _s_warp_http_muxed),
+        ("warp_http_muxed_web", _s_warp_http_muxed_web),
+        ("warp_socks_dash", _s_warp_socks_dash),
+        ("warp_socks_muxed", _s_warp_socks_muxed),
+        ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
         ("render_server_early", _s_render_early),
         ("android_vr_dash_ejs", _s1_android_vr_dash),
         ("android_vr_dash_proxy", _s2_android_vr_proxy),

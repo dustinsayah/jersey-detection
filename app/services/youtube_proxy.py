@@ -1,4 +1,4 @@
-# YouTube download proxy — 18-strategy robust download chain
+# YouTube download proxy — 34-strategy robust download chain
 #
 # Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
 # limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
@@ -290,6 +290,7 @@ def _yt_dlp_download(
     cmd = [
         yt_dlp_binary,
         "--no-check-certificate",
+        "--force-ipv4",
         "--extractor-args", f"youtube:player_client={client}" + (";player_skip=webpage" if client in ("android_vr", "android", "android_music") else ""),
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -reconnect_on_network_error 1",
         "--format", fmt,
@@ -580,6 +581,12 @@ def download_youtube_sync(
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
     global _warp_consecutive_failures, _warp_blocked_until, _last_successful_strategy
+
+    # Reset stale WARP block from previous request — allow fresh attempt
+    if _warp_blocked_until > 0 and time.time() >= _warp_blocked_until:
+        LOGGER.info("WARP block expired — resetting for fresh attempt")
+        _warp_consecutive_failures = 0
+        _warp_blocked_until = 0.0
 
     # CRITICAL: Clear any stale proxy env vars from previous requests/strategies.
     # _yt_dlp_python_download sets os.environ["HTTP_PROXY"] for ffmpeg, and if the
@@ -1125,12 +1132,18 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="warp_socks_muxed")
         return None
 
+    def _clear_proxy_env() -> None:
+        """Clear proxy env vars so httpx/requests don't route through stale proxies."""
+        for _pk in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(_pk, None)
+
     def _s_render_early() -> DownloadResult | None:
         """Render server early — used when Decodo is not configured."""
         if decodo_proxy:
             return None  # Decodo is configured, skip early render server
         if not RENDER_SERVER_URL:
             return None
+        _clear_proxy_env()
         _render_timeout_early = 300 if _is_long_video else 120
         with httpx.Client(timeout=httpx.Timeout(_render_timeout_early)) as _rs_client:
             if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary,
@@ -1167,6 +1180,7 @@ def download_youtube_sync(
         """Render server proxy — pre-trimmed video."""
         if not RENDER_SERVER_URL:
             return None
+        _clear_proxy_env()
         _render_timeout = 300 if _is_long_video else 120
         with httpx.Client(timeout=httpx.Timeout(_render_timeout)) as client:
             if _render_server_download(url, output_path, start_time, end_time, ffmpeg_binary, client, "Strategy 3"):
@@ -1214,6 +1228,7 @@ def download_youtube_sync(
         """Render server /extract-frames (last resort)."""
         if not RENDER_SERVER_URL:
             return None
+        _clear_proxy_env()
         with httpx.Client(timeout=httpx.Timeout(120)) as client:
             payload: dict = {"youtubeUrl": url}
             if start_time > 0:
@@ -1243,6 +1258,170 @@ def download_youtube_sync(
                                 return _make_result(output_path, sectioned=has_time_range, strategy="render_extract_frames_url")
         return None
 
+    # ── New strategies (Apr 2026) ─────────────────────────────────────────
+
+    def _s_warp_web_creator() -> DownloadResult | None:
+        """WARP HTTP + web_creator client — works for many videos, less bot detection."""
+        if not _warp_available:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web_creator", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy WC (WARP HTTP DASH web_creator)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_warp_http, skip_cookies=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                h = _get_video_height()
+                LOGGER.info("WC: downloaded %dp (web_creator)", h)
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_web_creator")
+        return None
+
+    def _s_warp_web_embedded() -> DownloadResult | None:
+        """WARP HTTP + web_embedded client — fallback for android_vr issues."""
+        if not _warp_available:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web_embedded", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy WE (WARP HTTP DASH web_embedded)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_warp_http, skip_cookies=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                h = _get_video_height()
+                LOGGER.info("WE: downloaded %dp (web_embedded)", h)
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_web_embedded")
+        return None
+
+    def _s_cookies_tv_downgraded() -> DownloadResult | None:
+        """Cookie-authenticated tv_downgraded — new default for auth'd free users."""
+        if not _has_cookies:
+            return None
+        _clear_proxy_env()
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="tv_downgraded", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy CTD (Cookies tv_downgraded)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="cookies_tv_downgraded")
+        return None
+
+    def _s_cookies_web_creator() -> DownloadResult | None:
+        """Cookie-authenticated web_creator — works with Premium accounts."""
+        if not _has_cookies:
+            return None
+        _clear_proxy_env()
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web_creator", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy CWC (Cookies web_creator)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="cookies_web_creator")
+        return None
+
+    def _s_warp_cookies_web_creator() -> DownloadResult | None:
+        """WARP + cookies + web_creator — combined auth with residential IP."""
+        if not _warp_available or not _has_cookies:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web_creator", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy WCWC (WARP+cookies web_creator)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_warp_http, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_cookies_web_creator")
+        return None
+
+    def _s_piped_api() -> DownloadResult | None:
+        """Download via Piped API — get direct stream URL from Piped, download with yt-dlp.
+
+        Piped instances proxy YouTube streams, bypassing bot detection.
+        As of Apr 2026, api.piped.private.coffee is the most reliable instance.
+        """
+        _clear_proxy_env()
+        video_id = extract_video_id(url)
+        if not video_id:
+            return None
+        piped_instances = [
+            "api.piped.private.coffee",
+            "pipedapi.kavin.rocks",
+            "pipedapi.adminforge.de",
+        ]
+        for instance in piped_instances:
+            try:
+                api_url = f"https://{instance}/streams/{video_id}"
+                LOGGER.info("Piped API: trying %s", instance)
+                with httpx.Client(timeout=httpx.Timeout(15)) as piped_client:
+                    resp = piped_client.get(api_url)
+                    if resp.status_code != 200:
+                        LOGGER.info("Piped API %s: HTTP %d", instance, resp.status_code)
+                        continue
+                    data = resp.json()
+                    # Find a suitable video stream (prefer 720p)
+                    video_streams = data.get("videoStreams", [])
+                    best_stream = None
+                    for stream in video_streams:
+                        quality = stream.get("quality", "")
+                        video_only = stream.get("videoOnly", True)
+                        stream_url = stream.get("url", "")
+                        if not stream_url:
+                            continue
+                        if "720" in quality and not video_only:
+                            best_stream = stream_url
+                            break
+                        if "480" in quality and not video_only:
+                            best_stream = stream_url
+                        elif not video_only and not best_stream:
+                            best_stream = stream_url
+                    if not best_stream:
+                        # Try format streams (muxed)
+                        format_streams = data.get("formatStreams", [])
+                        for fs in format_streams:
+                            stream_url = fs.get("url", "")
+                            if stream_url:
+                                best_stream = stream_url
+                                break
+                    if best_stream:
+                        LOGGER.info("Piped API: found stream via %s, downloading...", instance)
+                        # Download the stream directly with httpx
+                        with httpx.Client(timeout=httpx.Timeout(300), follow_redirects=True) as dl_client:
+                            dl_resp = dl_client.get(best_stream)
+                            if dl_resp.status_code == 200 and len(dl_resp.content) > _MIN_FILE_SIZE:
+                                if output_path.exists():
+                                    output_path.unlink()
+                                output_path.write_bytes(dl_resp.content)
+                                if _file_valid():
+                                    # Trim if needed
+                                    if has_time_range:
+                                        _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+                                    if _file_valid():
+                                        LOGGER.info("Piped API: SUCCESS via %s (%dMB)",
+                                                    instance, output_path.stat().st_size // 1024 // 1024)
+                                        return _make_result(output_path, sectioned=False, strategy=f"piped_api_{instance}")
+            except Exception as exc:
+                LOGGER.info("Piped API %s: %s: %s", instance, type(exc).__name__, str(exc)[:100])
+                continue
+        return None
+
+    def _s_default_client() -> DownloadResult | None:
+        """yt-dlp default client selection — let yt-dlp pick the best client."""
+        _clear_proxy_env()
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="default", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy DEF (default client, no proxy)",
+                            format_override=_MUXED_FORMAT, use_ejs=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="default_client")
+        return None
+
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
     #   W0-W0b. WARP + android_vr/web (FREE — 720p via DASH, no cookies needed)
@@ -1256,11 +1435,15 @@ def download_youtube_sync(
         # WARP + android_vr: FREE — gets 720p DASH, no PO tokens needed
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),
+        # WARP + web_creator/web_embedded: less bot detection (Apr 2026)
+        ("warp_web_creator", _s_warp_web_creator),
+        ("warp_web_embedded", _s_warp_web_embedded),
         # WARP + tv_embedded/mweb: FREE — less bot detection, PO token enhanced
         ("warp_http_dash_tv_embedded", _s_warp_http_dash_tv_embedded),
         ("warp_http_dash_mweb", _s_warp_http_dash_mweb),
         # WARP + Cookies: FREE — auth fallback if android_vr gets bot-detected
         ("warp_cookies_dash_web", _s_warp_cookies_dash),
+        ("warp_cookies_web_creator", _s_warp_cookies_web_creator),
         # WARP pylib: FREE — no EJS needed
         ("warp_http_dash_pylib", _s_warp_http_dash_pylib),
         ("warp_http_dash_pylib_web", _s_warp_http_dash_pylib_web),
@@ -1272,7 +1455,9 @@ def download_youtube_sync(
         ("warp_socks_muxed", _s_warp_socks_muxed),
         # WARP + Cookies muxed: auth + muxed last WARP attempt
         ("warp_cookies_muxed_web", _s_warp_cookies_muxed),
-        # Cookie-only (no WARP) — datacenter IP, usually 360p
+        # Cookie-only (no WARP) — datacenter IP
+        ("cookies_tv_downgraded", _s_cookies_tv_downgraded),
+        ("cookies_web_creator", _s_cookies_web_creator),
         ("cookies_dash_ejs", _s_cookies_dash),
         ("cookies_muxed_pylib", _s_cookies_muxed),
         # Decodo residential proxy — paid but reliable
@@ -1288,6 +1473,10 @@ def download_youtube_sync(
         ("android_muxed_ejs", _s4_android_muxed_ejs),
         ("python_lib_full_trim", _s5_python_lib),
         ("android_muxed_bare", _s6_android_bare),
+        # Piped API: alternative YouTube frontend (Apr 2026)
+        ("piped_api", _s_piped_api),
+        # Default client: let yt-dlp decide best client
+        ("default_client", _s_default_client),
         ("render_extract_frames", _s7_render_extract),
     ]
 

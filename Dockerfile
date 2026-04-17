@@ -21,7 +21,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsndfile1 \
     curl unzip git \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 LTS — required for bgutil PO Token server
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version && npm --version
 
 # deno is needed by yt-dlp for YouTube JS extraction
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
@@ -71,24 +78,16 @@ RUN python /app/scripts/bootstrap_public_reader.py
 RUN pip install --upgrade --pre yt-dlp \
     || pip install --upgrade yt-dlp
 
-# PO Token provider: bgutil server generates Proof-of-Origin tokens for yt-dlp.
-# Required for web/mweb/android clients to bypass bot detection.
-# Server runs on port 4416, yt-dlp-get-pot plugin connects automatically.
-RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider \
-    || echo "PO Token plugin install failed (non-fatal)"
-
-# Install Node.js for bgutil PO Token server
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/* \
-    || echo "Node.js install failed (non-fatal, PO tokens disabled)"
-
-# Clone and build bgutil PO Token server
-RUN git clone --single-branch --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-pot \
-    && cd /app/bgutil-pot/server \
-    && npm ci \
-    && npx tsc \
-    || echo "bgutil-pot build failed (non-fatal, PO tokens disabled)"
+# bgutil PO Token provider — generates YouTube Proof-of-Origin tokens
+# Required for web/mweb clients to bypass bot detection.
+# Server runs as background process (start.sh starts it on port 4416).
+# Plugin auto-intercepts yt-dlp web client requests to add PO tokens.
+RUN git clone --depth=1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-pot && \
+    cd /app/bgutil-pot/server && npm ci --omit=dev && npx tsc && \
+    echo "bgutil PO Token server built successfully" || \
+    echo "bgutil PO Token build failed (non-fatal — WARP strategies still work)"
+RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider || \
+    echo "PO Token pip packages failed (non-fatal)"
 
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
 # This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).
@@ -100,7 +99,7 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
 RUN mkdir -p /app/app/model
 
 # Cache bust for code changes (update this on each deploy)
-ARG CACHE_BUST=v8.14.3
+ARG CACHE_BUST=v8.16.0
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

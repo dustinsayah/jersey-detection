@@ -1015,6 +1015,23 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_tv_embedded")
         return None
 
+    def _s_warp_http_dash_mweb() -> DownloadResult | None:
+        """WARP HTTP + DASH + mweb client — mobile web, uses PO tokens from bgutil."""
+        if not _warp_available:
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="mweb", start_time=start_time, end_time=end_time,
+                            timeout=_strategy_timeout,
+                            strategy_name="Strategy W0h (WARP HTTP DASH mweb+PO)",
+                            format_override=_DASH_H264_FORMAT, use_ejs=True,
+                            proxy=_warp_http, skip_cookies=True,
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                h = _get_video_height()
+                LOGGER.info("W0h: downloaded %dp (mweb+PO)", h)
+                return _make_result(output_path, sectioned=has_time_range, strategy="warp_http_dash_mweb")
+        return None
+
     def _s_warp_http_dash_pylib() -> DownloadResult | None:
         """WARP HTTP + DASH via Python library — 720p, no EJS needed."""
         if not _warp_available:
@@ -1228,18 +1245,20 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
-    #   W0-W0b. WARP + android_vr (FREE — 720p via DASH, no cookies needed)
+    #   W0-W0b. WARP + android_vr/web (FREE — 720p via DASH, no cookies needed)
+    #   W0g-h.  WARP + tv_embedded/mweb (FREE — less bot detection, PO token enhanced)
     #   CW0.    WARP + Cookies (FREE — auth fallback for bot detection)
     #   W0e-W2. WARP pylib/muxed/SOCKS fallbacks
     #   C0-C1.  Cookie-only, no proxy (datacenter, 360p last resort)
     #   0-0c.   Decodo residential proxy (PAID)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # WARP + android_vr: FREE — gets 720p DASH, no cookies needed
+        # WARP + android_vr: FREE — gets 720p DASH, no PO tokens needed
         ("warp_http_dash_ejs", _s_warp_http_dash),
         ("warp_http_dash_web", _s_warp_http_dash_web),
-        # WARP + tv_embedded: FREE — less bot detection than web/android_vr
+        # WARP + tv_embedded/mweb: FREE — less bot detection, PO token enhanced
         ("warp_http_dash_tv_embedded", _s_warp_http_dash_tv_embedded),
+        ("warp_http_dash_mweb", _s_warp_http_dash_mweb),
         # WARP + Cookies: FREE — auth fallback if android_vr gets bot-detected
         ("warp_cookies_dash_web", _s_warp_cookies_dash),
         # WARP pylib: FREE — no EJS needed

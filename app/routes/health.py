@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.15.0",
+        "version": "v8.16.0",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.15.0",
+        "version": "v8.16.0",
     })
 
 
@@ -331,6 +331,16 @@ def health(request: Request) -> JSONResponse:
                 pass
             break
 
+    # Check PO Token server status
+    po_token_status = "not_installed"
+    try:
+        import socket as _sock
+        with _sock.create_connection(("127.0.0.1", 4416), timeout=2):
+            po_token_status = "running"
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        if Path("/app/bgutil-pot/server/build/main.js").exists():
+            po_token_status = "installed_not_running"
+
     # Memory usage
     memory_rss_mb = 0
     try:
@@ -343,11 +353,12 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.15.0",
+            "version": "v8.16.0",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
             "warp_pool_size": warp_pool_size,
+            "po_token_server": po_token_status,
             "cookie_health": cookie_health,
             "memory_rss_mb": memory_rss_mb,
         },
@@ -829,6 +840,69 @@ async def upload_cookies(request: Request) -> JSONResponse:
     })
 
 
+@router.get("/cookie-status")
+def cookie_status() -> JSONResponse:
+    """Dashboard-friendly cookie status for monitoring."""
+    import time as _time
+
+    accounts: dict = {}
+    cookie_paths = [
+        ("primary", "/app/app/youtube_cookies.txt"),
+        ("primary_alt", "/app/youtube_cookies.txt"),
+        ("data", "/data/youtube_cookies.txt"),
+    ]
+
+    for label, path in cookie_paths:
+        if not Path(path).is_file():
+            continue
+        try:
+            stat = Path(path).stat()
+            age_hours = (_time.time() - stat.st_mtime) / 3600
+            days_remaining = max(0, 3.0 - age_hours / 24)
+            content = Path(path).read_text(errors="replace")
+            validation = _validate_cookie_content(content)
+
+            if days_remaining < 0.5:
+                status = "critical"
+            elif days_remaining < 1.5:
+                status = "warning"
+            else:
+                status = "healthy"
+
+            if not validation["has_auth_tokens"]:
+                status = "critical"
+
+            accounts[label] = {
+                "age_hours": round(age_hours, 1),
+                "days_remaining": round(days_remaining, 1),
+                "status": status,
+                "has_auth_tokens": validation["has_auth_tokens"],
+                "path": path,
+            }
+        except Exception:
+            accounts[label] = {"status": "error", "path": path}
+
+    if not accounts:
+        return JSONResponse(status_code=200, content={
+            "status": "no_cookies",
+            "accounts": {},
+            "action": "Upload cookies via POST /upload-cookies",
+        })
+
+    overall = "healthy"
+    for acc in accounts.values():
+        if acc.get("status") == "critical":
+            overall = "critical"
+            break
+        if acc.get("status") == "warning":
+            overall = "warning"
+
+    return JSONResponse(status_code=200, content={
+        "status": overall,
+        "accounts": accounts,
+    })
+
+
 @router.get("/test-basketball")
 async def test_basketball(request: Request) -> Any:
     """Test endpoint — runs full detection on a known-good public basketball game.
@@ -847,7 +921,7 @@ async def test_basketball(request: Request) -> Any:
     if not getattr(request.app.state, "detector_ready", False):
         return JSONResponse(status_code=503, content={
             "error": "Detector not ready",
-            "version": "v8.15.0",
+            "version": "v8.16.0",
         })
 
     started_at = time.perf_counter()

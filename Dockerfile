@@ -83,7 +83,7 @@ RUN pip install --upgrade --pre yt-dlp \
 # Server runs as background process (start.sh starts it on port 4416).
 # Plugin auto-intercepts yt-dlp web client requests to add PO tokens.
 RUN git clone --depth=1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-pot && \
-    cd /app/bgutil-pot/server && npm ci --omit=dev && npx tsc && \
+    cd /app/bgutil-pot/server && npm ci && npx -p typescript tsc && \
     echo "bgutil PO Token server built successfully" || \
     echo "bgutil PO Token build failed (non-fatal — WARP strategies still work)"
 RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider || \
@@ -99,7 +99,7 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
 RUN mkdir -p /app/app/model
 
 # Cache bust for code changes (update this on each deploy)
-ARG CACHE_BUST=v8.16.0
+ARG CACHE_BUST=v8.16.1
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

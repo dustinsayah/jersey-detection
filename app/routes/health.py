@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.18.0",
+        "version": "v8.18.1",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.18.0",
+        "version": "v8.18.1",
     })
 
 
@@ -353,7 +353,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.18.0",
+            "version": "v8.18.1",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
@@ -921,7 +921,7 @@ async def test_basketball(request: Request) -> Any:
     if not getattr(request.app.state, "detector_ready", False):
         return JSONResponse(status_code=503, content={
             "error": "Detector not ready",
-            "version": "v8.18.0",
+            "version": "v8.18.1",
         })
 
     started_at = time.perf_counter()
@@ -1038,23 +1038,37 @@ async def test_decodo_youtube() -> JSONResponse:
     proxy_url = f"http://{encoded_user}:{encoded_passwd}@gate.decodo.com:10001"
 
     try:
-        result = subprocess.run(
-            [
-                "python3", "-m", "yt_dlp",
-                "--proxy", proxy_url,
-                "--skip-download",
-                "--print", "title",
-                "--no-warnings",
-                "--socket-timeout", "30",
-                "https://www.youtube.com/watch?v=x0bZnfVHDx4",
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-        title = result.stdout.strip()
+        # Try web client first (works for school sports), then android_vr fallback
+        clients_to_try = ["web", "web_creator", "android_vr"]
+        for client in clients_to_try:
+            result = subprocess.run(
+                [
+                    "python3", "-m", "yt_dlp",
+                    "--proxy", proxy_url,
+                    "--skip-download",
+                    "--print", "title",
+                    "--no-warnings",
+                    "--geo-bypass",
+                    "--force-ipv4",
+                    "--socket-timeout", "30",
+                    "--extractor-args", f"youtube:player_client={client}",
+                    "https://www.youtube.com/watch?v=x0bZnfVHDx4",
+                ],
+                capture_output=True, text=True, timeout=45,
+            )
+            title = result.stdout.strip()
+            if result.returncode == 0 and title:
+                return JSONResponse(content={
+                    "success": True,
+                    "title": title[:100],
+                    "client_used": client,
+                })
+        # All clients failed
         return JSONResponse(content={
-            "success": result.returncode == 0,
-            "title": title[:100] if title else None,
-            "stderr": result.stderr[:300] if result.returncode != 0 else None,
+            "success": False,
+            "title": None,
+            "stderr": result.stderr[:300] if result else "No result",
+            "clients_tried": clients_to_try,
         })
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)[:200]})

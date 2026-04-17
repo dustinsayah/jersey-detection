@@ -291,6 +291,7 @@ def _yt_dlp_download(
         yt_dlp_binary,
         "--no-check-certificate",
         "--force-ipv4",
+        "--geo-bypass",
         "--extractor-args", f"youtube:player_client={client}" + (";player_skip=webpage" if client in ("android_vr", "android", "android_music") else ""),
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -reconnect_on_network_error 1",
         "--format", fmt,
@@ -939,6 +940,67 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=False, strategy="decodo_muxed_pylib_full_trim")
         return None
 
+    # ── Decodo + web client strategies (Apr 2026) ─────────────────────
+    # android_vr returns "This video is not available" for some school sports
+    # videos. web/web_creator clients work better for these.
+
+    def _s0d_decodo_web() -> DownloadResult | None:
+        """Decodo + web client — for videos android_vr can't play."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0d (Decodo web+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_web_ejs")
+        return None
+
+    def _s0e_decodo_web_creator() -> DownloadResult | None:
+        """Decodo + web_creator client — less bot detection."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="web_creator", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0e (Decodo web_creator+EJS)",
+                            format_override=_DASH_H264_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_web_creator_ejs")
+        return None
+
+    def _s0f_decodo_mweb() -> DownloadResult | None:
+        """Decodo + mweb client — mobile web, different bot fingerprint."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_download(url, output_path, yt_dlp_binary, ffmpeg_binary,
+                            client="mweb", start_time=start_time, end_time=end_time,
+                            timeout=_decodo_sections_timeout,
+                            strategy_name="Strategy 0f (Decodo mweb+EJS)",
+                            format_override=_MUXED_FORMAT,
+                            use_ejs=True, proxy=decodo_proxy, errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_mweb_ejs")
+        return None
+
+    def _s0g_decodo_web_pylib() -> DownloadResult | None:
+        """Decodo + web client via Python lib (no subprocess)."""
+        if not (decodo_proxy and _decodo_healthy):
+            return None
+        if _yt_dlp_python_download(url, output_path, client="web",
+                                   start_time=start_time, end_time=end_time,
+                                   strategy_name="Strategy 0g (Decodo web pylib)",
+                                   format_override=_MUXED_FORMAT,
+                                   proxy=decodo_proxy,
+                                   timeout=_decodo_sections_timeout,
+                                   errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="decodo_web_pylib")
+        return None
+
     # ── Cloudflare WARP strategies ─────────────────────────────────────
     # WARP routes through Cloudflare's consumer VPN network (millions of users),
     # so YouTube treats WARP IPs as residential — FREE 720p from datacenter.
@@ -1430,6 +1492,12 @@ def download_youtube_sync(
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
         # Decodo residential proxy — PAID, most reliable, try FIRST
+        # web/web_creator clients first (work for school sports videos)
+        ("decodo_web_ejs", _s0d_decodo_web),
+        ("decodo_web_creator_ejs", _s0e_decodo_web_creator),
+        ("decodo_web_pylib", _s0g_decodo_web_pylib),
+        ("decodo_mweb_ejs", _s0f_decodo_mweb),
+        # android_vr client fallback (higher quality but blocked for some videos)
         ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
         ("decodo_dash_sections", _s0_decodo_sections),
         ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),

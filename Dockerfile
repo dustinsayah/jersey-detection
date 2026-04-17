@@ -86,8 +86,11 @@ RUN git clone --depth=1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.
     cd /app/bgutil-pot/server && npm ci && npx -p typescript tsc && \
     echo "bgutil PO Token server built successfully" || \
     echo "bgutil PO Token build failed (non-fatal — WARP strategies still work)"
-RUN pip install --no-cache-dir yt-dlp-get-pot bgutil-ytdlp-pot-provider || \
-    echo "PO Token pip packages failed (non-fatal)"
+# NOTE: Do NOT install yt-dlp-get-pot — it's deprecated (archived Nov 2025)
+# and conflicts with yt-dlp's native PO Token Provider Framework (since 2025.05.22).
+# bgutil-ytdlp-pot-provider v1.0.0+ registers directly with the native framework.
+RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider || \
+    echo "PO Token pip package failed (non-fatal)"
 
 # Pre-cache EJS challenge solver script so yt-dlp doesn't download at runtime.
 # This is REQUIRED for YouTube n-challenge solving (unlocks 720p+ DASH formats).
@@ -99,7 +102,10 @@ RUN yt-dlp --remote-components ejs:github --extractor-args "youtube:player_clien
 RUN mkdir -p /app/app/model
 
 # Cache bust for code changes (update this on each deploy)
-ARG CACHE_BUST=v8.16.1
+# Uninstall deprecated yt-dlp-get-pot if leftover from Docker cache layers
+RUN pip uninstall -y yt-dlp-get-pot 2>/dev/null || true
+
+ARG CACHE_BUST=v8.16.2
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

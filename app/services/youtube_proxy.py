@@ -939,7 +939,7 @@ def download_youtube_sync(
     """
     LOGGER.info("youtube_proxy_sync called with URL: %s", url)
 
-    global _warp_consecutive_failures, _warp_blocked_until, _last_successful_strategy
+    global _warp_consecutive_failures, _warp_blocked_until, _last_successful_strategy, _decodo_auth_failed
 
     # Reset stale WARP block from previous request — allow fresh attempt
     if _warp_blocked_until > 0 and time.time() >= _warp_blocked_until:

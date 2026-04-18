@@ -1492,17 +1492,17 @@ def download_youtube_sync(
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
         # Decodo residential proxy — PAID, most reliable, try FIRST
-        # web/web_creator clients first (work for school sports videos)
+        # muxed_pylib_full_trim is the PROVEN winner — always try first
+        ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
+        ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
+        ("decodo_dash_sections", _s0_decodo_sections),
+        ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
+        ("decodo_dash_full_trim", _s0b_decodo_full_trim),
+        # web/web_creator clients (work for school sports videos)
         ("decodo_web_ejs", _s0d_decodo_web),
         ("decodo_web_creator_ejs", _s0e_decodo_web_creator),
         ("decodo_web_pylib", _s0g_decodo_web_pylib),
         ("decodo_mweb_ejs", _s0f_decodo_mweb),
-        # android_vr client fallback (higher quality but blocked for some videos)
-        ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
-        ("decodo_dash_sections", _s0_decodo_sections),
-        ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
-        ("decodo_muxed_sections", _s0a2_decodo_muxed_sections),
-        ("decodo_dash_full_trim", _s0b_decodo_full_trim),
         # Cookie-only (no proxy) — datacenter IP but auth tokens help
         ("cookies_web_creator", _s_cookies_web_creator),
         ("cookies_dash_ejs", _s_cookies_dash),

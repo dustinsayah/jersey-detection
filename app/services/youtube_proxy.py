@@ -2002,12 +2002,14 @@ def download_youtube_sync(
             err_detail = _errors_detail.get(name, "")
             if "429" in str(err_detail):
                 _429_hit = True
-            # Detect Decodo 407 and skip all remaining Decodo strategies
-            if "decodo" in name and "407" in str(err_detail):
+            # Detect Decodo proxy auth failure and skip all remaining Decodo strategies
+            # Match "407", "Proxy Authentication Required", and truncated "Tunnel connection fai"
+            _err_str = str(err_detail).lower()
+            if "decodo" in name and ("407" in _err_str or "proxy auth" in _err_str or "tunnel connection fai" in _err_str):
                 _decodo_skip = True
                 _decodo_auth_failed = True  # Flag globally for future requests
-                LOGGER.warning("Decodo proxy 407 detected on %s — skipping all Decodo strategies", name)
-            strategy_errors.append(f"{name}=failed")
+                LOGGER.warning("Decodo proxy auth failed on %s — skipping all Decodo strategies", name)
+            strategy_errors.append(f"{name}={'decodo_auth_failed' if 'decodo' in name and _decodo_skip else 'failed'}")
             # Track WARP failures for rate-limit detection
             if "warp" in name and name != "warp_cookies_dash_web":
                 # Don't count CW0 (it often gets 360p which is "fail" for 720p but not a block)

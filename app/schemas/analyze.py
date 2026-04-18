@@ -105,6 +105,8 @@ class AnalyzeRequest(BaseModel):
 
     quality_mode: str = Field(default="auto", alias="qualityMode")
 
+    google_access_token: str | None = Field(default=None, alias="googleAccessToken")
+
     @field_validator("jersey_number", mode="before")
     @classmethod
     def _validate_jersey_number(cls, value: Any) -> int:

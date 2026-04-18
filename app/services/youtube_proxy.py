@@ -1,29 +1,26 @@
-# YouTube download proxy — 34-strategy robust download chain
+# YouTube download proxy — 35+ strategy robust download chain
 #
-# Key insight (Apr 2026): YouTube blocks datacenter IPs at the network level,
-# limiting them to itag 18 (360p muxed). The n-challenge solver (EJS/deno) is
-# also REQUIRED to unlock any DASH formats. Strategy order:
-#   W0. WARP HTTP + android_vr DASH (FREE — 720p, no cookies needed)
-#   W0b. WARP HTTP + web client DASH (FREE — different fingerprint)
-#   CW0. WARP + Cookies DASH (FREE — auth fallback if bot-detected)
-#   W0e/f. WARP pylib DASH (FREE — no EJS needed)
-#   W1/W1b. WARP muxed (FREE — 480p fallback)
-#   WS. WARP SOCKS5 DASH/muxed (fallback if HTTP proxy issues)
-#   CW1. WARP + Cookies muxed
-#   C0/C1. Cookie-only DASH/muxed (datacenter IP — usually 360p)
-#   0.  Decodo residential proxy DASH (PAID)
-#   0a-0c. Decodo muxed/range/full fallbacks
-#   1.  yt-dlp android_vr + DASH (720p+ if IP not blocked)
-#   2.  yt-dlp android_vr + DASH + proxy
-#   3.  Render server proxy
-#   4-7. Muxed/pylib/bare fallbacks
+# Key insight (Apr 2026): YouTube blocks datacenter IPs at the NETWORK level
+# (IP reputation), not application level. poToken, cookies, and Cobalt all
+# fail on datacenter IPs. Only residential proxies reliably work.
+#
+# Strategy order (fastest to slowest):
+#   CB. Cobalt API — self-hosted sidecar (FREE, needs COBALT_API_URL env var)
+#   0.  Decodo residential proxy (PAID — most reliable when credentials work)
+#       Fast-fail: if first Decodo gets 407, skip ALL remaining Decodo strategies
+#   C0/C1. Cookie-only DASH/muxed (datacenter IP + auth tokens)
+#   W0-WS. WARP fallbacks (FREE — Cloudflare VPN, often blocked by YouTube)
+#   1-7. Direct datacenter + render server fallbacks
+#
+# bgutil poToken server runs on port 4416 (start.sh). The bgutil-ytdlp-pot-
+# provider pip package auto-injects poTokens into yt-dlp web/mweb requests.
+# poToken helps on residential IPs but does NOT fix SABR on datacenter IPs.
 #
 # Cookie notes (researched Apr 2026):
 #   - Chrome 127+ has app-bound encryption — can't extract Chrome cookies
 #   - Use Firefox for cookie export (plain SQLite, no encryption)
 #   - Cookies expire in 3-5 days (must refresh from Firefox)
-#   - Piped/Invidious/Cobalt are all dead as of 2026
-#   - Decodo residential proxy remains the most reliable approach
+#   - Decodo/IPRoyal residential proxy remains the most reliable approach
 
 from __future__ import annotations
 
@@ -130,6 +127,10 @@ def _get_warp_proxies() -> tuple[str, str]:
 # Legacy single-instance aliases (used in strategy functions)
 _WARP_PROXY = "socks5://127.0.0.1:40000"
 _WARP_HTTP_PROXY = "http://127.0.0.1:40001"
+
+# Decodo proxy health tracking: skip all Decodo strategies if proxy returns 407
+# A 407 means credentials are invalid — no point trying 9 more Decodo strategies
+_decodo_auth_failed: bool = False  # Set True when 407 detected, reset on deploy
 
 # WARP rate-limit tracking: skip WARP strategies after repeated failures
 # YouTube blocks WARP IP after ~1-2 requests, wasting 30-60s per chunk trying all WARP strategies
@@ -505,6 +506,269 @@ def _yt_dlp_python_download(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _innertube_download(
+    video_id: str,
+    output_path: Path,
+    start_time: float = 0,
+    end_time: float = 0,
+    ffmpeg_binary: str = "ffmpeg",
+    proxy_url: str = "",
+    timeout: int = 120,
+    strategy_name: str = "Strategy IT (InnerTube iOS)",
+    errors_detail: dict | None = None,
+) -> bool:
+    """Download via direct InnerTube /player API with iOS client (cipher-exempt).
+
+    iOS client streams have plain URLs (no signature cipher), so no JS execution
+    needed. This is the same approach cobalt.tools uses. Requires residential
+    proxy (Decodo) to avoid datacenter IP blocks.
+
+    Returns True on success, False on failure.
+    """
+    LOGGER.info("%s: calling InnerTube /player for video_id=%s proxy=%s",
+                strategy_name, video_id, bool(proxy_url))
+
+    innertube_url = "https://www.youtube.com/youtubei/v1/player?pretend_newlayout=false"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+        "X-YouTube-Client-Name": "5",
+        "X-YouTube-Client-Version": "19.29.1",
+    }
+    body = {
+        "context": {
+            "client": {
+                "clientName": "IOS",
+                "clientVersion": "19.29.1",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "hl": "en",
+                "gl": "US",
+                "osName": "iOS",
+                "osVersion": "17.5.1.21F90",
+            }
+        },
+        "videoId": video_id,
+        "contentCheckOk": True,
+        "racyCheckOk": True,
+    }
+
+    transport = None
+    if proxy_url:
+        transport = httpx.HTTPTransport(proxy=proxy_url)
+
+    try:
+        with httpx.Client(transport=transport, timeout=30, follow_redirects=True) as client:
+            resp = client.post(innertube_url, json=body, headers=headers)
+
+        if resp.status_code != 200:
+            LOGGER.warning("%s: InnerTube returned %d: %s", strategy_name, resp.status_code, resp.text[:200])
+            if errors_detail is not None:
+                errors_detail[strategy_name] = f"InnerTube HTTP {resp.status_code}"
+            return False
+
+        data = resp.json()
+
+        # Check playability
+        playability = data.get("playabilityStatus", {})
+        if playability.get("status") != "OK":
+            reason = playability.get("reason", playability.get("status", "unknown"))
+            LOGGER.warning("%s: video not playable: %s", strategy_name, reason[:200])
+            if errors_detail is not None:
+                errors_detail[strategy_name] = f"Not playable: {reason[:100]}"
+            return False
+
+        streaming = data.get("streamingData", {})
+        formats = streaming.get("adaptiveFormats", [])
+        if not formats:
+            # Try regular formats (muxed)
+            formats = streaming.get("formats", [])
+        if not formats:
+            LOGGER.warning("%s: no formats in InnerTube response", strategy_name)
+            if errors_detail is not None:
+                errors_detail[strategy_name] = "No formats in response"
+            return False
+
+        # Pick best video ≤720p (H.264 preferred)
+        video_streams = [f for f in formats if f.get("mimeType", "").startswith("video/")]
+        audio_streams = [f for f in formats if f.get("mimeType", "").startswith("audio/")]
+
+        # Check for muxed streams first (video+audio combined)
+        muxed = [f for f in formats if f.get("mimeType", "").startswith("video/") and f.get("audioQuality")]
+        if muxed:
+            # Pick best muxed ≤720p
+            muxed_720 = [f for f in muxed if (f.get("height") or 0) <= 720]
+            muxed_720.sort(key=lambda f: f.get("height", 0), reverse=True)
+            if muxed_720:
+                stream = muxed_720[0]
+                stream_url = stream.get("url")
+                if stream_url:
+                    LOGGER.info("%s: downloading muxed %dp stream", strategy_name, stream.get("height", 0))
+                    return _innertube_download_stream(
+                        stream_url, output_path, proxy_url, timeout,
+                        start_time, end_time, ffmpeg_binary,
+                        strategy_name, errors_detail,
+                    )
+
+        # DASH: separate video + audio
+        h264_video = [f for f in video_streams
+                      if "avc1" in f.get("mimeType", "") and (f.get("height") or 0) <= 720]
+        h264_video.sort(key=lambda f: f.get("height", 0), reverse=True)
+        if not h264_video:
+            # Fall back to any video ≤720p
+            h264_video = [f for f in video_streams if (f.get("height") or 0) <= 720]
+            h264_video.sort(key=lambda f: f.get("height", 0), reverse=True)
+
+        m4a_audio = [f for f in audio_streams if "mp4a" in f.get("mimeType", "")]
+        m4a_audio.sort(key=lambda f: f.get("averageBitrate", 0), reverse=True)
+        if not m4a_audio:
+            m4a_audio = audio_streams  # any audio
+
+        if not h264_video:
+            LOGGER.warning("%s: no suitable video streams found", strategy_name)
+            if errors_detail is not None:
+                errors_detail[strategy_name] = "No video streams ≤720p"
+            return False
+
+        video_stream = h264_video[0]
+        video_url = video_stream.get("url")
+        if not video_url:
+            LOGGER.warning("%s: video stream has no URL (cipher-protected?)", strategy_name)
+            if errors_detail is not None:
+                errors_detail[strategy_name] = "Stream URL missing (cipher)"
+            return False
+
+        if not m4a_audio:
+            # Video-only: download just video
+            LOGGER.info("%s: downloading video-only %dp", strategy_name, video_stream.get("height", 0))
+            return _innertube_download_stream(
+                video_url, output_path, proxy_url, timeout,
+                start_time, end_time, ffmpeg_binary,
+                strategy_name, errors_detail,
+            )
+
+        audio_stream = m4a_audio[0]
+        audio_url = audio_stream.get("url")
+        if not audio_url:
+            # Fall back to video-only
+            LOGGER.info("%s: audio has no URL, downloading video-only", strategy_name)
+            return _innertube_download_stream(
+                video_url, output_path, proxy_url, timeout,
+                start_time, end_time, ffmpeg_binary,
+                strategy_name, errors_detail,
+            )
+
+        LOGGER.info("%s: downloading DASH %dp video + audio, will merge with ffmpeg",
+                    strategy_name, video_stream.get("height", 0))
+
+        # Download video and audio to temp files, merge with ffmpeg
+        video_tmp = output_path.with_suffix(".video.mp4")
+        audio_tmp = output_path.with_suffix(".audio.m4a")
+
+        try:
+            transport_dl = httpx.HTTPTransport(proxy=proxy_url) if proxy_url else None
+            with httpx.Client(transport=transport_dl, timeout=timeout, follow_redirects=True) as dl_client:
+                # Download video
+                with dl_client.stream("GET", video_url) as vr:
+                    vr.raise_for_status()
+                    with open(video_tmp, "wb") as f:
+                        for chunk in vr.iter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                LOGGER.info("%s: video downloaded %.1fMB", strategy_name,
+                           video_tmp.stat().st_size / 1024 / 1024)
+
+                # Download audio
+                with dl_client.stream("GET", audio_url) as ar:
+                    ar.raise_for_status()
+                    with open(audio_tmp, "wb") as f:
+                        for chunk in ar.iter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                LOGGER.info("%s: audio downloaded %.1fMB", strategy_name,
+                           audio_tmp.stat().st_size / 1024 / 1024)
+
+            # Merge with ffmpeg
+            merge_cmd = [
+                ffmpeg_binary, "-y",
+                "-i", str(video_tmp),
+                "-i", str(audio_tmp),
+                "-c", "copy",
+                "-movflags", "+faststart",
+            ]
+            # Add time range trimming during merge
+            if start_time > 0:
+                merge_cmd.extend(["-ss", str(start_time)])
+            if end_time > 0:
+                merge_cmd.extend(["-to", str(end_time)])
+
+            merge_cmd.append(str(output_path))
+            result = subprocess.run(merge_cmd, capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+                file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+                LOGGER.info("%s: SUCCESS — %sMB (merged DASH)", strategy_name, file_mb)
+                return True
+
+            LOGGER.warning("%s: ffmpeg merge failed: %s", strategy_name, (result.stderr or "")[:200])
+            if errors_detail is not None:
+                errors_detail[strategy_name] = f"ffmpeg merge failed: {(result.stderr or '')[:80]}"
+            return False
+
+        finally:
+            # Clean up temp files
+            for tmp in (video_tmp, audio_tmp):
+                if tmp.exists():
+                    tmp.unlink()
+
+    except httpx.TimeoutException as exc:
+        LOGGER.warning("%s: TIMEOUT — %s", strategy_name, str(exc)[:200])
+        if errors_detail is not None:
+            errors_detail[strategy_name] = f"TIMEOUT: {str(exc)[:80]}"
+        return False
+    except Exception as exc:
+        LOGGER.warning("%s: FAILED — %s: %s", strategy_name, type(exc).__name__, str(exc)[:200])
+        if errors_detail is not None:
+            errors_detail[strategy_name] = f"{type(exc).__name__}: {str(exc)[:80]}"
+        return False
+
+
+def _innertube_download_stream(
+    stream_url: str,
+    output_path: Path,
+    proxy_url: str,
+    timeout: int,
+    start_time: float,
+    end_time: float,
+    ffmpeg_binary: str,
+    strategy_name: str,
+    errors_detail: dict | None,
+) -> bool:
+    """Download a single stream URL (muxed or video-only) and optionally trim."""
+    try:
+        transport = httpx.HTTPTransport(proxy=proxy_url) if proxy_url else None
+        with httpx.Client(transport=transport, timeout=timeout, follow_redirects=True) as client:
+            with client.stream("GET", stream_url) as resp:
+                resp.raise_for_status()
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+            LOGGER.info("%s: stream downloaded %.1fMB", strategy_name, file_mb)
+            # Trim if time range specified
+            if start_time > 0 or end_time > 0:
+                _trim_video(output_path, start_time, end_time, ffmpeg_binary)
+            return True
+
+        LOGGER.warning("%s: downloaded file too small or missing", strategy_name)
+        return False
+    except Exception as exc:
+        LOGGER.warning("%s: stream download failed: %s", strategy_name, str(exc)[:200])
+        if errors_detail is not None:
+            errors_detail[strategy_name] = f"Stream download: {str(exc)[:80]}"
+        return False
+
+
 def _render_server_download(
     url: str,
     output_path: Path,
@@ -562,6 +826,100 @@ def _render_server_download(
         LOGGER.warning("%s: TIMEOUT — %s", strategy_name, str(exc)[:200])
     except Exception as exc:
         LOGGER.warning("%s: FAILED — %s: %s", strategy_name, type(exc).__name__, str(exc)[:200])
+
+    return False
+
+
+# ── Cobalt API download strategy ─────────────────────────────────────────
+# Calls a self-hosted Cobalt instance (Railway sidecar service).
+# Cobalt uses youtubei.js + yt-session-generator for poToken generation.
+# Set COBALT_API_URL env var to the Cobalt service URL.
+
+def _cobalt_download(
+    youtube_url: str,
+    output_path: Path,
+    timeout: int = 120,
+    strategy_name: str = "Strategy Cobalt",
+    errors_detail: dict | None = None,
+) -> bool:
+    """Download via self-hosted Cobalt API — free, no bandwidth limits."""
+    cobalt_url = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+    if not cobalt_url:
+        return False
+
+    try:
+        LOGGER.info("%s: requesting %s via Cobalt at %s", strategy_name, youtube_url, cobalt_url)
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"{cobalt_url}/",
+                json={
+                    "url": youtube_url,
+                    "videoQuality": "720",
+                    "downloadMode": "auto",
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+
+        if resp.status_code != 200:
+            err = f"Cobalt HTTP {resp.status_code}: {resp.text[:200]}"
+            LOGGER.warning("%s: %s", strategy_name, err)
+            if errors_detail is not None:
+                errors_detail[strategy_name] = err
+            return False
+
+        data = resp.json()
+        status = data.get("status")
+        LOGGER.info("%s: Cobalt status=%s", strategy_name, status)
+
+        stream_url = None
+        if status == "tunnel":
+            stream_url = data.get("url")
+        elif status == "redirect":
+            stream_url = data.get("url")
+        elif status == "picker":
+            # Multiple streams — pick first video
+            picker = data.get("picker", [])
+            for item in picker:
+                if item.get("type") in ("video", None):
+                    stream_url = item.get("url")
+                    break
+            if not stream_url and picker:
+                stream_url = picker[0].get("url")
+        elif status == "error":
+            err_code = data.get("error", {}).get("code", "unknown")
+            err = f"Cobalt error: {err_code}"
+            LOGGER.warning("%s: %s", strategy_name, err)
+            if errors_detail is not None:
+                errors_detail[strategy_name] = err
+            return False
+
+        if not stream_url:
+            LOGGER.warning("%s: no stream URL in response: %s", strategy_name, str(data)[:300])
+            return False
+
+        LOGGER.info("%s: downloading stream from %s...", strategy_name, stream_url[:80])
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            with client.stream("GET", stream_url) as dl:
+                dl.raise_for_status()
+                with open(output_path, "wb") as f:
+                    for chunk in dl.iter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
+        if output_path.exists() and output_path.stat().st_size > 100_000:
+            file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+            LOGGER.info("%s: SUCCESS — %sMB downloaded", strategy_name, file_mb)
+            return True
+
+        LOGGER.warning("%s: file too small (%d bytes)", strategy_name,
+                       output_path.stat().st_size if output_path.exists() else 0)
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {str(exc)[:200]}"
+        LOGGER.warning("%s: FAILED — %s", strategy_name, err)
+        if errors_detail is not None:
+            errors_detail[strategy_name] = err
 
     return False
 
@@ -747,6 +1105,47 @@ def download_youtube_sync(
     _errors_detail: dict[str, str] = {}
 
     # ── Strategy functions — each returns DownloadResult | None ───────────
+
+    def _s_cobalt() -> DownloadResult | None:
+        """Self-hosted Cobalt API — free, no bandwidth limits.
+
+        Requires COBALT_API_URL env var pointing to a deployed Cobalt instance.
+        Cobalt handles YouTube download internally (poToken + yt-session-generator).
+        Best when Cobalt has HTTP_PROXY set to a residential proxy.
+        """
+        if not os.getenv("COBALT_API_URL", "").strip():
+            return None
+        if _cobalt_download(url, output_path, timeout=_strategy_timeout,
+                            strategy_name="Strategy CB (Cobalt API)",
+                            errors_detail=_errors_detail):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="cobalt_api")
+        return None
+
+    def _s_innertube_ios() -> DownloadResult | None:
+        """Direct InnerTube API with iOS client — cipher-exempt, no yt-dlp.
+
+        iOS client streams have plain URLs (no JS signature cipher needed).
+        Uses Decodo residential proxy to avoid datacenter IP blocks.
+        This is the same approach cobalt.tools uses.
+        """
+        _vid_id = extract_video_id(url)
+        if not _vid_id:
+            return None
+        # Prefer Decodo proxy, fall back to no proxy
+        _it_proxy = decodo_proxy or ""
+        if _innertube_download(
+            _vid_id, output_path,
+            start_time=start_time, end_time=end_time,
+            ffmpeg_binary=ffmpeg_binary,
+            proxy_url=_it_proxy,
+            timeout=_strategy_timeout,
+            strategy_name="Strategy IT (InnerTube iOS)",
+            errors_detail=_errors_detail,
+        ):
+            if _file_valid():
+                return _make_result(output_path, sectioned=has_time_range, strategy="innertube_ios_direct")
+        return None
 
     def _s_cookies_dash() -> DownloadResult | None:
         """Cookie-authenticated DASH H.264 (720p+ without proxy).
@@ -1487,11 +1886,20 @@ def download_youtube_sync(
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026 — Decodo first, residential IPs most trusted):
     #   0-0c.   Decodo residential proxy (PAID — most reliable, try first)
+    #   CB.     Cobalt API — self-hosted sidecar (FREE, needs COBALT_API_URL)
     #   C0-C1.  Cookie-only, no proxy (datacenter IP, auth helps)
     #   W0-W2.  WARP fallbacks (FREE — datacenter VPN, often blocked)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # Decodo residential proxy — PAID, most reliable, try FIRST
+        # Cobalt API — self-hosted sidecar, FREE, no bandwidth limits
+        # Requires COBALT_API_URL env var. Best with HTTP_PROXY on Cobalt side.
+        ("cobalt_api", _s_cobalt),
+        # NOTE (Apr 2026): InnerTube iOS disabled — YouTube now requires poToken
+        # for ALL InnerTube clients (iOS, Android, WEB). Without poToken, the
+        # /player endpoint returns FAILED_PRECONDITION. Keeping code for future
+        # use when poToken generation is added.
+        # ("innertube_ios_direct", _s_innertube_ios),
+        # Decodo residential proxy — PAID, most reliable
         # muxed_pylib_full_trim is the PROVEN winner — always try first
         ("decodo_muxed_pylib_full_trim", _s0c_decodo_muxed_pylib),
         ("decodo_muxed_pylib_range", _s0a_decodo_muxed_pylib_range),
@@ -1553,10 +1961,17 @@ def download_youtube_sync(
     # ── Run strategies — each wrapped in try/except, NEVER crashes chain ─
     # Track 429 hits so we can add backoff between WARP retries
     _429_hit = False
+    _decodo_skip = _decodo_auth_failed  # Start skipping if globally flagged
     for name, fn in strategies:
         if _total_expired():
             strategy_errors.append(f"{name}=total_timeout_skip")
             continue  # Skip but NEVER raise — always try remaining strategies
+
+        # Skip ALL Decodo strategies if proxy returned 407 (auth failed)
+        if "decodo" in name and _decodo_skip:
+            LOGGER.info("Decodo auth failed: skipping %s", name)
+            strategy_errors.append(f"{name}=decodo_auth_failed")
+            continue
 
         # Skip ALL WARP strategies if WARP IP is rate-limited by YouTube
         if "warp" in name and time.time() < _warp_blocked_until:
@@ -1587,6 +2002,11 @@ def download_youtube_sync(
             err_detail = _errors_detail.get(name, "")
             if "429" in str(err_detail):
                 _429_hit = True
+            # Detect Decodo 407 and skip all remaining Decodo strategies
+            if "decodo" in name and "407" in str(err_detail):
+                _decodo_skip = True
+                _decodo_auth_failed = True  # Flag globally for future requests
+                LOGGER.warning("Decodo proxy 407 detected on %s — skipping all Decodo strategies", name)
             strategy_errors.append(f"{name}=failed")
             # Track WARP failures for rate-limit detection
             if "warp" in name and name != "warp_cookies_dash_web":

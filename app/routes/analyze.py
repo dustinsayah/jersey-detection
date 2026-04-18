@@ -18,11 +18,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from typing import Any, AsyncIterator
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
@@ -31,6 +33,56 @@ from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse
 
 LOGGER = logging.getLogger(__name__)
 router = APIRouter()
+
+# YouTube video ID pattern for preflight check
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})"
+)
+
+
+async def _youtube_preflight(video_url: str, access_token: str) -> dict | None:
+    """Check video availability via YouTube Data API v3 using OAuth token.
+
+    Returns dict with {id, title, duration} on success, None on failure.
+    Non-fatal — any error is logged and returns None.
+    """
+    match = _YT_ID_RE.search(video_url)
+    if not match:
+        return None
+    video_id = match.group(1)
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={
+                    "id": video_id,
+                    "part": "snippet,contentDetails,status",
+                    "fields": "items(id,snippet/title,contentDetails/duration,status/privacyStatus)",
+                },
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        if resp.status_code != 200:
+            LOGGER.warning("youtube_preflight: API returned %d: %s", resp.status_code, resp.text[:200])
+            return None
+
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            LOGGER.warning("youtube_preflight: video %s not found or private", video_id)
+            return None
+
+        item = items[0]
+        return {
+            "id": item.get("id"),
+            "title": item.get("snippet", {}).get("title"),
+            "duration": item.get("contentDetails", {}).get("duration"),
+            "privacy": item.get("status", {}).get("privacyStatus"),
+        }
+    except Exception as exc:
+        LOGGER.warning("youtube_preflight: failed — %s: %s", type(exc).__name__, str(exc)[:200])
+        return None
+
 
 # Keepalive interval in seconds — must be < Railway's ~300s proxy timeout
 _KEEPALIVE_INTERVAL = 15
@@ -72,6 +124,16 @@ async def analyze(
             status_code=503,
             content={"error": f"Detection service is not ready: {detail}"},
         )
+
+    # Pre-flight: if Google access token provided, verify video with YouTube Data API v3
+    google_token = analyze_request.google_access_token
+    if google_token and analyze_request.video_url:
+        preflight_info = await _youtube_preflight(analyze_request.video_url, google_token)
+        if preflight_info:
+            LOGGER.info("analyze.preflight video_id=%s title=%s duration=%s",
+                        preflight_info.get("id", "?"),
+                        (preflight_info.get("title") or "")[:60],
+                        preflight_info.get("duration", "?"))
 
     # Capture request params for the pipeline thread
     pipeline_params = dict(
@@ -268,6 +330,16 @@ async def analyze_async(
         )
 
     _reap_stale_jobs()
+
+    # Pre-flight: verify video with YouTube Data API v3 if token provided
+    google_token = analyze_request.google_access_token
+    if google_token and analyze_request.video_url:
+        preflight_info = await _youtube_preflight(analyze_request.video_url, google_token)
+        if preflight_info:
+            LOGGER.info("analyze-async.preflight video_id=%s title=%s duration=%s",
+                        preflight_info.get("id", "?"),
+                        (preflight_info.get("title") or "")[:60],
+                        preflight_info.get("duration", "?"))
 
     pipeline_params = dict(
         video_url=analyze_request.video_url,

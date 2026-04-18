@@ -1072,3 +1072,98 @@ async def test_decodo_youtube() -> JSONResponse:
         })
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)[:200]})
+
+
+# ── Test endpoint for bgutil poToken server ────────────────────────────────
+
+@router.get("/test-po-token")
+async def test_po_token() -> JSONResponse:
+    """Test bgutil poToken server — generates a token for a known video."""
+    import httpx as _httpx
+
+    bgutil_url = "http://127.0.0.1:4416"
+    result: dict = {
+        "server_url": bgutil_url,
+        "ping": None,
+        "token_generated": False,
+        "token_preview": None,
+    }
+
+    try:
+        async with _httpx.AsyncClient(timeout=10) as client:
+            # Ping test
+            try:
+                ping_resp = await client.get(f"{bgutil_url}/ping")
+                result["ping"] = ping_resp.json() if ping_resp.status_code == 200 else f"HTTP {ping_resp.status_code}"
+            except Exception as e:
+                result["ping"] = f"unreachable: {str(e)[:100]}"
+                return JSONResponse(content=result)
+
+            # Generate a token for a test video
+            try:
+                pot_resp = await client.post(
+                    f"{bgutil_url}/get_pot",
+                    json={"content_binding": "dQw4w9WgXcQ", "bypass_cache": True},
+                )
+                if pot_resp.status_code == 200:
+                    pot_data = pot_resp.json()
+                    token = pot_data.get("poToken", "")
+                    result["token_generated"] = bool(token)
+                    result["token_preview"] = token[:30] + "..." if len(token) > 30 else token
+                    result["token_length"] = len(token)
+                else:
+                    result["token_error"] = f"HTTP {pot_resp.status_code}: {pot_resp.text[:200]}"
+            except Exception as e:
+                result["token_error"] = str(e)[:200]
+
+            # Check cache
+            try:
+                cache_resp = await client.get(f"{bgutil_url}/minter_cache")
+                if cache_resp.status_code == 200:
+                    result["cache_keys"] = cache_resp.json()
+            except Exception:
+                pass
+
+    except Exception as e:
+        result["error"] = str(e)[:200]
+
+    return JSONResponse(content=result)
+
+
+# ── Test endpoint for Cobalt API ────────────────────────────────────────────
+
+@router.get("/test-cobalt")
+async def test_cobalt() -> JSONResponse:
+    """Test Cobalt API connectivity."""
+    import httpx as _httpx
+
+    cobalt_url = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+    if not cobalt_url:
+        return JSONResponse(content={"configured": False, "error": "COBALT_API_URL not set"})
+
+    try:
+        async with _httpx.AsyncClient(timeout=15) as client:
+            # Health check
+            health_resp = await client.get(f"{cobalt_url}/")
+            health_ok = health_resp.status_code == 200
+
+            # Try a YouTube download request
+            dl_resp = await client.post(
+                f"{cobalt_url}/",
+                json={"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "videoQuality": "360"},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            dl_data = dl_resp.json() if dl_resp.status_code == 200 else {"status": "error", "http": dl_resp.status_code}
+
+            return JSONResponse(content={
+                "configured": True,
+                "cobalt_url": cobalt_url,
+                "health_ok": health_ok,
+                "download_test": {
+                    "status": dl_data.get("status"),
+                    "has_url": bool(dl_data.get("url")),
+                    "error": dl_data.get("error"),
+                },
+            })
+    except Exception as e:
+        return JSONResponse(content={"configured": True, "cobalt_url": cobalt_url, "error": str(e)[:200]})

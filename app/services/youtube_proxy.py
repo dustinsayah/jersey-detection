@@ -75,6 +75,46 @@ def _get_decodo_proxy() -> str:
         return proxy_url
     return ""
 
+# ── Free / alternative residential proxy services ─────────────────────────
+# Sign up for any of these free services and set the env var.
+# Each one adds a strategy BEFORE paid Decodo, saving bandwidth.
+#
+# Proxying.io:  2 GB free, no credit card
+#   Signup: https://dashboard.proxying.io/signup
+#   Set PROXYING_IO_URL=http://USER:PASS@proxy.proxying.io:8080
+#
+# Proxiware:    250 MB free, no credit card
+#   Signup: https://app.proxiware.com/auth/register
+#   Set PROXIWARE_URL=http://USER:PASS@proxy.proxiware.com:1337
+#
+# OwlProxy:     200 MB free, no credit card
+#   Signup: https://www.owlproxy.com/
+#   Set OWLPROXY_URL=socks5://USER:PASS@HOST:PORT
+#
+# ScrapeOps:    100 MB free, no credit card
+#   Signup: https://scrapeops.io/app/register/proxy/
+#   Set SCRAPEOPS_URL=http://scrapeops:APIKEY@residential-proxy.scrapeops.io:8181
+#
+# Any generic residential proxy:
+#   Set FREE_PROXY_URL=http://USER:PASS@host:port (or socks5://...)
+
+def _get_free_proxies() -> list[tuple[str, str]]:
+    """Return list of (name, proxy_url) for configured free proxy services."""
+    proxies = []
+    for env_var, name in [
+        ("PROXYING_IO_URL", "proxying_io"),
+        ("PROXIWARE_URL", "proxiware"),
+        ("OWLPROXY_URL", "owlproxy"),
+        ("SCRAPEOPS_URL", "scrapeops"),
+        ("FREE_PROXY_URL", "free_proxy"),
+    ]:
+        url = os.getenv(env_var, "").strip()
+        if url:
+            proxies.append((name, url))
+            LOGGER.info("Free proxy configured: %s (%s)", name, env_var)
+    return proxies
+
+
 # Optional proxy for yt-dlp — set to residential proxy or Cloudflare WARP SOCKS5
 # e.g. socks5://127.0.0.1:40000 (WARP) or socks5://user:pass@proxy.example.com:1080
 # Read at runtime via function (start.sh sets it dynamically after wireproxy starts)
@@ -1883,14 +1923,40 @@ def download_youtube_sync(
                 return _make_result(output_path, sectioned=has_time_range, strategy="default_client")
         return None
 
+    # ── Free proxy strategies — dynamically generated from env vars ──────
+    _free_proxies = _get_free_proxies()
+
+    def _make_free_proxy_strategy(proxy_name: str, proxy_url: str):
+        """Create a strategy function for a free residential proxy service."""
+        def _strategy() -> DownloadResult | None:
+            strategy_label = f"Strategy FP ({proxy_name})"
+            # Try muxed format with android client (most compatible)
+            if _yt_dlp_python_download(
+                url, output_path,
+                format_override=_MUXED_FORMAT,
+                proxy=proxy_url,
+                cookie_file=cookie_file,
+                extra_args={"extractor_args": {"youtube": {"player_client": ["android"]}}},
+                timeout=_strategy_timeout,
+                strategy_name=strategy_label,
+                errors_detail=_errors_detail,
+            ):
+                if _file_valid():
+                    return _make_result(output_path, sectioned=has_time_range, strategy=f"free_{proxy_name}")
+            return None
+        return _strategy
+
     # ── Build strategy chain as (name, function) tuples ──────────────────
-    # Order (Apr 2026 — Decodo first, residential IPs most trusted):
-    #   0-0c.   Decodo residential proxy (PAID — most reliable, try first)
+    # Order (Apr 2026):
+    #   FP.     Free residential proxies (Proxying.io, Proxiware, etc.)
     #   CB.     Cobalt API — self-hosted sidecar (FREE, needs COBALT_API_URL)
+    #   0-0c.   Decodo residential proxy (PAID — most reliable)
     #   C0-C1.  Cookie-only, no proxy (datacenter IP, auth helps)
     #   W0-W2.  WARP fallbacks (FREE — datacenter VPN, often blocked)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
+        # Free residential proxies — try first (save paid Decodo bandwidth)
+        *[(f"free_{pname}", _make_free_proxy_strategy(pname, purl)) for pname, purl in _free_proxies],
         # Cobalt API — self-hosted sidecar, FREE, no bandwidth limits
         # Requires COBALT_API_URL env var. Best with HTTP_PROXY on Cobalt side.
         ("cobalt_api", _s_cobalt),

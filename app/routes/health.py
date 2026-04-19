@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.19.5",
+        "version": "v8.19.6",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.19.5",
+        "version": "v8.19.6",
     })
 
 
@@ -353,9 +353,16 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.19.5",
+            "version": "v8.19.6",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
+            "free_proxies": [name for name, _ in [
+                ("proxying_io", os.getenv("PROXYING_IO_URL", "")),
+                ("proxiware", os.getenv("PROXIWARE_URL", "")),
+                ("owlproxy", os.getenv("OWLPROXY_URL", "")),
+                ("scrapeops", os.getenv("SCRAPEOPS_URL", "")),
+                ("free_proxy", os.getenv("FREE_PROXY_URL", "")),
+            ] if _],
             "warp_proxy_running": warp_running,
             "warp_pool_size": warp_pool_size,
             "po_token_server": po_token_status,
@@ -921,7 +928,7 @@ async def test_basketball(request: Request) -> Any:
     if not getattr(request.app.state, "detector_ready", False):
         return JSONResponse(status_code=503, content={
             "error": "Detector not ready",
-            "version": "v8.19.5",
+            "version": "v8.19.6",
         })
 
     started_at = time.perf_counter()

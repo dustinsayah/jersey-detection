@@ -5,6 +5,8 @@
 # fail on datacenter IPs. Only residential proxies reliably work.
 #
 # Strategy order (fastest to slowest):
+#   HP. Home proxy — user's own PC, residential IP (FREE, needs HOME_PROXY_URL)
+#   FP. Free residential proxies (needs PROXYING_IO_URL etc. env vars)
 #   CB. Cobalt API — self-hosted sidecar (FREE, needs COBALT_API_URL env var)
 #   0.  Decodo residential proxy (PAID — most reliable when credentials work)
 #       Fast-fail: if first Decodo gets 407, skip ALL remaining Decodo strategies
@@ -1146,6 +1148,84 @@ def download_youtube_sync(
 
     # ── Strategy functions — each returns DownloadResult | None ───────────
 
+    def _s_home_proxy() -> DownloadResult | None:
+        """Home proxy — user's residential PC running scripts/home_proxy.py.
+
+        Requires HOME_PROXY_URL env var (e.g. https://proxy.cliptapp.com via
+        Cloudflare Tunnel). The home proxy runs yt-dlp on the user's machine
+        with their residential IP — YouTube serves full quality (720p/1080p).
+        This is the most reliable free strategy because residential IPs are
+        never blocked by YouTube.
+        """
+        hp_url = os.getenv("HOME_PROXY_URL", "").strip().rstrip("/")
+        if not hp_url:
+            return None  # Not configured — skip silently
+
+        hp_secret = os.getenv("HOME_PROXY_SECRET", "clipt-home-proxy-2026")
+        strategy_name = "Strategy HP (Home Proxy)"
+
+        try:
+            # Quick health check (2s timeout)
+            try:
+                hp_health = httpx.get(f"{hp_url}/health", timeout=3)
+                if hp_health.status_code != 200:
+                    LOGGER.warning("%s: health check failed (HTTP %d)", strategy_name, hp_health.status_code)
+                    if _errors_detail is not None:
+                        _errors_detail[strategy_name] = f"health check HTTP {hp_health.status_code}"
+                    return None
+                LOGGER.info("%s: health OK — %s", strategy_name, hp_health.json())
+            except Exception as he:
+                LOGGER.warning("%s: unreachable (%s) — proxy not running?", strategy_name, str(he)[:100])
+                if _errors_detail is not None:
+                    _errors_detail[strategy_name] = f"unreachable: {str(he)[:100]}"
+                return None
+
+            # Request download from home proxy
+            payload = {
+                "url": url,
+                "start_sec": start_time,
+                "end_sec": end_time,
+                "quality": 720,
+                "secret": hp_secret,
+            }
+
+            # Home proxy downloads the video on user's residential IP
+            # and streams the file back. Timeout scales with segment length.
+            hp_timeout = max(120, _strategy_timeout * 3)  # Home internet can be slow
+            LOGGER.info("%s: requesting download (timeout=%ds)...", strategy_name, hp_timeout)
+
+            with httpx.Client(timeout=hp_timeout, follow_redirects=True) as client:
+                resp = client.post(f"{hp_url}/download", json=payload)
+
+            if resp.status_code != 200:
+                err_body = resp.text[:300]
+                LOGGER.warning("%s: download failed (HTTP %d): %s", strategy_name, resp.status_code, err_body)
+                if _errors_detail is not None:
+                    _errors_detail[strategy_name] = f"HTTP {resp.status_code}: {err_body[:200]}"
+                return None
+
+            # Save the received video file
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+
+            if _file_valid():
+                video_height = resp.headers.get("X-Video-Height", "?")
+                dl_time = resp.headers.get("X-Download-Time", "?")
+                file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
+                LOGGER.info("%s: SUCCESS — %sMB, %sp, downloaded in %ss",
+                            strategy_name, file_mb, video_height, dl_time)
+                return _make_result(output_path, sectioned=has_time_range, strategy="home_proxy")
+
+            LOGGER.warning("%s: file too small (%d bytes)",
+                           strategy_name, output_path.stat().st_size if output_path.exists() else 0)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {str(exc)[:200]}"
+            LOGGER.warning("%s: FAILED — %s", strategy_name, err)
+            if _errors_detail is not None:
+                _errors_detail[strategy_name] = err
+
+        return None
+
     def _s_cobalt() -> DownloadResult | None:
         """Self-hosted Cobalt API — free, no bandwidth limits.
 
@@ -1948,6 +2028,7 @@ def download_youtube_sync(
 
     # ── Build strategy chain as (name, function) tuples ──────────────────
     # Order (Apr 2026):
+    #   HP.     Home proxy — user's own PC, residential IP (FREE)
     #   FP.     Free residential proxies (Proxying.io, Proxiware, etc.)
     #   CB.     Cobalt API — self-hosted sidecar (FREE, needs COBALT_API_URL)
     #   0-0c.   Decodo residential proxy (PAID — most reliable)
@@ -1955,7 +2036,10 @@ def download_youtube_sync(
     #   W0-W2.  WARP fallbacks (FREE — datacenter VPN, often blocked)
     #   1-7.    Direct datacenter + render server fallbacks
     strategies: list[tuple[str, callable]] = [
-        # Free residential proxies — try first (save paid Decodo bandwidth)
+        # Home proxy — user's own PC, residential IP, yt-dlp. THE BEST free option.
+        # Requires HOME_PROXY_URL env var (set up via scripts/setup_home_proxy.bat)
+        ("home_proxy", _s_home_proxy),
+        # Free residential proxies — try next (save paid Decodo bandwidth)
         *[(f"free_{pname}", _make_free_proxy_strategy(pname, purl)) for pname, purl in _free_proxies],
         # Cobalt API — self-hosted sidecar, FREE, no bandwidth limits
         # Requires COBALT_API_URL env var. Best with HTTP_PROXY on Cobalt side.

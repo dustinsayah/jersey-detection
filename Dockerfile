@@ -105,7 +105,7 @@ RUN mkdir -p /app/app/model
 # Uninstall deprecated yt-dlp-get-pot if leftover from Docker cache layers
 RUN pip uninstall -y yt-dlp-get-pot 2>/dev/null || true
 
-ARG CACHE_BUST=v8.20.0
+ARG CACHE_BUST=v8.21.0
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

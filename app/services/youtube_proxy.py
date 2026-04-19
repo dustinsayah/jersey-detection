@@ -1999,16 +1999,18 @@ def download_youtube_sync(
                 _last_successful_strategy[_video_id] = (name, time.time())
                 return result
             # fn returned None — strategy didn't apply or failed gracefully
-            err_detail = _errors_detail.get(name, "")
-            if "429" in str(err_detail):
+            # _errors_detail is keyed by human-readable strategy_name (e.g. "Strategy 0c (Decodo ...)")
+            # Scan errors matching this strategy type for error signatures
+            _all_errors = " ".join(_errors_detail.values()).lower()
+            if "429" in _all_errors:
                 _429_hit = True
-            # Detect Decodo proxy auth failure and skip all remaining Decodo strategies
-            # Match "407", "Proxy Authentication Required", and truncated "Tunnel connection fai"
-            _err_str = str(err_detail).lower()
-            if "decodo" in name and ("407" in _err_str or "proxy auth" in _err_str or "tunnel connection fai" in _err_str):
-                _decodo_skip = True
-                _decodo_auth_failed = True  # Flag globally for future requests
-                LOGGER.warning("Decodo proxy auth failed on %s — skipping all Decodo strategies", name)
+            # Detect Decodo proxy auth failure — check only Decodo-keyed errors
+            if "decodo" in name and not _decodo_skip:
+                _decodo_errors = " ".join(v for k, v in _errors_detail.items() if "decodo" in k.lower() or "Decodo" in k).lower()
+                if "407" in _decodo_errors or "proxy auth" in _decodo_errors or "tunnel connection fai" in _decodo_errors:
+                    _decodo_skip = True
+                    _decodo_auth_failed = True  # Flag globally for future requests
+                    LOGGER.warning("Decodo proxy auth failed on %s — skipping all Decodo strategies", name)
             strategy_errors.append(f"{name}={'decodo_auth_failed' if 'decodo' in name and _decodo_skip else 'failed'}")
             # Track WARP failures for rate-limit detection
             if "warp" in name and name != "warp_cookies_dash_web":

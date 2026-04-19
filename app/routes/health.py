@@ -221,7 +221,7 @@ def live() -> JSONResponse:
 
     return JSONResponse(status_code=200, content={
         "status": "ok",
-        "version": "v8.19.4",
+        "version": "v8.19.5",
         "models": pt_count,
         "primary_detection": primary,
     })
@@ -260,7 +260,7 @@ def models_inventory() -> JSONResponse:
         "missing": sorted(missing),
         "primary_detection": primary,
         "ali_status": ali_status,
-        "version": "v8.19.4",
+        "version": "v8.19.5",
     })
 
 
@@ -353,7 +353,7 @@ def health(request: Request) -> JSONResponse:
         status_code=200,
         content={
             "status": "ok" if ready else "warming_up",
-            "version": "v8.19.4",
+            "version": "v8.19.5",
             "detector_ready": ready,
             "decodo_proxy_configured": decodo_configured,
             "warp_proxy_running": warp_running,
@@ -921,7 +921,7 @@ async def test_basketball(request: Request) -> Any:
     if not getattr(request.app.state, "detector_ready", False):
         return JSONResponse(status_code=503, content={
             "error": "Detector not ready",
-            "version": "v8.19.4",
+            "version": "v8.19.5",
         })
 
     started_at = time.perf_counter()
@@ -1167,3 +1167,117 @@ async def test_cobalt() -> JSONResponse:
             })
     except Exception as e:
         return JSONResponse(content={"configured": True, "cobalt_url": cobalt_url, "error": str(e)[:200]})
+
+
+# ── Bulk proxy tester for YouTube ──────────────────────────────────────────
+
+@router.post("/test-proxies")
+async def test_proxies(request: Request) -> JSONResponse:
+    """Test a list of proxies for YouTube video access.
+
+    POST body: {"proxies": ["ip:port", ...], "max_test": 20}
+    Tests each proxy:
+      1. ipinfo.io — check if residential
+      2. YouTube innertube /player — check if video playback allowed
+    Returns working proxies sorted by quality.
+    """
+    import httpx as _httpx
+    import asyncio
+
+    body = await request.json()
+    proxy_list = body.get("proxies", [])
+    max_test = min(body.get("max_test", 20), 50)  # Cap at 50
+
+    proxy_list = proxy_list[:max_test]
+    results = []
+
+    async def _test_one(proxy_str: str) -> dict:
+        proxy_url = f"http://{proxy_str}" if not proxy_str.startswith("http") else proxy_str
+        result = {"proxy": proxy_str, "ip_info": None, "residential": False, "youtube_ok": False}
+
+        try:
+            async with _httpx.AsyncClient(
+                proxy=proxy_url, timeout=_httpx.Timeout(12), follow_redirects=True
+            ) as client:
+                # Step 1: Check IP info
+                try:
+                    ip_resp = await client.get("https://ipinfo.io/json")
+                    if ip_resp.status_code == 200:
+                        ip_data = ip_resp.json()
+                        result["ip_info"] = {
+                            "ip": ip_data.get("ip"),
+                            "org": ip_data.get("org", ""),
+                            "city": ip_data.get("city", ""),
+                            "country": ip_data.get("country", ""),
+                        }
+                        org = ip_data.get("org", "").upper()
+                        dc_keywords = ["AMAZON", "GOOGLE", "MICROSOFT", "CLOUDFLARE",
+                                       "DIGITALOCEAN", "LINODE", "VULTR", "OVH",
+                                       "HETZNER", "CONTABO", "ORACLE"]
+                        result["residential"] = not any(k in org for k in dc_keywords)
+                except Exception:
+                    pass
+
+                # Step 2: Test YouTube InnerTube access
+                try:
+                    yt_resp = await client.post(
+                        "https://www.youtube.com/youtubei/v1/player",
+                        json={
+                            "context": {
+                                "client": {
+                                    "clientName": "ANDROID",
+                                    "clientVersion": "19.29.37",
+                                    "hl": "en", "gl": "US",
+                                }
+                            },
+                            "videoId": "jNQXAC9IVRw",
+                            "contentCheckOk": True,
+                        },
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "com.google.android.youtube/19.29.37",
+                        },
+                    )
+                    if yt_resp.status_code == 200:
+                        yt_data = yt_resp.json()
+                        playability = yt_data.get("playabilityStatus", {})
+                        status = playability.get("status", "")
+                        streaming = yt_data.get("streamingData", {})
+                        has_formats = bool(streaming.get("formats") or streaming.get("adaptiveFormats"))
+                        result["youtube_ok"] = status == "OK" and has_formats
+                        result["youtube_status"] = status
+                        result["youtube_formats"] = len(streaming.get("formats", [])) + len(streaming.get("adaptiveFormats", []))
+                    else:
+                        result["youtube_status"] = f"HTTP {yt_resp.status_code}"
+                except Exception as e:
+                    result["youtube_error"] = str(e)[:100]
+
+        except Exception as e:
+            result["error"] = str(e)[:100]
+
+        return result
+
+    # Run tests concurrently in batches of 10
+    for i in range(0, len(proxy_list), 10):
+        batch = proxy_list[i:i + 10]
+        batch_results = await asyncio.gather(
+            *[_test_one(p) for p in batch],
+            return_exceptions=True,
+        )
+        for r in batch_results:
+            if isinstance(r, dict):
+                results.append(r)
+            else:
+                results.append({"error": str(r)[:100]})
+
+    # Sort: residential + youtube first
+    working = [r for r in results if r.get("youtube_ok")]
+    residential_working = [r for r in working if r.get("residential")]
+
+    return JSONResponse(content={
+        "tested": len(results),
+        "working_youtube": len(working),
+        "residential_working": len(residential_working),
+        "results": results,
+        "best_proxies": [r["proxy"] for r in residential_working] or [r["proxy"] for r in working],
+    })

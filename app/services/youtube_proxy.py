@@ -1933,10 +1933,10 @@ def download_youtube_sync(
             # Try muxed format with android client (most compatible)
             if _yt_dlp_python_download(
                 url, output_path,
+                client="android",
                 format_override=_MUXED_FORMAT,
                 proxy=proxy_url,
-                cookie_file=cookie_file,
-                extra_args={"extractor_args": {"youtube": {"player_client": ["android"]}}},
+                start_time=start_time, end_time=end_time,
                 timeout=_strategy_timeout,
                 strategy_name=strategy_label,
                 errors_detail=_errors_detail,

@@ -107,39 +107,88 @@ def download():
         log.info("Downloading: %s [%s-%s] @ %dp", url, start_sec, end_sec, quality)
         t0 = time.time()
 
-        # Use yt-dlp CLI for reliability (handles all edge cases)
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "--format", f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "--no-warnings",
-            "--quiet",
-        ]
+        # Use yt-dlp Python API for reliability (avoids Windows exe alias issues)
+        import yt_dlp as _ytdl
 
-        # Add time range if specified
-        if end_sec > start_sec > 0:
-            cmd += ["--download-sections", f"*{start_sec}-{end_sec}"]
-        elif end_sec > 0:
-            cmd += ["--download-sections", f"*0-{end_sec}"]
+        # Check if ffmpeg is available (needed for merging separate video+audio)
+        has_ffmpeg = False
+        try:
+            subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            has_ffmpeg = True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
 
-        cmd += ["-o", output_path, url]
+        # Format selection: with ffmpeg we can merge best video + audio.
+        # Without ffmpeg, we must use pre-muxed formats (lower quality but no merge needed).
+        if has_ffmpeg:
+            fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
+        else:
+            fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
+            log.info("ffmpeg not installed — using pre-muxed format (360p max)")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        ydl_opts = {
+            "format": fmt,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": output_path,
+        }
 
-        if result.returncode != 0:
-            log.error("yt-dlp failed: %s", result.stderr[:500])
-            return jsonify({"error": "download_failed", "detail": result.stderr[:300]}), 500
+        if has_ffmpeg:
+            ydl_opts["merge_output_format"] = "mp4"
+
+        # Add time range if specified (requires ffmpeg)
+        if has_ffmpeg and end_sec > start_sec > 0:
+            ydl_opts["download_ranges"] = _ytdl.utils.download_range_func(
+                None, [(start_sec, end_sec)]
+            )
+        elif has_ffmpeg and end_sec > 0:
+            ydl_opts["download_ranges"] = _ytdl.utils.download_range_func(
+                None, [(0, end_sec)]
+            )
+        elif not has_ffmpeg and (end_sec > start_sec > 0 or end_sec > 0):
+            log.warning("ffmpeg not installed — downloading full video (no time trimming)")
+
+        # Download using yt-dlp Python API
+        try:
+            with _ytdl.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except _ytdl.DownloadError as e:
+            log.error("yt-dlp failed: %s", str(e)[:500])
+            return jsonify({"error": "download_failed", "detail": str(e)[:300]}), 500
+        except Exception as e:
+            log.error("yt-dlp unexpected error: %s", str(e)[:500])
+            return jsonify({"error": "download_failed", "detail": str(e)[:300]}), 500
+
+        # Log everything in the temp directory for debugging
+        all_files = []
+        for root, dirs, files in os.walk(tmp_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                all_files.append((fp, os.path.getsize(fp)))
+        log.info("Files in temp dir after download: %s", all_files)
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
-            # Check for .mkv or other extension (merge sometimes produces different ext)
-            for ext in [".mkv", ".webm", ".mp4.part"]:
-                alt = output_path.replace(".mp4", ext)
-                if os.path.exists(alt) and os.path.getsize(alt) > 10000:
-                    output_path = alt
+            # Check for any video file in the temp directory
+            for fp, sz in all_files:
+                if sz > 10000:
+                    log.info("Found valid file at different path: %s (%d bytes)", fp, sz)
+                    output_path = fp
                     break
             else:
-                return jsonify({"error": "file_too_small"}), 500
+                # Also check for .mkv or other extension (merge sometimes produces different ext)
+                for ext in [".mkv", ".webm", ".mp4.part"]:
+                    alt = output_path.replace(".mp4", ext)
+                    if os.path.exists(alt) and os.path.getsize(alt) > 10000:
+                        output_path = alt
+                        break
+                else:
+                    log.error("No valid file found. Expected at: %s", output_path)
+                    return jsonify({"error": "file_too_small", "files_found": [(f, s) for f, s in all_files]}), 500
 
         # Get video height via ffprobe
         height = 0
@@ -213,7 +262,7 @@ def extract_info():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("HOME_PROXY_PORT", 5000))
+    port = int(os.environ.get("HOME_PROXY_PORT", 5050))
 
     print(f"""
 ====================================================

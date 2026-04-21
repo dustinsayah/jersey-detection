@@ -1187,6 +1187,7 @@ def download_youtube_sync(
                 "end_sec": end_time,
                 "quality": 720,
                 "secret": hp_secret,
+                "preferred_client": "android",  # Helps bypass "video not available"
             }
 
             # Home proxy downloads the video on user's residential IP

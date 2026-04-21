@@ -258,11 +258,11 @@ def _compute_score(
     # When dead ball models aren't loaded, default to 50 (neutral)
     dead_ball_component = 50.0  # neutral default
 
-    # OCR compensation: when jersey OCR returns 0, redistribute jersey weight
-    # to motion + audio so clips can still score reasonably based on game signals.
-    # Applies to football AND basketball (broadcast distance OCR is unreliable).
+    # Football OCR compensation: when jersey OCR returns 0 (all football
+    # OCR models fail), redistribute jersey weight to motion + audio so
+    # football clips can still score in the 50-70 range based on game signals.
     weights = dict(WEIGHTS)
-    if jersey_confidence < 0.01 and sport.lower() in ("football", "basketball"):
+    if sport.lower() == "football" and jersey_confidence < 0.01:
         jersey_weight_to_redistribute = weights["jersey"]  # 0.30
         weights["jersey"] = 0.0
         weights["motion"] += jersey_weight_to_redistribute * 0.50   # +0.15

@@ -9,16 +9,16 @@ class TestHealth:
     def test_live_returns_ok(self, client: TestClient) -> None:
         response = client.get("/live")
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
+        assert response.json() == {"status": "ok"}
 
     def test_health_returns_ok_when_ready(self, client: TestClient) -> None:
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert "version" in data
-        assert "detector_ready" in data
+        assert "/detect" in data["endpoints"]
+        assert "/analyze" in data["endpoints"]
+        assert "phases" in data
 
     def test_ready_returns_ok(self, client: TestClient) -> None:
         response = client.get("/ready")
@@ -26,10 +26,10 @@ class TestHealth:
         data = response.json()
         assert data["status"] == "ok"
 
-    def test_ready_returns_error_when_detector_not_ready(self, client: TestClient) -> None:
+    def test_health_returns_error_when_detector_not_ready(self, client: TestClient) -> None:
         client.app.state.detector_ready = False
         client.app.state.startup_error = "missing jersey model"
-        response = client.get("/ready")
+        response = client.get("/health")
         assert response.status_code == 503
         data = response.json()
         assert data["status"] == "error"
@@ -37,11 +37,11 @@ class TestHealth:
         assert "hint" in data
         assert "phases" in data
 
-    def test_ready_503_includes_actionable_hint(self, client: TestClient) -> None:
-        """Regression: /ready 503 must include an actionable hint for debugging."""
+    def test_health_503_includes_actionable_hint(self, client: TestClient) -> None:
+        """Regression: /health 503 must include an actionable hint for debugging."""
         client.app.state.detector_ready = False
         client.app.state.startup_error = "OOM during model load"
-        response = client.get("/ready")
+        response = client.get("/health")
         assert response.status_code == 503
         data = response.json()
         assert "hint" in data
@@ -50,14 +50,6 @@ class TestHealth:
     def test_health_post_not_allowed(self, client: TestClient) -> None:
         response = client.post("/health")
         assert response.status_code == 405
-
-    def test_health_returns_200_even_when_not_ready(self, client: TestClient) -> None:
-        """Liveness probe /health must always return 200."""
-        client.app.state.detector_ready = False
-        response = client.get("/health")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "warming_up"
 
     def test_health_does_not_load_roboflow_models(self, client: TestClient) -> None:
         """Regression: /health must NOT trigger roboflow_detector.load().

@@ -73,75 +73,61 @@ if not defined TUNNEL_TOKEN (
     )
 )
 
+:: ============================================================
+:: Load Railway token for auto-update (reads from .railway-token file)
+:: ============================================================
+set RAILWAY_TOKEN=
+if exist "%~dp0.railway-token" (
+    set /p RAILWAY_TOKEN=<"%~dp0.railway-token"
+    echo Railway auto-update: ENABLED
+) else (
+    echo Railway auto-update: DISABLED (no .railway-token file)
+    echo To enable: save your Railway API token to %~dp0.railway-token
+)
+
 if defined TUNNEL_TOKEN (
     echo Using PERMANENT Cloudflare tunnel...
     echo URL: proxy.cliptapp.com (never changes)
     echo.
+
+    :: Tell Flask to update Railway with the permanent URL
+    curl -s -X POST http://localhost:5050/set-tunnel-url -H "Content-Type: application/json" -d "{\"url\":\"https://proxy.cliptapp.com\"}" >nul 2>&1
+
     echo ====================================================
     echo   HOME PROXY IS RUNNING (Permanent Tunnel)
     echo ====================================================
     echo   URL: https://proxy.cliptapp.com
-    echo   This URL never changes. Railway is pre-configured.
+    echo   Railway auto-updated with this URL.
     echo   Keep this window open while using AI Highlights.
     echo   Close to stop the proxy.
     echo ====================================================
     echo.
-    "%CLOUDFLARED%" tunnel --no-autoupdate run --token %TUNNEL_TOKEN%
+    :: Trim any trailing whitespace/newlines from token
+    for /f "tokens=*" %%t in ("%TUNNEL_TOKEN%") do set TUNNEL_TOKEN=%%t
+    "%CLOUDFLARED%" --no-autoupdate tunnel run --token %TUNNEL_TOKEN%
 ) else (
-    echo No permanent tunnel configured. Using quick tunnel...
-    echo (URL will change each restart - see setup guide for permanent tunnel)
+    echo Using quick tunnel (URL changes each restart, auto-updates Railway)...
     echo.
 
-    :: Create a temp file to capture the tunnel URL
-    set TUNNEL_LOG=%TEMP%\clipt_tunnel.log
-    del "%TUNNEL_LOG%" 2>nul
-
-    :: Start tunnel in background, log output
-    start "Clipt Tunnel" /min cmd /c ""%CLOUDFLARED%" tunnel --url http://localhost:5050 --no-autoupdate 2>"%TUNNEL_LOG%""
-
-    :: Wait for tunnel URL to appear
-    echo Waiting for tunnel URL...
-    :wait_loop
-    timeout /t 2 /nobreak >nul
-    findstr /C:"trycloudflare.com" "%TUNNEL_LOG%" >nul 2>&1
-    if %ERRORLEVEL% NEQ 0 goto wait_loop
-
-    :: Extract tunnel URL
-    for /f "tokens=*" %%a in ('findstr /C:"trycloudflare.com" "%TUNNEL_LOG%"') do set TUNNEL_LINE=%%a
-
+    :: Start tunnel and pipe output through update_railway.py
+    :: This script reads cloudflared output, finds the URL, and POSTs it to Flask
+    :: Flask then updates Railway's HOME_PROXY_URL automatically
+    echo Starting Cloudflare tunnel with auto-update...
     echo.
     echo ====================================================
-    echo   HOME PROXY IS RUNNING (Quick Tunnel)
+    echo   HOME PROXY IS RUNNING (Quick Tunnel + Auto-Update)
     echo ====================================================
-    echo   Check %TUNNEL_LOG% for your tunnel URL
-    echo.
-    echo   For a permanent URL, set up a named tunnel:
-    echo   1. Go to https://one.dash.cloudflare.com
-    echo   2. Networks ^> Tunnels ^> Create
-    echo   3. Save the token to: %~dp0.tunnel-token
+    echo   Tunnel URL will be detected and sent to Railway
+    echo   automatically. No manual steps needed.
     echo.
     echo   Keep this window open while using AI Highlights.
     echo   Close to stop the proxy.
     echo ====================================================
     echo.
 
-    :: Try to auto-update Railway if CLI is available
-    where railway >nul 2>&1
-    if %ERRORLEVEL% EQU 0 (
-        echo Updating Railway env vars with quick tunnel URL...
-        for /f "tokens=*" %%u in ('findstr /R "https://.*trycloudflare.com" "%TUNNEL_LOG%"') do (
-            for %%w in (%%u) do (
-                echo %%w | findstr "https://" >nul && (
-                    railway variables --set "HOME_PROXY_URL=%%w"
-                    echo Railway updated with: %%w
-                )
-            )
-        )
-    )
-
-    echo.
-    echo Press any key to stop the proxy...
-    pause >nul
+    :: Run cloudflared and pipe stderr through update_railway.py
+    :: The 2>&1 merges stderr to stdout so Python can read the URL
+    "%CLOUDFLARED%" tunnel --url http://localhost:5050 --no-autoupdate 2>&1 | python "%~dp0update_railway.py"
 )
 
 :: Cleanup

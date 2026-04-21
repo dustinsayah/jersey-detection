@@ -20,9 +20,8 @@ FOOTBALL_RULES: list[PlayTypeRule] = [
         play_type="touchdown",
         label="Touchdown",
         conditions={
-            "crowd_energy_min": 0.9,
-            "motion_min": 80,
-            "motion_spike": True,
+            "crowd_energy_min": 0.8,
+            "motion_min": 70,
             "pose_any": ["running", "jumping"],
         },
         priority=10,

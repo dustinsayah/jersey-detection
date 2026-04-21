@@ -68,22 +68,6 @@ ANALYZE_FPS = int(os.getenv("ANALYZE_FPS", "2"))
 # Hard cap on total frames — 0 means use adaptive cap from _get_adaptive_fps()
 MAX_FRAMES = int(os.getenv("MAX_FRAMES", "0"))
 
-def _check_cookie_warning() -> str | None:
-    """Return cookie expiry warning if cookies expire within 2 days."""
-    cookie_paths = [Path("/app/app/youtube_cookies.txt"), Path("app/youtube_cookies.txt")]
-    for cp in cookie_paths:
-        if cp.exists():
-            age_days = (time.time() - cp.stat().st_mtime) / 86400
-            remaining = max(0, 3.0 - age_days)
-            if remaining < 2.0:
-                return (
-                    f"Cookies expire in {remaining:.1f} days. "
-                    f"Refresh: curl -X POST https://jersey-detection-production-d8d8.up.railway.app"
-                    f"/upload-cookies --data-binary @cookies.txt"
-                )
-    return None
-
-
 # ── Blocker 3: Request semaphore — only 1 concurrent analyze request ──
 import asyncio as _asyncio
 _REQUEST_SEMAPHORE = _asyncio.Semaphore(1)
@@ -94,16 +78,13 @@ _MEMORY_THRESHOLD_MB = 5000
 def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple[int, int]:
     """Return (fps, max_frames) based on video duration.
 
-    Strategy — balance quality vs speed:
+    Strategy — more frames for longer videos to avoid missing plays:
       - Short clips (<120s): 2 fps, 150 frames → full coverage
       - Medium clips (120-600s): 1 fps, 200 frames → every second for ~3 min
       - Long videos (600-1800s): 1 fps, 300 frames → one per second, 5 min
-      - Full games (1800-3600s): 1 fps, 500 frames → every ~4-7s over 30-60 min
-      - Long games (3600-7200s): 1 fps, 500 frames → every ~7-14s over 1-2 hrs
-      - Extra long (>7200s): 1 fps, 500 frames → every ~15s over 2+ hrs
-
-    v8.14: Reduced from 600/750/900 to 500 for games >30min.
-    Cuts chunked processing from 620s to ~310s while retaining clip quality.
+      - Full games (1800-3600s): 1 fps, 600 frames → every ~3-6s over 30-60 min
+      - Long games (3600-7200s): 1 fps, 750 frames → every ~5-10s over 1-2 hrs
+      - Extra long (>7200s): 1 fps, 900 frames → every ~8s+ over 2+ hrs
     """
     if video_duration <= 120:
         return 2, 150
@@ -112,11 +93,11 @@ def _get_adaptive_fps(video_duration: float, sport: str = "basketball") -> tuple
     elif video_duration <= 1800:
         return 1, 300
     elif video_duration <= 3600:
-        return 1, 500
+        return 1, 600
     elif video_duration <= 7200:
-        return 1, 500
+        return 1, 750
     else:
-        return 1, 500
+        return 1, 900
 
 
 def _generate_clip_caption(
@@ -220,7 +201,7 @@ def _compute_recruiting_score(
 
     # Position-specific bonuses
     pos = (position or "").upper()
-    if pos == "QB" and effective_play in ("pass_play", "qb_scramble", "completion", "touchdown", "big_play", "big_gain"):
+    if pos == "QB" and effective_play in ("pass_play", "qb_scramble", "completion", "touchdown", "big_play"):
         score += 10
     elif pos in ("WR", "TE") and effective_play in ("completion", "reception_yac", "touchdown"):
         score += 10
@@ -429,17 +410,7 @@ def _build_player_summary(
     """
     total = len(clips_out)
     jersey_clips = [c for c in clips_out if c.get("jerseyVisible")]
-    _scoring_types = ("touchdown", "made_shot", "goal", "three_pointer", "dunk", "layup")
-    scoring_plays = []
-    for c in clips_out:
-        pt = c.get("playType", "")
-        if c.get("v4Outcome") in _scoring_types or pt in _scoring_types:
-            scoring_plays.append(c)
-        elif sport == "basketball" and pt in ("drive", "fast_break"):
-            # Basketball: high-crowd drives/fast breaks near the basket likely scored
-            sigs = c.get("signals", {})
-            if sigs.get("crowd", 0) > 0.5 and sigs.get("motion", 0) > 60:
-                scoring_plays.append(c)
+    scoring_plays = [c for c in clips_out if c.get("v4Outcome") in ("touchdown", "made_shot", "goal")]
     recruiting_scores = [c.get("recruitingScore", 0) for c in clips_out]
 
     # Play type breakdown
@@ -2324,7 +2295,7 @@ async def _run_analyze_pipeline_impl(
         # Full-game videos use wider window (120s) because OCR detections
         # may only appear in certain chunks but the player is on the field
         # throughout.  Short clips use 15s window.
-        _jersey_attr_window = (600 if sport.lower() == "football" else 120) if video_duration > 600 else 15
+        _jersey_attr_window = 120 if video_duration > 600 else 15
         _jersey_ts_std = sorted(
             d["timestamp"] for d in all_layer_dets
             if d.get("number_detected") == jersey_number
@@ -2578,20 +2549,15 @@ async def _run_analyze_pipeline_impl(
             "memory_rss_mb": memory_rss_mb,
         }
 
-        # v8.15: Temporal smoothing for jersey numbers
-        clips_out = _smooth_jersey_numbers(clips_out, jersey_number)
-
         # Player summary for coaches
         player_summary = _build_player_summary(
             clips_out, jersey_number, sport, position, video_duration, elapsed,
         )
 
-        cookie_warning = _check_cookie_warning()
-        result = {
+        return {
             "playerSummary": player_summary,
             "clips": clips_out,
             "layerUsed": layer_used,
-            "error_type": "success",
             "elapsed": round(elapsed, 1),
             "videoDuration": round(video_duration, 1),
             "framesProcessed": frames_processed,
@@ -2602,12 +2568,6 @@ async def _run_analyze_pipeline_impl(
             "actionsDetected": stat_result.get("actions_detected", []),
             "debug": debug,
         }
-
-        # Add cookie warning if expiring within 2 days
-        if cookie_warning:
-            result["cookies_warning"] = cookie_warning
-
-        return result
 
     finally:
         # ── Post-request cleanup (Blocker 3) ──
@@ -2664,20 +2624,10 @@ async def _run_chunked_full_game(
     from app.services.roboflow_detector import roboflow_detector, is_dark_color, is_navy
 
     # Per-chunk download uses 10-min chunks (fits in WARP 300s timeout at 720p)
-    # Pre-downloaded video: chunk size based on duration.
-    # v8.14.3: Per-chunk overhead ~120s regardless of frame count.
-    # Fewer chunks = faster total time. Use 1hr chunks for long games.
+    # Pre-downloaded video uses 30-min chunks (no download timeout concern)
     _per_chunk_download = (video_url is not None and local_video_path is None)
-    _effective_dur = extract_end - extract_start
-    if _per_chunk_download:
-        CHUNK_SIZE = 600  # 10-min chunks for per-chunk downloads
-    elif _effective_dur > 3600:
-        CHUNK_SIZE = 3600  # 1hr chunks — 2 chunks for 2hr game (was 4 × 30min)
-    else:
-        CHUNK_SIZE = 1800  # 30-min chunks for shorter videos
-    # Frame cap per chunk: 100 frames gives good quality/speed balance.
-    # 2 chunks × 100 = 200 frames for 2hr games (1 every 36s).
-    CHUNK_MAX_FRAMES = 100
+    CHUNK_SIZE = 600 if _per_chunk_download else 1800
+    CHUNK_MAX_FRAMES = 300  # Balanced: good OCR coverage while keeping chunks fast (~75s each)
     _is_football = sport.lower() == "football"
     _is_dark = is_dark_color(jersey_color)
     _is_navy_jersey = is_navy(jersey_color)
@@ -2704,30 +2654,24 @@ async def _run_chunked_full_game(
 
         def _do_audio_sync():
             import subprocess as _sp_audio
-            import time as _atime
             from app.services.audio_analyzer import analyze_audio
             from app.services.detection_runtime import PipelineSettings
             _settings = PipelineSettings()
-            _a_t0 = _atime.perf_counter()
-            # v8.14.1: 600s audio cap (10 min) — fast DSP needs far less than YAMNet.
-            # ffmpeg extraction of 600s from 3.6GB file takes ~30-60s.
-            _audio_cap = 600
+            # Extract max 3600s of audio (first half) — full game audio takes 300s+
             _apath = _audio_video_path.parent / "audio.wav"
             try:
                 _sp_audio.run([
                     _settings.ffmpeg_binary, "-y",
                     "-i", str(_audio_video_path),
-                    "-t", str(_audio_cap),
+                    "-t", "3600",  # Cap at 1 hour — enough for play pattern detection
                     "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                     str(_apath),
-                ], capture_output=True, timeout=120)
+                ], capture_output=True, timeout=180)
             except Exception:
                 pass
-            _result = AudioAnalysisResult(has_audio=False)
             if _apath.exists() and _apath.stat().st_size > 0:
-                _result = analyze_audio(_apath)
-            _result._actual_elapsed_ms = round((_atime.perf_counter() - _a_t0) * 1000)
-            return _result
+                return analyze_audio(_apath)
+            return AudioAnalysisResult(has_audio=False)
 
         _audio_task = _asyncio.ensure_future(run_in_threadpool(_do_audio_sync))
         LOGGER.info("Chunked: audio analysis started in background thread")
@@ -2767,11 +2711,6 @@ async def _run_chunked_full_game(
         # Check for cancellation (client disconnected)
         if cancel_event is not None and cancel_event.is_set():
             LOGGER.warning("Pipeline: CANCELLED by client disconnect at chunk %d", chunk_count + 1)
-            break
-        # Skip chunks beyond actual video duration (prevents duplicate re-processing)
-        if video_duration > 0 and chunk_start >= video_duration:
-            LOGGER.info("Chunked: skipping chunk at %.0fs — past video duration (%.0fs)",
-                        chunk_start, video_duration)
             break
         chunk_end = min(chunk_start + CHUNK_SIZE, extract_end)
         chunk_count += 1
@@ -2931,21 +2870,18 @@ async def _run_chunked_full_game(
     if _audio_task is not None:
         try:
             audio_result = await _audio_task
-            _audio_wall = time.perf_counter() - _audio_t0
-            # Use actual work time from inside the thread (excludes await wait)
-            _audio_actual_ms = getattr(audio_result, "_actual_elapsed_ms", round(_audio_wall * 1000))
+            _audio_elapsed = time.perf_counter() - _audio_t0
             if audio_result.has_audio:
                 phases_used.append("audio_analysis")
             layer_timings["audio_analysis"] = {
-                "elapsed_ms": _audio_actual_ms,
+                "elapsed_ms": round(_audio_elapsed * 1000),
                 "status": "success" if audio_result.has_audio else "no_audio",
                 "events": len(audio_result.events),
                 "boundaries": len(audio_result.play_boundaries),
                 "parallel": True,
-                "wall_clock_ms": round(_audio_wall * 1000),
             }
-            LOGGER.info("Chunked: audio analysis complete (actual=%.1fs, wall=%.1fs, %d events, parallel=true)",
-                        _audio_actual_ms / 1000, _audio_wall, len(audio_result.events))
+            LOGGER.info("Chunked: audio analysis complete (%.1fs, %d events, parallel=true)",
+                        _audio_elapsed, len(audio_result.events))
         except Exception as exc:
             layer_timings["audio_analysis"] = {
                 "elapsed_ms": round((time.perf_counter() - _audio_t0) * 1000),
@@ -3060,29 +2996,16 @@ async def _run_chunked_full_game(
     # ── Motion supplement for full games ──
     # Lowered thresholds: with 600 frames/chunk we get enough motion data
     # to reliably detect plays. Previous threshold (30) missed most action.
-    # Sport-specific supplement thresholds — basketball has continuous motion
-    # so needs higher threshold to avoid merging everything into mega-clusters.
-    if _is_football:
-        _motion_supp_threshold = 15
-        _motion_supp_audio = 10
-    elif sport.lower() == "basketball":
-        _motion_supp_threshold = 35  # High — basketball always has motion
-        _motion_supp_audio = 20
-    else:
-        _motion_supp_threshold = 15
-        _motion_supp_audio = 8
-    # Basketball: space supplement points 10s apart (continuous motion fills gaps too densely)
-    _supp_dedup_dist = 10.0 if sport.lower() == "basketball" else 1.5
+    _motion_supp_threshold = 15 if _is_football else 10
+    _motion_supp_audio = 10 if _is_football else 8
     if 1 <= len(detection_points) <= 120 and all_frame_timestamps:
         _existing_ts = {dp.timestamp for dp in detection_points}
         _supplement_count = 0
         for t in all_frame_timestamps:
             if t in _existing_ts:
                 continue
-            if any(abs(t - ets) < _supp_dedup_dist for ets in _existing_ts):
+            if any(abs(t - ets) < 1.5 for ets in _existing_ts):
                 continue
-            # Update existing set to include this new point for future dedup
-            _existing_ts.add(t)
             motion = all_motion.get(t, 0)
             in_boundary = _in_audio_boundary(audio_result, t)
             if motion > _motion_supp_threshold or (in_boundary and motion > _motion_supp_audio):
@@ -3157,95 +3080,50 @@ async def _run_chunked_full_game(
     LOGGER.info("Chunked: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_c)
 
     # ── Temporal jersey attribution (global post-processing) ──
-    # ONLY uses 300s window — no unlimited spread.
-    # Clips must be within 300s of an actual OCR detection to get jerseyVisible.
+    # Collect ALL jersey detections across ALL chunks, then attribute to clips.
+    # Uses 300s window (covers nearly half a football quarter).
+    # If jersey is confirmed ANYWHERE, also attribute to active clips (motion > 20).
     _jersey_ts = sorted(
         d["timestamp"] for d in all_layer_dets
         if d.get("number_detected") == jersey_number
     ) if all_layer_dets else []
-    _jersey_attr_window_c = 900 if sport.lower() == "football" else 300  # football: 15 min, others: 5 min
+    _jersey_attr_window_c = 300  # 5 min window (was 120s)
     _has_any_jersey = len(_jersey_ts) > 0
-    LOGGER.info("Chunked: jersey attribution — %d OCR detections for #%d, window=%ds",
-                len(_jersey_ts), jersey_number, _jersey_attr_window_c)
     if _jersey_ts and clips:
         _attr_count = 0
         for clip in clips:
             if clip.jersey_visible:
                 continue
-            # Only method: temporal proximity — jersey detected within 300s
-            _min_dist = float("inf")
+            # Method 1: temporal proximity — jersey detected within 300s
             for jts in _jersey_ts:
-                dist = min(abs(clip.start_time - jts), abs(clip.end_time - jts))
-                _min_dist = min(_min_dist, dist)
                 if clip.start_time - _jersey_attr_window_c <= jts <= clip.end_time + _jersey_attr_window_c:
                     clip.jersey_visible = True
                     clip.jersey_number_seen = jersey_number
-                    # Store attribution distance for debugging
-                    if clip.signals is None:
-                        clip.signals = {}
-                    clip.signals["jersey_attr_distance"] = round(_min_dist, 1)
                     _attr_count += 1
                     break
-            # Store distance even for non-attributed clips
-            if not clip.jersey_visible and _min_dist < float("inf"):
-                if clip.signals is None:
-                    clip.signals = {}
-                clip.signals["jersey_attr_distance"] = round(_min_dist, 1)
+        # Method 2: motion-based — if jersey confirmed ANYWHERE and clip has
+        # significant motion, the player is likely on field during active plays
+        if _has_any_jersey:
+            _motion_attr_count = 0
+            for clip in clips:
+                if clip.jersey_visible:
+                    continue
+                clip_motion = (clip.signals or {}).get("motion", 0) or 0
+                if clip_motion > 20:
+                    clip.jersey_visible = True
+                    clip.jersey_number_seen = jersey_number
+                    _motion_attr_count += 1
+            if _motion_attr_count:
+                _attr_count += _motion_attr_count
+                LOGGER.info("Chunked: motion-based jersey attribution: %d clips (motion>20)", _motion_attr_count)
         if _attr_count:
-            LOGGER.info("Chunked: temporal attribution: %d clips gained jersey=%d (window=%ds)",
+            LOGGER.info("Chunked: total jersey attribution: %d clips gained jersey=%d (window=%ds)",
                         _attr_count, jersey_number, _jersey_attr_window_c)
-
-    # ── QB position detection boost ──
-    # When user says position=QB and OCR is sparse, use motion/crowd/outcome
-    # signals to mark clips as "qb_identified" — QBs are always the focal player
-    # in offensive plays, so high-activity clips reliably feature the QB.
-    _is_qb = (
-        sport.lower() == "football"
-        and position
-        and position.lower() in ("qb", "quarterback")
-    )
-    if _is_qb and clips:
-        _qb_count = 0
-        for clip in clips:
-            if clip.jersey_visible:
-                continue
-            sigs = clip.signals or {}
-            clip_motion = sigs.get("motion", 0) or 0
-            clip_crowd = sigs.get("crowd", 0) or 0
-            clip_v4 = sigs.get("v4_outcome", "")
-            clip_pose = sigs.get("pose", "standing")
-            clip_pt = clip.play_type or ""
-            # Selective QB boost — only real active plays, not formation/low-energy
-            # Requires: throwing/running pose, strong motion, AND meaningful crowd
-            _throwing_or_running = clip_pose in ("throwing", "running")
-            _active_play = clip_motion > 45  # Higher bar (was 30)
-            _crowd_react = clip_crowd > 0.4  # Stronger crowd signal (was 0.2)
-            _is_formation = clip_pt in ("formation", "dead_ball")
-            _has_v4_outcome = clip_v4 in (
-                "pass_play", "qb_scramble", "completion", "sack",
-                "touchdown",
-            )
-            # Must have throwing/running pose + active motion + crowd,
-            # OR a confirmed v4 outcome (not formation)
-            _signal_count = sum([_throwing_or_running, _active_play, _crowd_react])
-            if _is_formation:
-                continue  # Never QB-boost formation clips
-            if (_throwing_or_running and _active_play) or (_signal_count >= 2 and _crowd_react) or _has_v4_outcome:
-                clip.jersey_visible = True
-                clip.jersey_number_seen = jersey_number
-                if clip.signals is None:
-                    clip.signals = {}
-                clip.signals["jersey_method"] = "qb_identified"
-                _qb_count += 1
-        if _qb_count:
-            LOGGER.info(
-                "Chunked: QB position boost — %d/%d clips gained jersey=%d via qb_identified",
-                _qb_count, len(clips), jersey_number,
-            )
 
     # ── Fallback: user-claimed jersey when OCR found ZERO detections ──
     # Full-game OCR often fails on navy/dark jerseys at broadcast distance.
-    # Mark active clips as "user_claimed" (distinct from OCR-confirmed).
+    # When user specified their jersey number and we found active plays via
+    # motion, trust the user's claim for clips with significant motion.
     if not _has_any_jersey and jersey_number > 0 and clips:
         _user_attr_count = 0
         for clip in clips:
@@ -3255,13 +3133,10 @@ async def _run_chunked_full_game(
             if clip_motion > 20:  # Active play motion threshold
                 clip.jersey_visible = True
                 clip.jersey_number_seen = jersey_number
-                if clip.signals is None:
-                    clip.signals = {}
-                clip.signals["jersey_method"] = "user_claimed"
                 _user_attr_count += 1
         if _user_attr_count:
             LOGGER.info(
-                "Chunked: OCR=0 fallback — user-claimed #%d on %d/%d clips (motion>20)",
+                "Chunked: OCR=0 fallback — user-claimed jersey #%d applied to %d/%d clips (motion>20)",
                 jersey_number, _user_attr_count, len(clips),
             )
 
@@ -3419,19 +3294,15 @@ async def _run_chunked_full_game(
         "chunks_processed": chunk_count,
     }
 
-    # v8.15: Temporal smoothing for jersey numbers
-    clips_out = _smooth_jersey_numbers(clips_out, jersey_number)
-
     # Player summary for coaches
     player_summary = _build_player_summary(
         clips_out, jersey_number, sport, position, video_duration, elapsed,
     )
 
-    result = {
+    return {
         "playerSummary": player_summary,
         "clips": clips_out,
         "layerUsed": "+".join(phases_used),
-        "error_type": "success",
         "elapsed": round(elapsed, 1),
         "videoDuration": round(video_duration, 1),
         "framesProcessed": total_frames,
@@ -3442,10 +3313,6 @@ async def _run_chunked_full_game(
         "actionsDetected": [],
         "debug": debug,
     }
-    cookie_warning = _check_cookie_warning()
-    if cookie_warning:
-        result["cookies_warning"] = cookie_warning
-    return result
 
 
 def _run_jersey_detection(
@@ -3637,10 +3504,10 @@ def _run_chunk_ocr(
 
     # ── v5 player detection → OCR ──
     _t_v5_start = time.perf_counter()
-    _player_conf = 0.25 if _is_football else 0.20
+    _player_conf = 0.35 if _is_football else 0.20
     # Uniform coverage: step through frames so time-limited OCR covers
     # the full chunk, not just the first N seconds.
-    _v5_chunk_budget = max(30, time_limit // 2)
+    _v5_chunk_budget = max(20, time_limit // 3)
     _v5_chunk_step = max(1, len(live_frames) // _v5_chunk_budget)
     sampled = live_frames[::_v5_chunk_step]
     _v5_crops = 0
@@ -3658,8 +3525,7 @@ def _run_chunk_ocr(
             continue
         if not players:
             continue
-        _max_players = 5 if _is_football else 3
-        for player in players[:_max_players]:
+        for player in players[:3]:
             if _v5_crops >= _V5_MAX_CROPS:
                 break
             x1, y1, x2, y2 = [int(c) for c in player["bbox"]]
@@ -3701,8 +3567,7 @@ def _run_chunk_ocr(
             except Exception:
                 pass
 
-    LOGGER.info("Chunk OCR: v5 phase %.1fs (%d dets, %d crops, %d frames sampled, step=%d)",
-                time.perf_counter() - _t_v5_start, len(chunk_ocr_dets), _v5_crops, len(sampled), _v5_chunk_step)
+    LOGGER.info("Chunk OCR: v5 phase %.1fs (%d dets, %d crops)", time.perf_counter() - _t_v5_start, len(chunk_ocr_dets), _v5_crops)
 
     # ── v4 outcome detection — DISABLED in chunked mode ──
     # v4 models add ~200MB RSS each and 20-30s per chunk.
@@ -3991,84 +3856,14 @@ def _in_audio_boundary(audio_result: AudioAnalysisResult, timestamp: float) -> b
     return False
 
 
-def _smooth_jersey_numbers(clips: list[dict], target_jersey: int) -> list[dict]:
-    """Temporal smoothing for jersey number assignment.
-
-    v8.15: When a target jersey is specified, boost clips where the target
-    number was seen in adjacent clips (within 30s window). This prevents
-    flickering jersey assignments caused by single-frame OCR errors.
-
-    Also: if >60% of clips see the same jersey number, assign it to clips
-    where no jersey was detected (likely same player, OCR just missed).
-    """
-    if not clips or target_jersey <= 0:
-        return clips
-
-    # Count jersey number occurrences
-    jersey_counts: dict[int, int] = {}
-    for clip in clips:
-        jn = clip.get("jerseyNumberSeen")
-        if jn and jn > 0:
-            jersey_counts[jn] = jersey_counts.get(jn, 0) + 1
-
-    if not jersey_counts:
-        return clips
-
-    # Find dominant jersey number
-    dominant_jersey = max(jersey_counts, key=lambda k: jersey_counts[k])
-    dominant_ratio = jersey_counts[dominant_jersey] / len(clips) if clips else 0
-
-    # If target jersey is dominant (>40% of clips), fill in gaps
-    if dominant_jersey == target_jersey and dominant_ratio >= 0.4:
-        for clip in clips:
-            if not clip.get("jerseyNumberSeen") and clip.get("jerseyVisible"):
-                clip["jerseyNumberSeen"] = target_jersey
-                clip["jerseySmoothed"] = True
-                LOGGER.debug(
-                    "Jersey smoothing: assigned #%d to clip at %.1f-%.1f",
-                    target_jersey, clip.get("startTime", 0), clip.get("endTime", 0),
-                )
-
-    # Adjacent clip smoothing: if neighboring clips (within 30s) both see the
-    # target jersey but a middle clip doesn't, assign the target number
-    for i in range(1, len(clips) - 1):
-        clip = clips[i]
-        if clip.get("jerseyNumberSeen"):
-            continue
-        prev_jn = clips[i - 1].get("jerseyNumberSeen")
-        next_jn = clips[i + 1].get("jerseyNumberSeen")
-        if prev_jn == target_jersey and next_jn == target_jersey:
-            time_gap = clips[i + 1].get("startTime", 0) - clips[i - 1].get("endTime", 0)
-            if time_gap <= 30:
-                clip["jerseyNumberSeen"] = target_jersey
-                clip["jerseySmoothed"] = True
-
-    return clips
-
-
-def _classify_error_type(message: str) -> str:
-    """Classify error into frontend-friendly type."""
-    msg = message.lower()
-    if "download" in msg or "youtube" in msg or "yt-dlp" in msg or "403" in msg or "sign in" in msg:
-        return "download_blocked"
-    if "timeout" in msg or "timed out" in msg or "deadline" in msg:
-        return "timeout"
-    if "detection" in msg or "ocr" in msg or "jersey" in msg or "model" in msg:
-        return "detection_failed"
-    return "detection_failed"
-
-
 def _error_response(
     message: str,
     elapsed: float,
     layer_timings: dict | None = None,
-    error_type: str | None = None,
 ) -> dict:
-    cookie_warning = _check_cookie_warning()
-    result: dict = {
+    return {
         "clips": [],
         "layerUsed": "none",
-        "error_type": error_type or _classify_error_type(message),
         "elapsed": round(elapsed, 1),
         "videoDuration": 0,
         "framesProcessed": 0,
@@ -4108,6 +3903,3 @@ def _error_response(
         },
         "error": message,
     }
-    if cookie_warning:
-        result["cookies_warning"] = cookie_warning
-    return result

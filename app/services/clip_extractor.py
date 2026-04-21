@@ -16,107 +16,6 @@ from app.services.play_classifier import ClassificationResult, classify_play
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ── Play segmentation from motion patterns ───────────────────────────
-def segment_plays_from_motion(
-    motion_scores: dict[float, float],
-    sport: str = "football",
-) -> list[tuple[float, float]]:
-    """Detect individual plays from motion score time series.
-
-    Football rhythm: ~5s of action (snap → whistle) + ~25s dead ball.
-    Returns list of (start_time, end_time) play segments.
-    """
-    if not motion_scores or sport.lower() != "football":
-        return []
-
-    sorted_ts = sorted(motion_scores.keys())
-    if len(sorted_ts) < 3:
-        return []
-
-    scores = [motion_scores[t] for t in sorted_ts]
-    mean_motion = sum(scores) / len(scores)
-
-    # Threshold: motion above mean indicates active play
-    # Use adaptive threshold: mean + 0.3*std to catch most plays
-    variance = sum((s - mean_motion) ** 2 for s in scores) / len(scores)
-    std_motion = variance ** 0.5
-    play_threshold = max(8.0, mean_motion + 0.3 * std_motion)
-
-    plays: list[tuple[float, float]] = []
-    in_play = False
-    play_start = 0.0
-
-    for i, t in enumerate(sorted_ts):
-        motion = motion_scores[t]
-        if not in_play and motion > play_threshold:
-            # Play start — motion spike
-            in_play = True
-            play_start = t
-        elif in_play and motion < play_threshold * 0.5:
-            # Play end — motion drops
-            in_play = False
-            play_end = t
-            duration = play_end - play_start
-            if 1.5 <= duration <= 20.0:  # Reasonable play duration
-                plays.append((play_start, play_end))
-
-    # Close any open play
-    if in_play:
-        play_end = sorted_ts[-1]
-        duration = play_end - play_start
-        if 1.5 <= duration <= 20.0:
-            plays.append((play_start, play_end))
-
-    LOGGER.info("Play segmentation: %d plays detected (threshold=%.1f, mean=%.1f)",
-                len(plays), play_threshold, mean_motion)
-    return plays
-
-
-def compute_crowd_energy_boost(
-    energy_curve: list | None,
-    clip_start: float,
-    clip_end: float,
-) -> float:
-    """Compute crowd energy boost for a clip time range.
-
-    Returns boost value 0-25 based on audio energy spikes (crowd noise).
-    """
-    if not energy_curve:
-        return 0.0
-
-    # Get energy values in clip range
-    clip_energies = [
-        pt.energy for pt in energy_curve
-        if clip_start - 1 <= pt.timestamp <= clip_end + 2
-    ]
-    if not clip_energies:
-        return 0.0
-
-    # Get baseline from full curve
-    all_energies = [pt.energy for pt in energy_curve]
-    mean_e = sum(all_energies) / len(all_energies) if all_energies else 0
-    variance = sum((e - mean_e) ** 2 for e in all_energies) / len(all_energies) if all_energies else 0
-    std_e = variance ** 0.5
-
-    # Peak energy in clip range
-    peak = max(clip_energies)
-    # How many standard deviations above mean
-    if std_e > 0.001:
-        z_score = (peak - mean_e) / std_e
-    else:
-        z_score = 0.0
-
-    # Boost: 0-25 points scaled by z-score (>2 std = significant crowd reaction)
-    if z_score > 3.0:
-        return 25.0
-    elif z_score > 2.0:
-        return 15.0
-    elif z_score > 1.0:
-        return 8.0
-    return 0.0
-
-
 # v4 outcome actions that auto-boost clip grade to Elite
 _ELITE_OUTCOMES = {"made_shot", "touchdown", "goal"}
 # v4 outcome actions that boost clip score by fixed amount
@@ -149,10 +48,6 @@ MIN_CLIP_DURATION = 3.0
 MAX_CLIP_DURATION = 30.0
 # Shorter clips for full-game analysis (>1800s videos)
 FULL_GAME_MAX_CLIP_DURATION = 15.0
-
-# ── Hard caps on clip count ──────────────────────────────────────────
-MAX_CLIPS_PER_GAME = 35   # Absolute max clips returned
-MAX_CLIPS_PER_HOUR = 20   # Per hour of video
 
 # Maximum distance between jersey detections to cluster them (seconds)
 # Basketball: 3s gap — fast-paced, plays change quickly
@@ -230,23 +125,9 @@ def extract_clips(
     # ── Step 0: Jitter filter — remove isolated 1-frame false positives ──
     # Full-game mode: wider neighbor window because frames are 8+ seconds
     # apart at 1fps.  Also lower confidence bypass (v5 OCR averages 0.4-0.45).
-    # Standard mode: use adaptive window based on actual detection density.
-    # With uniform frame sampling, frames can be 3s+ apart — fixed 2s window
-    # would filter out almost everything.
-    _is_full_game = video_duration > 600  # > 10 min = full game (matches chunked pipeline threshold)
-    if _is_full_game:
-        _jitter_window = 10.0
-        _jitter_conf_bypass = 0.3
-    else:
-        # Adaptive: compute median gap between detections
-        _sorted_ts = sorted(d.timestamp for d in detections)
-        if len(_sorted_ts) >= 2:
-            _gaps = [_sorted_ts[i+1] - _sorted_ts[i] for i in range(len(_sorted_ts)-1)]
-            _median_gap = sorted(_gaps)[len(_gaps) // 2]
-            _jitter_window = max(2.0, _median_gap * 1.5)
-        else:
-            _jitter_window = 4.0
-        _jitter_conf_bypass = 0.4
+    _is_full_game = video_duration > 1800
+    _jitter_window = 10.0 if _is_full_game else 2.0
+    _jitter_conf_bypass = 0.3 if _is_full_game else 0.5
     sorted_dets = sorted(detections, key=lambda d: d.timestamp)
     if len(sorted_dets) >= 3:
         filtered_dets: list[DetectionPoint] = []
@@ -268,11 +149,9 @@ def extract_clips(
     clusters: list[list[DetectionPoint]] = []
     current_cluster: list[DetectionPoint] = []
 
-    # Full-game mode: tuned for ~600 frames per 30-min chunk (frames every ~3s)
-    # Football play = ~5-7s action + ~25-30s dead ball → gap=5 separates plays
-    # Basketball = continuous action → gap=4 keeps possessions separate
+    # Full-game mode: wider cluster gap because frames are 1fps (8-10s apart)
     if _is_full_game:
-        cluster_gap = 5.0 if sport.lower() == "football" else 3.0
+        cluster_gap = 8.0  # Wider gap for sparse frames
     elif sport.lower() == "football":
         cluster_gap = FOOTBALL_CLUSTER_GAP
     else:
@@ -301,6 +180,9 @@ def extract_clips(
             if boundary.start_time - 3 <= first_t and last_t <= boundary.end_time + 3:
                 audio_bounded = True
                 audio_confidence = boundary.confidence
+                # Use audio boundary for clip edges if tighter
+                first_t = min(first_t, boundary.start_time)
+                last_t = max(last_t, boundary.end_time)
                 break
 
         # Aggregate signals from all detections in cluster
@@ -378,15 +260,9 @@ def extract_clips(
             v4_outcome=dominant_v4,
         )
 
-        # ── Crowd energy boost ───────────────────────────────────────
-        crowd_boost = compute_crowd_energy_boost(
-            audio_result.energy_curve if audio_result else None,
-            start_time, end_time,
-        )
-
         # ── v4: Apply outcome detection boosts ─────────────────────────
         v4_outcomes = [d.v4_outcome for d in cluster if d.v4_outcome]
-        outcome_score = min(100, classification.score + int(crowd_boost))
+        outcome_score = classification.score
         outcome_grade = classification.grade
 
         if v4_outcomes:
@@ -455,25 +331,16 @@ def extract_clips(
                 clip.description = "Game Action"
 
     # ── Step 3: Merge overlapping AND adjacent clips ─────────────────────
-    # Merge clips that overlap OR are within gap of each other.
-    # Football: tighter gap (2s) — plays are well-separated by 25-30s dead ball.
-    # Full-game basketball: tighter gap (2s) — supplement points ~10s apart,
-    # expansion 4.5s leaves only 5.5s gap which cascades with 5s proximity.
-    # Short clips / other sports: 5s gap for continuous action.
-    if sport.lower() == "football" or (_is_full_game and sport.lower() == "basketball"):
-        PROXIMITY_GAP = 2.0
-    else:
-        PROXIMITY_GAP = 5.0
-    MOTION_SIMILARITY = 20.0
+    # Merge clips that overlap OR are within 2s of each other with similar
+    # motion scores (±15). This prevents consecutive 5s windows with
+    # identical motion scores from appearing as separate clips.
+    PROXIMITY_GAP = 2.0
+    MOTION_SIMILARITY = 15.0
     clips.sort(key=lambda c: c.start_time)
     merged: list[ExtractedClip] = []
-    _merge_count = 0
 
     for clip in clips:
-        if merged and not _is_full_game:
-            # Merge step: only for short clips / non-full-game.
-            # Full-game clips are already well-separated by dedup distance
-            # and merging causes chain collapse across entire video.
+        if merged:
             prev = merged[-1]
             gap = clip.start_time - prev.end_time
             overlaps = gap < 0
@@ -486,7 +353,6 @@ def extract_clips(
             )
 
             if overlaps or adjacent_similar:
-                _merge_count += 1
                 # Merge — keep the higher-scoring one's metadata
                 if clip.score > prev.score:
                     merged[-1] = ExtractedClip(
@@ -515,20 +381,11 @@ def extract_clips(
     # ── Step 3.5: Quality gate — require at least one meaningful signal ──
     # Clips with no jersey, no v4 outcome, low motion, and no audio event
     # are likely noise from dead ball frames or camera pans.
-    # Football: skip quality gate entirely — at 640x360, Farneback motion
-    # scores are 0-10 (mean across full frame), too low for any threshold.
-    # Football clips are already gated by score threshold (>=15) later.
     gated: list[ExtractedClip] = []
-    # Full games: skip quality gate — clips already filtered by motion/score thresholds
-    # in chunked pipeline. Quality gate at motion>15 was too aggressive for basketball
-    # where motion is continuous (not spike-based like football).
     for clip in merged:
-        if _is_football or _is_full_game:
-            gated.append(clip)
-            continue
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
-        has_motion = (clip.signals.get("motion", 0) or 0) > 8  # Lowered from 15
+        has_motion = (clip.signals.get("motion", 0) or 0) > 30
         has_audio = bool(clip.signals.get("audio"))
         if has_jersey or has_outcome or has_motion or has_audio:
             gated.append(clip)
@@ -545,47 +402,16 @@ def extract_clips(
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)
 
-    # Filter out low-quality clips
-    # Full-game mode: sport-specific cut thresholds
-    # Basketball: scores average 16-20 without jersey/outcome → threshold 10
-    # Football: QB boosts push scores higher → threshold 15
-    # Other: threshold 15
-    _is_football = sport.lower() == "football"
-    _is_basketball = sport.lower() == "basketball"
-    _FOOTBALL_MIN_CLIPS = 15  # Target minimum for football
+    # Filter out "Cut" grade clips
+    # Full-game mode: lower cut threshold to include more clips (target 20+)
     if _is_full_game:
-        _full_game_thresh = 10 if _is_basketball else 15 if _is_football else 15
-        result = [c for c in merged if c.score >= _full_game_thresh]
-        LOGGER.info("Full-game score filter: %d/%d clips pass threshold %d (sport=%s)",
-                    len(result), len(merged), _full_game_thresh, sport)
-    elif _is_football:
-        # Football: keep clips with score >= 15 (lower than other sports)
-        result = [c for c in merged if c.score >= 15]
-        # Promote low-score football clips to "Decent" grade
-        for clip in result:
-            if clip.grade == "Cut":
-                clip.grade = "Decent"
+        result = [c for c in merged if c.score >= 20]
     else:
         result = [c for c in merged if c.grade != "Cut"]
 
-    # ── Sport clip targets: ensure minimum clips for full games ─────────
-    _SPORT_MIN_CLIPS = {"football": 15, "basketball": 15, "lacrosse": 10}
-    _min_clips = _SPORT_MIN_CLIPS.get(sport.lower(), 10) if _is_full_game else 0
-    if _min_clips and len(result) < _min_clips and len(merged) > len(result):
-        remaining = [c for c in merged if c not in result]
-        remaining.sort(key=lambda c: c.score, reverse=True)
-        needed = _min_clips - len(result)
-        for clip in remaining[:needed]:
-            clip.grade = "Decent"
-            result.append(clip)
-        result.sort(key=lambda c: c.score, reverse=True)
-        LOGGER.info(
-            "%s clip target: added %d clips to reach %d (target=%d)",
-            sport, min(needed, len(remaining)), len(result), _min_clips,
-        )
-
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
-    rescue_threshold = 15 if _is_football else 25
+    # Football: rescue aggressively — jersey OCR rarely works on football footage
+    rescue_threshold = 15 if sport.lower() == "football" else 25
     if not result and merged:
         rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:
@@ -597,51 +423,9 @@ def extract_clips(
                 len(merged), len(result), rescue_threshold, sport,
             )
 
-    # ── Step 5: Hard cap — keep only the best N clips ───────────────────
-    result = _select_best_clips(result, video_duration)
-
     LOGGER.info(
-        "Extracted %d clips from %d detections (%d clusters, %d merged, %d after cap)",
-        len(result), len(detections), len(clusters), len(merged), len(result),
+        "Extracted %d clips from %d detections (%d clusters, %d after merge/filter)",
+        len(result), len(detections), len(clusters), len(result),
     )
 
     return result
-
-
-def _get_max_clips(video_duration_seconds: float) -> int:
-    """Compute max clip count based on video duration."""
-    if video_duration_seconds <= 0:
-        return MAX_CLIPS_PER_GAME
-    hours = max(1.0, video_duration_seconds / 3600.0)
-    return min(MAX_CLIPS_PER_GAME, int(hours * MAX_CLIPS_PER_HOUR))
-
-
-def _select_best_clips(
-    clips: list[ExtractedClip],
-    video_duration: float,
-) -> list[ExtractedClip]:
-    """Sort by score descending and keep only top N clips.
-
-    Prioritizes clips with jersey visibility and meaningful play types.
-    """
-    max_clips = _get_max_clips(video_duration)
-    if len(clips) <= max_clips:
-        return clips
-
-    # Sort: jersey-visible first, then by score descending
-    clips.sort(
-        key=lambda c: (
-            0 if c.jersey_visible else 1,  # jersey clips first
-            -c.score,                       # then highest score
-        ),
-    )
-
-    selected = clips[:max_clips]
-    # Re-sort by time for chronological output
-    selected.sort(key=lambda c: c.start_time)
-
-    LOGGER.info(
-        "Hard cap: %d → %d clips (max=%d, duration=%.0fs)",
-        len(clips), len(selected), max_clips, video_duration,
-    )
-    return selected

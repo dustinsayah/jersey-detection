@@ -31,8 +31,8 @@ WHISTLE_MIN_DURATION = 0.3
 WHISTLE_MAX_DURATION = 2.0
 WHISTLE_THRESHOLD = 0.3
 
-# Audio chunk size for YAMNet (seconds) — 60s halves inference count vs 30s
-YAMNET_CHUNK_SECONDS = 60
+# Audio chunk size for YAMNet (seconds)
+YAMNET_CHUNK_SECONDS = 30
 
 # YAMNet class indices for sports-relevant sounds
 YAMNET_WHISTLE_CLASSES = {399, 400, 401}  # Whistle, Steam whistle
@@ -160,75 +160,77 @@ def compute_crowd_energy(samples: np.ndarray, sample_rate: int) -> list[EnergyPo
 
 
 def classify_with_yamnet(samples: np.ndarray, sample_rate: int) -> list[AudioEvent]:
-    """Fast DSP-based audio classification replacing YAMNet TFLite.
-
-    Uses numpy RMS energy (crowd reactions) + scipy bandpass (whistles) + ZCR
-    (commentary detection). Processes 2.5hr audio in ~5-10s instead of ~600s.
-    Falls back to YAMNet TFLite only if fast path fails.
-    """
+    """Classify audio using YAMNet TFLite model in 30s chunks."""
     events: list[AudioEvent] = []
-    import time as _time
-    t0 = _time.perf_counter()
+
+    if not Path(YAMNET_MODEL_PATH).exists():
+        LOGGER.info("YAMNet model not found at %s, skipping", YAMNET_MODEL_PATH)
+        return events
 
     try:
-        # ── Fast path: numpy + scipy DSP (no ML model) ──
-        # Window size: 60 seconds to match YAMNet chunk granularity
-        window_seconds = YAMNET_CHUNK_SECONDS
-        window_samples = int(sample_rate * window_seconds)
-        n_windows = max(1, len(samples) // window_samples)
+        import tflite_runtime.interpreter as tflite
 
-        # Pre-compute windowed RMS energy (crowd reactions)
-        rms_values = np.zeros(n_windows)
-        for i in range(n_windows):
-            start = i * window_samples
-            end = min(start + window_samples, len(samples))
-            chunk = samples[start:end]
-            rms_values[i] = float(np.sqrt(np.mean(chunk ** 2)))
+        interpreter = tflite.Interpreter(model_path=YAMNET_MODEL_PATH)
+        interpreter.allocate_tensors()
 
-        # Crowd reaction threshold: windows above 85th percentile
-        if len(rms_values) > 2:
-            crowd_threshold = np.percentile(rms_values, 85)
-            for i, rms in enumerate(rms_values):
-                if rms > crowd_threshold:
-                    t = i * window_seconds
-                    confidence = min(1.0, (rms / crowd_threshold - 1.0) * 2)
-                    events.append(AudioEvent(
-                        timestamp=t,
-                        event_type="cheering",
-                        confidence=max(0.3, confidence),
-                    ))
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
 
-        # Commentary detection: ZCR (moderate = speech, high = noise, low = silence)
-        zcr_values = np.zeros(n_windows)
-        for i in range(n_windows):
-            start = i * window_samples
-            end = min(start + window_samples, len(samples))
-            chunk = samples[start:end]
-            if len(chunk) > 1:
-                zero_crossings = np.sum(np.abs(np.diff(np.sign(chunk))) > 0)
-                zcr_values[i] = zero_crossings / len(chunk)
+        # YAMNet expects 16kHz mono audio
+        if sample_rate != 16000:
+            from scipy.signal import resample
+            num_samples = int(len(samples) * 16000 / sample_rate)
+            samples = resample(samples, num_samples)
+            sample_rate = 16000
 
-        # Speech has moderate ZCR (0.02-0.15) and moderate energy
-        if len(zcr_values) > 2 and len(rms_values) > 2:
-            rms_low = np.percentile(rms_values, 30)
-            for i in range(n_windows):
-                if 0.02 < zcr_values[i] < 0.15 and rms_values[i] > rms_low:
-                    t = i * window_seconds
-                    # Confidence based on how "speech-like" the ZCR is
-                    zcr_center = 0.07  # typical speech ZCR
-                    zcr_dist = abs(zcr_values[i] - zcr_center) / 0.06
-                    confidence = max(0.3, min(1.0, 1.0 - zcr_dist))
-                    events.append(AudioEvent(
-                        timestamp=t,
-                        event_type="commentary",
-                        confidence=confidence,
-                    ))
+        chunk_samples = YAMNET_CHUNK_SECONDS * sample_rate
 
-        elapsed_ms = round((_time.perf_counter() - t0) * 1000)
-        LOGGER.info("Fast audio classification: %d events in %dms (no YAMNet)", len(events), elapsed_ms)
+        for chunk_start in range(0, len(samples), chunk_samples):
+            chunk = samples[chunk_start:chunk_start + chunk_samples]
+            if len(chunk) < sample_rate:  # Skip very short chunks
+                continue
 
+            chunk_time = chunk_start / sample_rate
+
+            # Pad to expected input size if needed
+            expected_len = input_details[0]["shape"][-1] if len(input_details[0]["shape"]) > 1 else len(chunk)
+            if len(chunk) < expected_len:
+                chunk = np.pad(chunk, (0, expected_len - len(chunk)))
+            elif len(chunk) > expected_len:
+                chunk = chunk[:expected_len]
+
+            chunk = chunk.astype(np.float32)
+            if len(input_details[0]["shape"]) == 1:
+                interpreter.resize_tensor_input(input_details[0]["index"], chunk.shape)
+                interpreter.allocate_tensors()
+
+            interpreter.set_tensor(input_details[0]["index"], chunk)
+            interpreter.invoke()
+
+            scores = interpreter.get_tensor(output_details[0]["index"])
+            if len(scores.shape) > 1:
+                scores = scores.mean(axis=0)  # Average over time frames
+
+            # Check for sports-relevant sounds
+            for class_set, event_type in [
+                (YAMNET_WHISTLE_CLASSES, "whistle"),
+                (YAMNET_CHEERING_CLASSES, "cheering"),
+                (YAMNET_BUZZER_CLASSES, "buzzer"),
+                (YAMNET_SPEECH_CLASSES, "commentary"),
+            ]:
+                for idx in class_set:
+                    if idx < len(scores) and scores[idx] > 0.3:
+                        events.append(AudioEvent(
+                            timestamp=chunk_time,
+                            event_type=event_type,
+                            confidence=float(scores[idx]),
+                        ))
+                        break  # One event per type per chunk
+
+    except ImportError:
+        LOGGER.info("tflite_runtime not installed, skipping YAMNet classification")
     except Exception as exc:
-        LOGGER.warning("Fast audio classification failed: %s — skipping", exc)
+        LOGGER.warning("YAMNet classification failed: %s", exc)
 
     return events
 

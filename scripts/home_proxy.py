@@ -26,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 
+import requests as _requests
+
 from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
@@ -34,10 +36,59 @@ log = logging.getLogger("home_proxy")
 
 SECRET = os.environ.get("HOME_PROXY_SECRET", "clipt-home-proxy-2026")
 
+# Railway API config (for auto-updating HOME_PROXY_URL when tunnel URL changes)
+RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "")
+RAILWAY_PROJECT_ID = "ac3e09ae-e3c2-41f8-8636-63f5b50d6936"
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "9aa045d4-2040-4c3d-b67d-cb14ed9e7a03")
+RAILWAY_ENV_ID = os.environ.get("RAILWAY_ENV_ID", "4b08fce3-a80f-41f0-8fe1-2aaef8a015ba")
+
 # Track active downloads to prevent overload
 _active_downloads = 0
+_tunnel_url = ""
+_start_time = time.time()
 _lock = threading.Lock()
 MAX_CONCURRENT = 2
+
+
+def update_railway_proxy_url(tunnel_url: str) -> bool:
+    """Update Railway HOME_PROXY_URL env var via GraphQL API."""
+    if not RAILWAY_TOKEN:
+        log.warning("No RAILWAY_TOKEN set — skipping Railway update")
+        return False
+
+    query = """
+    mutation UpsertVariables($input: VariableCollectionUpsertInput!) {
+      variableCollectionUpsert(input: $input)
+    }
+    """
+    variables = {
+        "input": {
+            "projectId": RAILWAY_PROJECT_ID,
+            "serviceId": RAILWAY_SERVICE_ID,
+            "environmentId": RAILWAY_ENV_ID,
+            "variables": {"HOME_PROXY_URL": tunnel_url},
+        }
+    }
+
+    try:
+        resp = _requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            json={"query": query, "variables": variables},
+            headers={
+                "Authorization": f"Bearer {RAILWAY_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200 and "errors" not in resp.json():
+            log.info("Railway updated: HOME_PROXY_URL = %s", tunnel_url)
+            return True
+        else:
+            log.error("Railway update failed: %s %s", resp.status_code, resp.text[:200])
+            return False
+    except Exception as e:
+        log.error("Railway update error: %s", e)
+        return False
 
 
 def _cleanup_later(path: str, delay: int = 120):
@@ -51,6 +102,31 @@ def _cleanup_later(path: str, delay: int = 120):
     threading.Timer(delay, _rm).start()
 
 
+def _find_cookie_file() -> str | None:
+    """Find YouTube cookies file if it exists."""
+    script_dir = Path(__file__).parent
+    candidates = [
+        script_dir / "youtube_cookies.txt",
+        script_dir / "cookies.txt",
+        script_dir.parent / "youtube_cookies.txt",
+        script_dir.parent / "app" / "youtube_cookies.txt",
+        Path.home() / "youtube_cookies.txt",
+    ]
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 100:
+            return str(p)
+    return None
+
+
+# YouTube client strategies to try (in order)
+_YT_CLIENTS = [
+    "android",          # Best for bypassing "video not available" errors
+    "web_creator",      # Reliable but may require cookies
+    "mweb",             # Mobile web fallback
+    None,               # Default (no override)
+]
+
+
 @app.route("/health")
 def health():
     """Health check — Railway pings this to see if proxy is online."""
@@ -59,11 +135,28 @@ def health():
         ver = yt_dlp.version.__version__
     except Exception:
         ver = "unknown"
+    cookie_file = _find_cookie_file()
     return jsonify({
         "status": "ok",
         "type": "home_proxy",
         "yt_dlp_version": ver,
         "active_downloads": _active_downloads,
+        "has_cookies": cookie_file is not None,
+        "cookie_file": cookie_file,
+    })
+
+
+@app.route("/status")
+def status():
+    """Extended status for monitoring."""
+    import platform
+    return jsonify({
+        "status": "ok",
+        "type": "home_proxy",
+        "active_downloads": _active_downloads,
+        "uptime_seconds": int(time.time() - _start_time),
+        "platform": platform.system(),
+        "python": platform.python_version(),
     })
 
 
@@ -93,6 +186,7 @@ def download():
     start_sec = float(data.get("start_sec", 0))
     end_sec = float(data.get("end_sec", 60))
     quality = int(data.get("quality", 720))
+    preferred_client = data.get("preferred_client")  # Railway can hint which client
 
     # Concurrency limit
     with _lock:
@@ -130,7 +224,7 @@ def download():
             fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
             log.info("ffmpeg not installed — using pre-muxed format (360p max)")
 
-        ydl_opts = {
+        base_opts = {
             "format": fmt,
             "noplaylist": True,
             "quiet": True,
@@ -139,30 +233,79 @@ def download():
         }
 
         if has_ffmpeg:
-            ydl_opts["merge_output_format"] = "mp4"
+            base_opts["merge_output_format"] = "mp4"
 
         # Add time range if specified (requires ffmpeg)
         if has_ffmpeg and end_sec > start_sec > 0:
-            ydl_opts["download_ranges"] = _ytdl.utils.download_range_func(
+            base_opts["download_ranges"] = _ytdl.utils.download_range_func(
                 None, [(start_sec, end_sec)]
             )
         elif has_ffmpeg and end_sec > 0:
-            ydl_opts["download_ranges"] = _ytdl.utils.download_range_func(
+            base_opts["download_ranges"] = _ytdl.utils.download_range_func(
                 None, [(0, end_sec)]
             )
         elif not has_ffmpeg and (end_sec > start_sec > 0 or end_sec > 0):
             log.warning("ffmpeg not installed — downloading full video (no time trimming)")
 
-        # Download using yt-dlp Python API
-        try:
-            with _ytdl.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except _ytdl.DownloadError as e:
-            log.error("yt-dlp failed: %s", str(e)[:500])
-            return jsonify({"error": "download_failed", "detail": str(e)[:300]}), 500
-        except Exception as e:
-            log.error("yt-dlp unexpected error: %s", str(e)[:500])
-            return jsonify({"error": "download_failed", "detail": str(e)[:300]}), 500
+        # Add cookies if available
+        cookie_file = _find_cookie_file()
+        if cookie_file:
+            base_opts["cookiefile"] = cookie_file
+            log.info("Using cookies from: %s", cookie_file)
+
+        # Build client list — preferred client first if specified
+        clients = list(_YT_CLIENTS)
+        if preferred_client and preferred_client in clients:
+            clients.remove(preferred_client)
+            clients.insert(0, preferred_client)
+        elif preferred_client:
+            clients.insert(0, preferred_client)
+
+        # Try multiple YouTube client strategies
+        last_error = None
+        for client in clients:
+            ydl_opts = dict(base_opts)
+            if client:
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                log.info("Trying client: %s", client)
+            else:
+                log.info("Trying default client")
+
+            # Clean up any partial files from previous attempt
+            for f in Path(tmp_dir).glob("*"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+            try:
+                with _ytdl.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                # Check if download produced a valid file
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                    log.info("Download succeeded with client: %s", client or "default")
+                    break
+                # Check for files with different names
+                found = False
+                for fp in Path(tmp_dir).iterdir():
+                    if fp.stat().st_size > 10000:
+                        found = True
+                        break
+                if found:
+                    log.info("Download succeeded (alt path) with client: %s", client or "default")
+                    break
+            except _ytdl.DownloadError as e:
+                last_error = str(e)[:300]
+                log.warning("Client %s failed: %s", client or "default", last_error[:100])
+                continue
+            except Exception as e:
+                last_error = str(e)[:300]
+                log.warning("Client %s error: %s", client or "default", last_error[:100])
+                continue
+        else:
+            # All clients failed
+            log.error("All download strategies failed: %s", last_error)
+            return jsonify({"error": "download_failed", "detail": last_error or "all clients failed"}), 500
 
         # Log everything in the temp directory for debugging
         all_files = []
@@ -259,6 +402,74 @@ def extract_info():
             })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/test-url", methods=["POST"])
+def test_url():
+    """Test if a YouTube URL can be resolved — tries all clients, reports which work."""
+    data = request.json or {}
+    if data.get("secret") != SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "no url"}), 400
+
+    import yt_dlp as _ytdl
+
+    cookie_file = _find_cookie_file()
+    results = {}
+
+    for client in _YT_CLIENTS:
+        label = client or "default"
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+
+        try:
+            with _ytdl.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                formats = info.get("formats", [])
+                video_fmts = [f for f in formats if f.get("height") and f.get("vcodec") != "none"]
+                best_h = max((f.get("height", 0) for f in video_fmts), default=0) if video_fmts else 0
+                results[label] = {
+                    "status": "ok",
+                    "title": info.get("title"),
+                    "duration": info.get("duration"),
+                    "best_height": best_h,
+                    "format_count": len(video_fmts),
+                }
+        except Exception as e:
+            results[label] = {"status": "failed", "error": str(e)[:200]}
+
+    return jsonify({
+        "url": url,
+        "has_cookies": cookie_file is not None,
+        "results": results,
+    })
+
+
+@app.route("/set-tunnel-url", methods=["POST"])
+def set_tunnel_url():
+    """Called by run_home_proxy.bat after tunnel URL is detected.
+    Updates Railway HOME_PROXY_URL automatically."""
+    global _tunnel_url
+    data = request.json or {}
+    url = data.get("url", "")
+    if not url:
+        return jsonify({"error": "no url"}), 400
+
+    _tunnel_url = url
+    log.info("Tunnel URL set: %s", url)
+
+    # Update Railway in background thread
+    def _bg():
+        update_railway_proxy_url(url)
+    threading.Thread(target=_bg, daemon=True).start()
+
+    return jsonify({"status": "ok", "url": url, "railway_update": "queued"})
 
 
 if __name__ == "__main__":

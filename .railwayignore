@@ -3,7 +3,6 @@
 # The Dockerfile's COPY app /app/app will use whatever is in the build context.
 # For fresh deploys, models must be uploaded separately.
 app/model/*.pt
-app/model/*.pt.part_*
 app/model/*.pth
 app/model/*.ckpt
 app/model/public/
@@ -16,3 +15,6 @@ tests/
 *.zip
 .git/
 __pycache__/
+*.part_aa
+*.part_ab
+*.safetensors

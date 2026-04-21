@@ -51,7 +51,7 @@ class TestDictDetectionHandling:
         from app.services.analyze_pipeline import _run_jersey_detection
 
         with patch(
-            "app.services.detection_service.DetectionService"
+            "app.services.analyze_pipeline.DetectionService"
         ) as MockService:
             instance = MockService.return_value
             instance.detect.return_value = self.SAMPLE_DICTS
@@ -78,7 +78,7 @@ class TestDictDetectionHandling:
         bare_dicts = [{"timestamp": 5.0, "confidence": 0.7}]
 
         with patch(
-            "app.services.detection_service.DetectionService"
+            "app.services.analyze_pipeline.DetectionService"
         ) as MockService:
             instance = MockService.return_value
             instance.detect.return_value = bare_dicts
@@ -102,7 +102,7 @@ class TestDictDetectionHandling:
         from app.services.analyze_pipeline import _run_jersey_detection
 
         with patch(
-            "app.services.detection_service.DetectionService"
+            "app.services.analyze_pipeline.DetectionService"
         ) as MockService:
             instance = MockService.return_value
             instance.detect.return_value = []
@@ -311,9 +311,7 @@ class TestTemporalConsensusDict:
         confirmed = tc.filter_detections(dets, jersey_number=2)
         assert len(confirmed) >= 1
 
-    def test_filter_adapts_for_single_isolated_detection(self) -> None:
-        """With adaptive min_confirmations, a single detection is rescued
-        (min drops from 3 to 1 when total detections is very low)."""
+    def test_filter_rejects_single_isolated_detection(self) -> None:
         from app.services.temporal_consensus import TemporalConsensus
 
         tc = TemporalConsensus(min_confirmations=3, time_window=2.0)
@@ -321,5 +319,4 @@ class TestTemporalConsensusDict:
             {"timestamp": 8.0, "confidence": 0.9, "number_detected": 2, "layer": "ali"},
         ]
         confirmed = tc.filter_detections(dets, jersey_number=2)
-        # Adaptive behavior: min_confirmations drops to 1 for single detections
-        assert len(confirmed) == 1
+        assert len(confirmed) == 0

@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import subprocess
-import threading
 
 from contextlib import asynccontextmanager
 
@@ -69,49 +68,36 @@ def _verify_runtime_dependencies(settings) -> None:
         raise RuntimeError(f"Runtime dependency verification failed: {error}") from error
 
 
-def _warmup_models(application: FastAPI) -> None:
-    """Background thread: verify deps only. Models loaded on first request.
-
-    Ali detector (jersey_number_yolo11m.pt + yolo26n-seg.pt + public_reader)
-    uses ~1.1GB RSS. Railway OOM-kills at ~2.3GB. Skipping Ali warmup leaves
-    room for Roboflow v5 models (~700MB) + inference tensors (~400MB).
-    Ali detector loads on-demand via /detect endpoint if needed.
-    """
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Load models at startup so the first request doesn't wait."""
+    _configure_logging()
+    application.state.detector_ready = False
+    application.state.startup_error = None
     try:
+        from app.services.detection_detector import get_or_create_detector
         from app.services.detection_runtime import PipelineSettings
 
         settings = PipelineSettings()
         LOGGER.info(
-            "Warmup: verifying runtime deps (ffmpeg=%s, yt-dlp=%s)",
+            "Startup: verifying runtime deps (ffmpeg=%s, yt-dlp=%s)",
             settings.ffmpeg_binary, settings.yt_dlp_binary,
         )
         _verify_runtime_dependencies(settings)
-        # Ali detector NOT loaded at startup — saves ~1.1GB RSS.
-        # /analyze uses Roboflow v5 (loaded on first request).
-        # /detect loads Ali on-demand via get_or_create_detector().
+        LOGGER.info(
+            "Startup: loading models (yolo=%s, person=%s, reader=%s)",
+            settings.yolo_model_source, settings.person_model_source,
+            settings.jersey_reader_backend,
+        )
+        get_or_create_detector(settings)
         application.state.detector_ready = True
-        LOGGER.info("Warmup complete (deps verified, models deferred) — detector_ready=True")
+        LOGGER.info("Detection stack warmed up at startup — detector_ready=True")
     except Exception as error:
         application.state.startup_error = str(error)
         LOGGER.exception(
-            "Model warm-up failed — detector_ready stays False. Error: %s", error,
+            "Model warm-up failed — detector_ready will stay False, "
+            "/detect and /analyze will return 503. Error: %s", error,
         )
-
-
-@asynccontextmanager
-async def _lifespan(application: FastAPI):
-    """Start model loading in background so the app is immediately healthy."""
-    _configure_logging()
-    application.state.detector_ready = False
-    application.state.startup_error = None
-
-    if os.getenv("SKIP_MODEL_WARMUP", "").lower() in ("1", "true", "yes"):
-        LOGGER.info("SKIP_MODEL_WARMUP set — skipping all model loading at startup")
-        application.state.detector_ready = True
-    else:
-        LOGGER.info("App starting — launching model warmup in background thread")
-        thread = threading.Thread(target=_warmup_models, args=(application,), daemon=True)
-        thread.start()
     yield
 
 

@@ -54,7 +54,7 @@ urllib3==2.6.3
 uvicorn==0.41.0
 webcolors==25.10.0
 yt-dlp>=2024.12.1
-httpx[socks]>=0.28.0
+httpx>=0.28.0
 supervision>=0.25.0
 soundfile>=0.12.1
 librosa>=0.10.2

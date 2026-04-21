@@ -37,7 +37,32 @@ if %ERRORLEVEL% NEQ 0 (
     )
 )
 
-:: Start Flask server in background
+:: ============================================================
+:: Load tokens BEFORE starting Flask so it inherits them
+:: ============================================================
+
+:: Load Railway token for auto-update
+set RAILWAY_TOKEN=
+if exist "%~dp0.railway-token" (
+    set /p RAILWAY_TOKEN=<"%~dp0.railway-token"
+    echo Railway auto-update: ENABLED
+) else (
+    echo Railway auto-update: DISABLED (no .railway-token file)
+    echo To enable: save your Railway API token to %~dp0.railway-token
+)
+
+:: Load tunnel token
+set TUNNEL_TOKEN=
+if defined CLIPT_TUNNEL_TOKEN (
+    set TUNNEL_TOKEN=%CLIPT_TUNNEL_TOKEN%
+)
+if not defined TUNNEL_TOKEN (
+    if exist "%~dp0.tunnel-token" (
+        set /p TUNNEL_TOKEN=<"%~dp0.tunnel-token"
+    )
+)
+
+:: Start Flask server in background (inherits RAILWAY_TOKEN env var)
 echo Starting Home Proxy on port 5050...
 start "Clipt Home Proxy" /min python "%~dp0home_proxy.py"
 
@@ -53,37 +78,6 @@ if %ERRORLEVEL% NEQ 0 (
 )
 echo Home proxy is running on port 5050
 echo.
-
-:: ============================================================
-:: PERMANENT TUNNEL (preferred) vs QUICK TUNNEL (fallback)
-:: ============================================================
-:: If CLIPT_TUNNEL_TOKEN is set, use permanent named tunnel.
-:: This gives a fixed URL like proxy.cliptapp.com that never changes.
-:: Set the token once: set CLIPT_TUNNEL_TOKEN=eyJ...
-:: Or save it in: %~dp0.tunnel-token
-:: ============================================================
-
-set TUNNEL_TOKEN=
-if defined CLIPT_TUNNEL_TOKEN (
-    set TUNNEL_TOKEN=%CLIPT_TUNNEL_TOKEN%
-)
-if not defined TUNNEL_TOKEN (
-    if exist "%~dp0.tunnel-token" (
-        set /p TUNNEL_TOKEN=<"%~dp0.tunnel-token"
-    )
-)
-
-:: ============================================================
-:: Load Railway token for auto-update (reads from .railway-token file)
-:: ============================================================
-set RAILWAY_TOKEN=
-if exist "%~dp0.railway-token" (
-    set /p RAILWAY_TOKEN=<"%~dp0.railway-token"
-    echo Railway auto-update: ENABLED
-) else (
-    echo Railway auto-update: DISABLED (no .railway-token file)
-    echo To enable: save your Railway API token to %~dp0.railway-token
-)
 
 if defined TUNNEL_TOKEN (
     echo Using PERMANENT Cloudflare tunnel...

@@ -47,7 +47,7 @@ _DEFAULT_EXPAND = (2.0, 4.0)
 MIN_CLIP_DURATION = 3.0
 MAX_CLIP_DURATION = 30.0
 # Shorter clips for full-game analysis (>1800s videos)
-FULL_GAME_MAX_CLIP_DURATION = 15.0
+FULL_GAME_MAX_CLIP_DURATION = 20.0  # Allow longer plays to capture full action
 
 # Maximum distance between jersey detections to cluster them (seconds)
 # Basketball: 3s gap — fast-paced, plays change quickly
@@ -385,9 +385,12 @@ def extract_clips(
     for clip in merged:
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
-        has_motion = (clip.signals.get("motion", 0) or 0) > 30
+        clip_motion = clip.signals.get("motion", 0) or 0
+        has_high_motion = clip_motion > 50  # Raised from 30 — excludes sideline/huddle
         has_audio = bool(clip.signals.get("audio"))
-        if has_jersey or has_outcome or has_motion or has_audio:
+        # Require jersey OR (high motion + audio) OR outcome for quality
+        # Pure motion-only clips with no jersey are usually false positives
+        if has_jersey or has_outcome or (has_high_motion and has_audio) or (clip_motion > 65):
             gated.append(clip)
         else:
             LOGGER.debug(

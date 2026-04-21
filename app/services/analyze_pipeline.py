@@ -57,7 +57,7 @@ LOGGER = logging.getLogger(__name__)
 # Football-specific overrides
 FOOTBALL_CONF_THRESHOLD = 0.08  # Lower for better recall on 720p crops
 FOOTBALL_MIN_CLIP = 3.0
-FOOTBALL_MAX_CLIP = 12.0
+FOOTBALL_MAX_CLIP = 20.0  # Allow longer plays (was 12.0 — cut actual highlights short)
 
 # Frame sampling: how many FPS to extract for Roboflow layers.
 # Default 2 = 1 frame per 0.5s. Railway OOM kills at ~2.3GB;
@@ -3033,13 +3033,16 @@ async def _run_chunked_full_game(
                         _supplement_count, len(detection_points))
 
     # ── Motion/audio fallback if no OCR detections ──
+    # Only use motion fallback when jersey OCR truly found nothing.
+    # Raised thresholds to avoid flagging random sideline/huddle motion.
     if not detection_points and all_frame_timestamps:
-        motion_threshold = 8 if _is_football else 10
+        motion_threshold = 40 if _is_football else 35
         LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
         for t in all_frame_timestamps:
             motion = all_motion.get(t, 0)
             in_boundary = _in_audio_boundary(audio_result, t)
-            if motion > motion_threshold or in_boundary:
+            # Require BOTH high motion AND audio boundary, or very high motion alone
+            if (motion > motion_threshold and in_boundary) or motion > 60:
                 conf = motion / 100.0 * 0.7
                 if in_boundary:
                     conf = min(1.0, conf + 0.15)
@@ -3102,20 +3105,22 @@ async def _run_chunked_full_game(
                     _attr_count += 1
                     break
         # Method 2: motion-based — if jersey confirmed ANYWHERE and clip has
-        # significant motion, the player is likely on field during active plays
+        # very high motion, the player is likely on field during active plays.
+        # Raised threshold from 20 to 50 to avoid attributing jersey to
+        # random sideline/huddle clips.
         if _has_any_jersey:
             _motion_attr_count = 0
             for clip in clips:
                 if clip.jersey_visible:
                     continue
                 clip_motion = (clip.signals or {}).get("motion", 0) or 0
-                if clip_motion > 20:
+                if clip_motion > 50:
                     clip.jersey_visible = True
                     clip.jersey_number_seen = jersey_number
                     _motion_attr_count += 1
             if _motion_attr_count:
                 _attr_count += _motion_attr_count
-                LOGGER.info("Chunked: motion-based jersey attribution: %d clips (motion>20)", _motion_attr_count)
+                LOGGER.info("Chunked: motion-based jersey attribution: %d clips (motion>50)", _motion_attr_count)
         if _attr_count:
             LOGGER.info("Chunked: total jersey attribution: %d clips gained jersey=%d (window=%ds)",
                         _attr_count, jersey_number, _jersey_attr_window_c)

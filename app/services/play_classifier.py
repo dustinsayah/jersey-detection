@@ -175,10 +175,10 @@ def classify_play(
     #   Strong: next ~10% (clear highlight play)
     #   Decent: middle ~60% (player involved)
     #   Cut: bottom ~20% (not involved / dead ball)
-    # Football: lower thresholds (45/25) since jersey OCR rarely works at 360p
+    # Football: moderate thresholds — raised from 45/25 to reduce false positives
     _is_football = sport.lower() == "football"
-    _strong_thresh = 45 if _is_football else 55
-    _decent_thresh = 25 if _is_football else 35
+    _strong_thresh = 50 if _is_football else 55
+    _decent_thresh = 35 if _is_football else 35
     if score >= 75:
         grade = "Elite"
     elif score >= _strong_thresh:

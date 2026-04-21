@@ -38,6 +38,12 @@ SECRET = os.environ.get("HOME_PROXY_SECRET", "clipt-home-proxy-2026")
 
 # Railway API config (for auto-updating HOME_PROXY_URL when tunnel URL changes)
 RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "")
+if not RAILWAY_TOKEN:
+    # Fallback: read from .railway-token file in the scripts directory
+    _token_file = Path(__file__).parent / ".railway-token"
+    if _token_file.exists():
+        RAILWAY_TOKEN = _token_file.read_text().strip()
+        log.info("Loaded Railway token from %s", _token_file)
 RAILWAY_PROJECT_ID = "ac3e09ae-e3c2-41f8-8636-63f5b50d6936"
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "9aa045d4-2040-4c3d-b67d-cb14ed9e7a03")
 RAILWAY_ENV_ID = os.environ.get("RAILWAY_ENV_ID", "4b08fce3-a80f-41f0-8fe1-2aaef8a015ba")

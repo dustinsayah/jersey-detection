@@ -83,7 +83,9 @@ def classify_play(
     play_label = matched_rule.label if matched_rule else "Game Action"
 
     # v4 outcome override: if v4 model detected a specific play type, prefer it
-    if v4_outcome and v4_outcome != "game_action":
+    # But NEVER override to special teams — those should only match via rules
+    _SPECIAL_TEAMS_TYPES = {"kickoff", "punt"}
+    if v4_outcome and v4_outcome != "game_action" and v4_outcome not in _SPECIAL_TEAMS_TYPES:
         # Look up if v4 outcome matches a known play type
         v4_rule = next(
             (r for r in sorted_rules if r.play_type == v4_outcome),
@@ -93,6 +95,14 @@ def classify_play(
             play_type = v4_rule.play_type
             play_label = v4_rule.label
             matched_rule = v4_rule
+
+    # Special teams downgrade: kickoff/punt without jersey = player not involved
+    # These clips have high motion from 22 players running but tracked player
+    # is usually not identifiable — demote to Cut-worthy score
+    if play_type in _SPECIAL_TEAMS_TYPES and jersey_confidence < 0.15:
+        LOGGER.debug("Special teams downgrade: %s with jersey_conf=%.2f", play_type, jersey_confidence)
+        play_type = play_type  # keep label for transparency
+        # Will get Cut grade from low score below
 
     # Compute weighted score
     score = _compute_score(
@@ -157,6 +167,12 @@ def classify_play(
         if pose_action == "jumping" and motion_score > 60:
             score = min(100, score + 10)
             LOGGER.debug("Basketball jumping+motion boost +10")
+
+    # Special teams penalty: kickoff/punt plays without jersey confirmation
+    # are almost never the tracked player's highlight — hard cap at 25
+    if play_type in ("kickoff", "punt") and jersey_confidence < 0.15:
+        score = min(score, 25)
+        LOGGER.debug("Special teams score cap: %s → max 25 (jersey=%.2f)", play_type, jersey_confidence)
 
     # Position-appropriate action without OCR: still valuable clip
     # If jersey wasn't detected but high-confidence action matches position role

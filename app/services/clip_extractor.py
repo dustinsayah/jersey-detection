@@ -38,13 +38,14 @@ _OUTCOME_SCORE_BOOSTS = {
 # Clip boundary expansion — sport-specific defaults (seconds)
 _SPORT_EXPAND = {
     "basketball": (1.5, 3.0),  # Fast game, tighter clips
-    "football": (2.5, 5.0),    # Play develops slower, needs pre-snap context
+    "football": (3.0, 6.0),    # Pre-snap lineup + post-play follow-through
     "lacrosse": (1.5, 3.5),    # Fast transitions
 }
 _DEFAULT_EXPAND = (2.0, 4.0)
 
-# Minimum clip duration
+# Minimum clip duration — football needs longer clips to capture full plays
 MIN_CLIP_DURATION = 3.0
+FOOTBALL_MIN_CLIP_DURATION = 8.0
 MAX_CLIP_DURATION = 30.0
 # Shorter clips for full-game analysis (>1800s videos)
 FULL_GAME_MAX_CLIP_DURATION = 20.0  # Allow longer plays to capture full action
@@ -233,12 +234,13 @@ def extract_clips(
 
         # Enforce duration limits — shorter clips for full games
         _max_dur = FULL_GAME_MAX_CLIP_DURATION if _is_full_game else MAX_CLIP_DURATION
+        _min_dur = FOOTBALL_MIN_CLIP_DURATION if sport.lower() == "football" else MIN_CLIP_DURATION
         duration = end_time - start_time
-        if duration < MIN_CLIP_DURATION:
-            # Expand symmetrically
-            needed = MIN_CLIP_DURATION - duration
+        if duration < _min_dur:
+            # Expand symmetrically to meet minimum
+            needed = _min_dur - duration
             start_time = max(0, start_time - needed / 2)
-            end_time = start_time + MIN_CLIP_DURATION
+            end_time = start_time + _min_dur
         elif duration > _max_dur:
             end_time = start_time + _max_dur
 
@@ -381,8 +383,18 @@ def extract_clips(
     # ── Step 3.5: Quality gate — require at least one meaningful signal ──
     # Clips with no jersey, no v4 outcome, low motion, and no audio event
     # are likely noise from dead ball frames or camera pans.
+    # Special teams (kickoff/punt) without jersey are always filtered.
+    _SPECIAL_TEAMS = {"kickoff", "punt"}
     gated: list[ExtractedClip] = []
     for clip in merged:
+        # Always filter special teams without jersey — not player's highlight
+        if clip.play_type in _SPECIAL_TEAMS and not clip.jersey_visible:
+            LOGGER.debug(
+                "Quality gate: dropped special teams clip %.1f-%.1f (%s, no jersey)",
+                clip.start_time, clip.end_time, clip.play_type,
+            )
+            continue
+
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
         clip_motion = clip.signals.get("motion", 0) or 0

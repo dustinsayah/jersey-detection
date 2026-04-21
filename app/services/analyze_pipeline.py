@@ -3128,20 +3128,25 @@ async def _run_chunked_full_game(
     # ── Fallback: user-claimed jersey when OCR found ZERO detections ──
     # Full-game OCR often fails on navy/dark jerseys at broadcast distance.
     # When user specified their jersey number and we found active plays via
-    # motion, trust the user's claim for clips with significant motion.
+    # motion + audio, trust the user's claim but ONLY for high-quality clips.
+    # Require BOTH high motion AND audio boundary to avoid stamping jersey
+    # on kickoffs/dead ball/sideline clips.
     if not _has_any_jersey and jersey_number > 0 and clips:
         _user_attr_count = 0
         for clip in clips:
             if clip.jersey_visible:
                 continue
             clip_motion = (clip.signals or {}).get("motion", 0) or 0
-            if clip_motion > 20:  # Active play motion threshold
+            has_audio = clip.signals.get("audio", False)
+            # Only attribute if high motion + audio boundary (real play),
+            # or very high motion alone (definite on-field action)
+            if (clip_motion > 45 and has_audio) or clip_motion > 60:
                 clip.jersey_visible = True
                 clip.jersey_number_seen = jersey_number
                 _user_attr_count += 1
         if _user_attr_count:
             LOGGER.info(
-                "Chunked: OCR=0 fallback — user-claimed jersey #%d applied to %d/%d clips (motion>20)",
+                "Chunked: OCR=0 fallback — user-claimed jersey #%d applied to %d/%d clips (motion>45+audio or >60)",
                 jersey_number, _user_attr_count, len(clips),
             )
 

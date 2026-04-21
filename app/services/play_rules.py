@@ -77,6 +77,26 @@ FOOTBALL_RULES: list[PlayTypeRule] = [
         priority=5,
     ),
     PlayTypeRule(
+        play_type="kickoff",
+        label="Kickoff",
+        conditions={
+            "motion_min": 60,
+            "play_duration_range": (5, 30),
+            # Kickoffs have high sustained motion, long duration, wide camera
+            # Distinguish from pass/run by NOT requiring throwing/whistle
+        },
+        priority=3,  # Below pass/run/sack so real plays win
+    ),
+    PlayTypeRule(
+        play_type="punt",
+        label="Punt",
+        conditions={
+            "motion_min": 50,
+            "play_duration_range": (3, 20),
+        },
+        priority=3,
+    ),
+    PlayTypeRule(
         play_type="formation",
         label="Pre-Snap Formation",
         conditions={

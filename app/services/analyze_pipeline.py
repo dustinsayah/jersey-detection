@@ -733,37 +733,56 @@ async def _run_analyze_pipeline_impl(
             video_duration = get_video_duration(local_video_path, settings.ffprobe_binary)
             LOGGER.info("Pipeline: video duration = %.1fs", video_duration)
 
-        # ── Trim to requested range if video is much longer ──
-        # Saves audio time (ffmpeg extracts only requested portion, not full video).
-        # Uses -t (not -ss) to preserve timestamps at 0-based for chunk alignment.
-        if (local_video_path and local_video_path.exists()
-                and time_range_end > 0 and video_duration > time_range_end * 1.1):
+        # ── Trim to requested time range ──
+        # Uses -ss (seek start) and -t (duration) to extract only the needed
+        # portion.  After trimming the video is 0-based, so extract_start/end
+        # are reset accordingly and _time_offset stores the original start so
+        # clip timestamps can be corrected before the final return.
+        _time_offset = 0.0  # seconds to add back to clip timestamps
+        _need_trim = (
+            local_video_path and local_video_path.exists()
+            and video_duration > 0
+            and (
+                time_range_start > 0
+                or (time_range_end > 0 and video_duration > time_range_end * 1.1)
+            )
+        )
+        if _need_trim:
             t_trim = time.perf_counter()
             trimmed_path = local_video_path.parent / "trimmed.mp4"
+            _trim_start = time_range_start if time_range_start > 0 else 0
+            _trim_end = time_range_end if time_range_end > 0 else video_duration
+            _trim_dur = _trim_end - _trim_start
             try:
                 import subprocess as _sp
-                _sp.run([
-                    settings.ffmpeg_binary, "-y",
-                    "-i", str(local_video_path),
-                    "-t", str(time_range_end),  # Keep 0 to time_range_end (preserves timestamps)
-                    "-c", "copy",
-                    str(trimmed_path),
-                ], capture_output=True, timeout=120)
+                cmd = [settings.ffmpeg_binary, "-y"]
+                if _trim_start > 0:
+                    cmd.extend(["-ss", str(_trim_start)])
+                cmd.extend(["-i", str(local_video_path),
+                            "-t", str(_trim_dur),
+                            "-c", "copy",
+                            str(trimmed_path)])
+                _sp.run(cmd, capture_output=True, timeout=120)
                 if trimmed_path.exists() and trimmed_path.stat().st_size > 0:
                     old_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
                     local_video_path.unlink(missing_ok=True)
                     local_video_path = trimmed_path
                     new_mb = round(local_video_path.stat().st_size / 1024 / 1024, 1)
-                    video_duration = time_range_end
-                    LOGGER.info("Pipeline: trimmed %sMB → %sMB (%.0fs video, keeping 0-%.0fs) in %.1fs",
-                                old_mb, new_mb, video_duration,
-                                time_range_end, time.perf_counter() - t_trim)
+                    _time_offset = _trim_start
+                    video_duration = _trim_dur
+                    extract_start = 0
+                    extract_end = _trim_dur
+                    LOGGER.info(
+                        "Pipeline: trimmed %sMB → %sMB (%.0fs-%.0fs → 0-%.0fs) in %.1fs",
+                        old_mb, new_mb, _trim_start, _trim_end,
+                        _trim_dur, time.perf_counter() - t_trim,
+                    )
             except Exception as exc:
                 LOGGER.warning("Pipeline: trim failed (using full video): %s", exc)
 
         # ── Determine effective duration for chunked vs standard path ──
         _effective_duration = video_duration
-        if time_range_end > time_range_start:
+        if _time_offset == 0 and time_range_end > time_range_start:
             _effective_duration = time_range_end - time_range_start
 
         # ── CHUNKED PIPELINE for long videos (>10 min) ─────────────────
@@ -777,7 +796,7 @@ async def _run_analyze_pipeline_impl(
                 "Pipeline: CHUNKED MODE — %.0fs video, processing in %ds chunks",
                 _effective_duration, _CHUNK_SIZE,
             )
-            return await _run_chunked_full_game(
+            _chunked_result = await _run_chunked_full_game(
                 local_video_path=local_video_path if (local_video_path and local_video_path.exists()) else None,
                 video_url=video_url if (video_url and is_youtube_url(video_url)) else None,
                 video_duration=video_duration if video_duration > 0 else _effective_duration,
@@ -785,8 +804,8 @@ async def _run_analyze_pipeline_impl(
                 jersey_color=jersey_color,
                 sport=sport,
                 position=position,
-                extract_start=time_range_start,
-                extract_end=time_range_end if time_range_end > 0 else (video_duration if video_duration > 0 else _effective_duration),
+                extract_start=extract_start,
+                extract_end=extract_end if extract_end > 0 else (video_duration if video_duration > 0 else _effective_duration),
                 enable_audio=enable_audio,
                 quality_mode=quality_mode,
                 youtube_strategy_used=youtube_strategy_used,
@@ -795,6 +814,12 @@ async def _run_analyze_pipeline_impl(
                 phases_used=phases_used,
                 cancel_event=cancel_event,
             )
+            # Restore absolute timestamps when video was trimmed from a non-zero start
+            if _time_offset > 0 and "clips" in _chunked_result:
+                for _c in _chunked_result["clips"]:
+                    _c["startTime"] = round(_c.get("startTime", 0) + _time_offset, 2)
+                    _c["endTime"] = round(_c.get("endTime", 0) + _time_offset, 2)
+            return _chunked_result
 
         # ── Step 2a: Load context-aware models for this request ──────────
         try:
@@ -2548,6 +2573,13 @@ async def _run_analyze_pipeline_impl(
             "clips_after_filter": len(clips_out),
             "memory_rss_mb": memory_rss_mb,
         }
+
+        # Restore absolute timestamps when video was trimmed from a non-zero start
+        if _time_offset > 0:
+            for _c in clips_out:
+                _c["startTime"] = round(_c.get("startTime", 0) + _time_offset, 2)
+                _c["endTime"] = round(_c.get("endTime", 0) + _time_offset, 2)
+            video_duration = time_range_end - time_range_start  # report requested range
 
         # Player summary for coaches
         player_summary = _build_player_summary(

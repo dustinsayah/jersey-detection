@@ -230,10 +230,16 @@ def download():
             fmt = (
                 f"bestvideo[height<={quality}]+bestaudio/"
                 f"best[height<={quality}][ext=mp4]/"
-                f"best[height<={quality}]/best"
+                f"best[height={quality}]/"
+                f"bestvideo[height<=480]+bestaudio/"
+                f"best[height<=480]/best"
             )
         else:
-            fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
+            fmt = (
+                f"best[height<={quality}][ext=mp4]/"
+                f"best[height={quality}]/"
+                f"best[height<=480]/best"
+            )
             log.info("ffmpeg not installed — using pre-muxed format (may be limited to 360p)")
 
         base_opts = {

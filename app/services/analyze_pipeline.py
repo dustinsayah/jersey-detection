@@ -55,7 +55,7 @@ from app.services.youtube_proxy import (
 LOGGER = logging.getLogger(__name__)
 
 # Football-specific overrides
-FOOTBALL_CONF_THRESHOLD = 0.08  # Lower for better recall on 720p crops
+FOOTBALL_CONF_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.06"))  # env-tunable, default lowered for wide-angle JV footage
 FOOTBALL_MIN_CLIP = 3.0
 FOOTBALL_MAX_CLIP = 20.0  # Allow longer plays (was 12.0 — cut actual highlights short)
 
@@ -3064,11 +3064,11 @@ async def _run_chunked_full_game(
             LOGGER.info("Chunked: motion supplement added %d points (total=%d)",
                         _supplement_count, len(detection_points))
 
-    # ── Motion/audio fallback if no OCR detections ──
-    # Only use motion fallback when jersey OCR truly found nothing.
-    # Raised thresholds to avoid flagging random sideline/huddle motion.
-    if not detection_points and all_frame_timestamps:
-        motion_threshold = 40 if _is_football else 35
+    # ── Motion/audio fallback when OCR finds too few detections ──
+    # Fire when jersey OCR found fewer than 3 detection points (was: 0 only).
+    # At 720p wide-angle JV footage, OCR often misses small jersey numbers.
+    if len(detection_points) < 3 and all_frame_timestamps:
+        motion_threshold = 35 if _is_football else 30
         LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
         for t in all_frame_timestamps:
             motion = all_motion.get(t, 0)

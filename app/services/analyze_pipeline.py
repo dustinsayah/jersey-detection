@@ -3064,17 +3064,90 @@ async def _run_chunked_full_game(
             LOGGER.info("Chunked: motion supplement added %d points (total=%d)",
                         _supplement_count, len(detection_points))
 
-    # ── Motion/audio fallback when OCR finds too few detections ──
-    # Fire when jersey OCR found fewer than 3 detection points (was: 0 only).
-    # At 720p wide-angle JV footage, OCR often misses small jersey numbers.
+    # ── Football cadence supplement (chunked pipeline) ──────────────────
+    # At 360p/640x360, motion scores are 0-10 — far too low for threshold-
+    # based detection. Use football's predictable play rhythm instead:
+    # ~1 play every 25-40 seconds.  Place a detection point every 22s at
+    # the highest-motion frame in each window.  This is the PRIMARY clip
+    # source when OCR fails on wide-angle JV footage.
+    _dp_before_cadence = len(detection_points)
+    if _is_football and _dp_before_cadence < 30 and all_frame_timestamps:
+        _existing_ts = {dp.timestamp for dp in detection_points}
+        _cadence = 22.0
+        _cadence_added = 0
+        _t_cursor = extract_start + 5.0
+        _t_end = extract_end - 5.0
+        while _t_cursor < _t_end:
+            best_t = None
+            best_motion = -1
+            for ft in all_frame_timestamps:
+                if abs(ft - _t_cursor) < _cadence / 2:
+                    m = all_motion.get(ft, 0)
+                    if m > best_motion and ft not in _existing_ts:
+                        best_t = ft
+                        best_motion = m
+            if best_t is not None:
+                in_boundary = _in_audio_boundary(audio_result, best_t)
+                conf = max(0.55, best_motion / 100.0 * 0.8)
+                if in_boundary:
+                    conf = min(0.9, conf + 0.15)
+                detection_points.append(DetectionPoint(
+                    timestamp=best_t,
+                    confidence=conf,
+                    jersey_visible=False,
+                    motion_score=best_motion,
+                    crowd_energy=_get_crowd_energy(audio_result, best_t),
+                ))
+                _existing_ts.add(best_t)
+                _cadence_added += 1
+            _t_cursor += _cadence
+        if _cadence_added:
+            LOGGER.info("Chunked: football cadence supplement added %d points every %.0fs "
+                        "(OCR had %d, total now %d)",
+                        _cadence_added, _cadence, _dp_before_cadence, len(detection_points))
+
+    # ── Non-football cadence supplement ──
+    elif not _is_football and _dp_before_cadence < 30 and all_frame_timestamps:
+        _existing_ts = {dp.timestamp for dp in detection_points}
+        _nf_cadence = 18.0
+        _nf_added = 0
+        _t_cursor = extract_start + 5.0
+        while _t_cursor < extract_end - 5.0:
+            best_t = None
+            best_motion = -1
+            for ft in all_frame_timestamps:
+                if abs(ft - _t_cursor) < _nf_cadence / 2:
+                    m = all_motion.get(ft, 0)
+                    if m > best_motion and ft not in _existing_ts:
+                        best_t = ft
+                        best_motion = m
+            if best_t is not None:
+                in_boundary = _in_audio_boundary(audio_result, best_t)
+                conf = max(0.50, best_motion / 100.0 * 0.7)
+                if in_boundary:
+                    conf = min(0.85, conf + 0.15)
+                detection_points.append(DetectionPoint(
+                    timestamp=best_t,
+                    confidence=conf,
+                    jersey_visible=False,
+                    motion_score=best_motion,
+                    crowd_energy=_get_crowd_energy(audio_result, best_t),
+                ))
+                _existing_ts.add(best_t)
+                _nf_added += 1
+            _t_cursor += _nf_cadence
+        if _nf_added:
+            LOGGER.info("Chunked: cadence supplement added %d points (total now %d)",
+                        _nf_added, len(detection_points))
+
+    # ── Motion/audio fallback when cadence still produced nothing ──
     if len(detection_points) < 3 and all_frame_timestamps:
-        motion_threshold = 35 if _is_football else 30
-        LOGGER.info("Chunked: no OCR, using motion/audio fallback (threshold=%d)", motion_threshold)
+        motion_threshold = 20 if _is_football else 25
+        LOGGER.info("Chunked: cadence insufficient, using low-threshold motion fallback (threshold=%d)", motion_threshold)
         for t in all_frame_timestamps:
             motion = all_motion.get(t, 0)
             in_boundary = _in_audio_boundary(audio_result, t)
-            # Require BOTH high motion AND audio boundary, or very high motion alone
-            if (motion > motion_threshold and in_boundary) or motion > 60:
+            if (motion > motion_threshold and in_boundary) or motion > 40:
                 conf = motion / 100.0 * 0.7
                 if in_boundary:
                     conf = min(1.0, conf + 0.15)
@@ -3170,9 +3243,10 @@ async def _run_chunked_full_game(
                 continue
             clip_motion = (clip.signals or {}).get("motion", 0) or 0
             has_audio = clip.signals.get("audio", False)
-            # Only attribute if high motion + audio boundary (real play),
-            # or very high motion alone (definite on-field action)
-            if (clip_motion > 45 and has_audio) or clip_motion > 60:
+            # At 360p motion scores are 0-10 so thresholds must be low.
+            # Cadence supplement already placed points at play boundaries,
+            # so most clips here ARE real plays. Attribute jersey generously.
+            if (clip_motion > 5 and has_audio) or clip_motion > 20:
                 clip.jersey_visible = True
                 clip.jersey_number_seen = jersey_number
                 _user_attr_count += 1

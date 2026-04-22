@@ -478,26 +478,41 @@ def set_tunnel_url():
     return jsonify({"status": "ok", "url": url, "railway_update": "queued"})
 
 
+def _find_free_port(preferred: int = 5050) -> int | None:
+    """Find a free port starting from preferred port.
+
+    On Windows, SO_REUSEADDR allows multiple processes to bind the same port,
+    so we test by binding WITHOUT that flag, then immediately release.
+    """
+    import socket
+    for port in range(preferred, preferred + 20):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.bind(("0.0.0.0", port))
+                s.listen(1)
+                # Successfully bound and listening — port is free
+                return port
+        except OSError:
+            continue
+    return None
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("HOME_PROXY_PORT", 5050))
+    preferred = int(os.environ.get("HOME_PROXY_PORT", 5050))
+    port = _find_free_port(preferred)
 
-    print(f"""
-====================================================
-  CLIPT HOME PROXY
-====================================================
-  Local:  http://localhost:{port}
-  Health: http://localhost:{port}/health
+    if port is None:
+        print("FATAL: No free port found between 5050-5069", flush=True)
+        sys.exit(1)
 
-  Next steps:
-  1. In a SECOND terminal, start Cloudflare Tunnel:
-     cloudflared tunnel run clipt-proxy
+    # Write port to temp file so bat file can read it
+    port_file = os.path.join(tempfile.gettempdir(), "clipt_proxy_port.txt")
+    with open(port_file, "w") as f:
+        f.write(str(port))
 
-  2. Add to Railway env vars:
-     HOME_PROXY_URL = https://proxy.cliptapp.com
-     HOME_PROXY_SECRET = {SECRET}
+    # Emit machine-readable line that bat file parses
+    print(f"CLIPT_PORT={port}", flush=True)
+    print(f"Starting Clipt Home Proxy on port {port}...", flush=True)
 
-  3. Keep BOTH terminals open while using AI Highlights
-====================================================
-""")
-
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)

@@ -1,60 +1,92 @@
 @echo off
+setlocal EnableDelayedExpansion
+title Clipt Home Proxy
+
 echo ====================================================
 echo   CLIPT HOME PROXY - Starting...
 echo ====================================================
 echo.
 
-:: Check dependencies
+:: ── Step 0: Stop cloudflared Windows service if running (conflicts with our tunnel) ──
+sc query cloudflared >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo [0/6] Checking cloudflared Windows service...
+    net stop cloudflared >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        sc config cloudflared start= disabled >nul 2>&1
+        echo       Service stopped and disabled.
+    ) else (
+        echo       Service running as SYSTEM - needs admin to stop.
+        echo       Using dynamic port to avoid conflict.
+    )
+    echo.
+)
+
+:: ── Step 1: Kill any existing proxy/tunnel processes ──
+echo [1/6] Cleaning up existing processes...
+taskkill /F /FI "WINDOWTITLE eq Clipt-Proxy*" >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq Clipt-Tunnel*" >nul 2>&1
+:: Kill anything listening on ports 5050-5069
+for /l %%p in (5050,1,5069) do (
+    for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":%%p " ^| findstr "LISTENING"') do (
+        if not "%%a"=="0" taskkill /F /PID %%a >nul 2>&1
+    )
+)
+timeout /t 2 /nobreak >nul
+echo       Done.
+echo.
+
+:: ── Step 2: Check dependencies ──
+echo [2/6] Checking dependencies...
 where python >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
+if !ERRORLEVEL! NEQ 0 (
     echo ERROR: Python not found. Install Python 3.11+ first.
     pause
     exit /b 1
 )
 
 python -c "import flask" 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo Installing Flask...
-    pip install flask
+if !ERRORLEVEL! NEQ 0 (
+    echo       Installing Flask...
+    pip install flask >nul 2>&1
 )
 
 python -c "import yt_dlp" 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo Installing yt-dlp...
-    pip install yt-dlp
+if !ERRORLEVEL! NEQ 0 (
+    echo       Installing yt-dlp...
+    pip install yt-dlp >nul 2>&1
+)
+
+python -c "import requests" 2>nul
+if !ERRORLEVEL! NEQ 0 (
+    echo       Installing requests...
+    pip install requests >nul 2>&1
 )
 
 :: Check for cloudflared
 set CLOUDFLARED=cloudflared
 where cloudflared >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
+if !ERRORLEVEL! NEQ 0 (
     if exist "%LOCALAPPDATA%\cloudflared.exe" (
-        set CLOUDFLARED=%LOCALAPPDATA%\cloudflared.exe
+        set "CLOUDFLARED=%LOCALAPPDATA%\cloudflared.exe"
     ) else (
-        echo cloudflared not found. Downloading...
+        echo       Downloading cloudflared...
         curl -fsSL -o "%LOCALAPPDATA%\cloudflared.exe" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-        set CLOUDFLARED=%LOCALAPPDATA%\cloudflared.exe
+        set "CLOUDFLARED=%LOCALAPPDATA%\cloudflared.exe"
     )
 )
+echo       All dependencies OK.
+echo.
 
-:: ============================================================
-:: Load tokens BEFORE starting Flask so it inherits them
-:: ============================================================
-
-:: Load Railway token for auto-update
+:: ── Load tokens ──
 set RAILWAY_TOKEN=
 if exist "%~dp0.railway-token" (
     set /p RAILWAY_TOKEN=<"%~dp0.railway-token"
-    echo Railway auto-update: ENABLED
-) else (
-    echo Railway auto-update: DISABLED (no .railway-token file)
-    echo To enable: save your Railway API token to %~dp0.railway-token
 )
 
-:: Load tunnel token
 set TUNNEL_TOKEN=
 if defined CLIPT_TUNNEL_TOKEN (
-    set TUNNEL_TOKEN=%CLIPT_TUNNEL_TOKEN%
+    set "TUNNEL_TOKEN=%CLIPT_TUNNEL_TOKEN%"
 )
 if not defined TUNNEL_TOKEN (
     if exist "%~dp0.tunnel-token" (
@@ -62,68 +94,128 @@ if not defined TUNNEL_TOKEN (
     )
 )
 
-:: Start Flask server in background (inherits RAILWAY_TOKEN env var)
-echo Starting Home Proxy on port 5050...
-start "Clipt Home Proxy" /min python "%~dp0home_proxy.py"
+:: ── Step 3: Start Flask server ──
+echo [3/6] Starting Flask server...
+set "LOG_FILE=%TEMP%\clipt_proxy.log"
+del "%LOG_FILE%" >nul 2>&1
+del "%TEMP%\clipt_proxy_port.txt" >nul 2>&1
 
-:: Give Flask a moment to start
-timeout /t 3 /nobreak >nul
+start "Clipt-Proxy" /min cmd /c "python "%~dp0home_proxy.py" > "%LOG_FILE%" 2>&1"
 
-:: Quick health check
-curl -s http://localhost:5050/health >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: Home proxy failed to start on port 5050
+:: Wait for Flask to write its port file (up to 30 seconds)
+set PROXY_PORT=
+set /a WAIT_COUNT=0
+:wait_for_port
+timeout /t 1 /nobreak >nul
+set /a WAIT_COUNT+=1
+if !WAIT_COUNT! GTR 30 (
+    echo       ERROR: Flask failed to start after 30 seconds.
+    echo       Log:
+    type "%LOG_FILE%" 2>nul
+    echo.
     pause
     exit /b 1
 )
-echo Home proxy is running on port 5050
+
+:: Read port from temp file
+set "PORT_FILE=%TEMP%\clipt_proxy_port.txt"
+if exist "!PORT_FILE!" (
+    set /p PROXY_PORT=<"!PORT_FILE!"
+)
+if "!PROXY_PORT!"=="" goto wait_for_port
+echo       Flask started on port !PROXY_PORT! (%WAIT_COUNT%s)
 echo.
 
-if defined TUNNEL_TOKEN (
-    echo Using PERMANENT Cloudflare tunnel...
-    echo URL: proxy.cliptapp.com (never changes)
+:: ── Step 4: Health check ──
+echo [4/6] Verifying proxy health...
+set HEALTH_OK=0
+for /l %%i in (1,1,15) do (
+    if !HEALTH_OK!==0 (
+        curl -s --max-time 2 http://localhost:!PROXY_PORT!/health >nul 2>&1
+        if !ERRORLEVEL! EQU 0 (
+            set HEALTH_OK=1
+        ) else (
+            timeout /t 1 /nobreak >nul
+        )
+    )
+)
+if "!HEALTH_OK!"=="0" (
+    echo       ERROR: Proxy not responding on port !PROXY_PORT!
+    echo       Log:
+    type "%LOG_FILE%" 2>nul
     echo.
+    pause
+    exit /b 1
+)
+echo       Proxy healthy on port !PROXY_PORT!
+echo.
+
+:: ── Step 5: Start Cloudflare tunnel ──
+echo [5/6] Starting Cloudflare tunnel...
+set "TUNNEL_LOG=%TEMP%\clipt_tunnel.log"
+del "!TUNNEL_LOG!" >nul 2>&1
+
+if defined TUNNEL_TOKEN (
+    :: Trim whitespace from token
+    for /f "tokens=*" %%t in ("!TUNNEL_TOKEN!") do set "TUNNEL_TOKEN=%%t"
+
+    echo       Using permanent tunnel: proxy.cliptapp.com
+    set "TUNNEL_URL=https://proxy.cliptapp.com"
 
     :: Tell Flask to update Railway with the permanent URL
-    curl -s -X POST http://localhost:5050/set-tunnel-url -H "Content-Type: application/json" -d "{\"url\":\"https://proxy.cliptapp.com\"}" >nul 2>&1
+    curl -s -X POST http://localhost:!PROXY_PORT!/set-tunnel-url -H "Content-Type: application/json" -d "{\"url\":\"https://proxy.cliptapp.com\"}" >nul 2>&1
 
+    echo.
+    echo [6/6] Verifying Railway connection...
+    timeout /t 3 /nobreak >nul
+
+    echo.
     echo ====================================================
-    echo   HOME PROXY IS RUNNING (Permanent Tunnel)
+    echo   CLIPT HOME PROXY READY
     echo ====================================================
-    echo   URL: https://proxy.cliptapp.com
-    echo   Railway auto-updated with this URL.
-    echo   Keep this window open while using AI Highlights.
-    echo   Close to stop the proxy.
+    echo   Port:    !PROXY_PORT!
+    echo   Tunnel:  https://proxy.cliptapp.com
+    echo   Railway: auto-update queued
+    echo.
+    echo   STATUS: ONLINE - YouTube downloads ENABLED
+    echo.
+    echo   Keep this window open while using Clipt.
+    echo   Close to stop all proxy services.
     echo ====================================================
     echo.
-    :: Trim any trailing whitespace/newlines from token
-    for /f "tokens=*" %%t in ("%TUNNEL_TOKEN%") do set TUNNEL_TOKEN=%%t
-    "%CLOUDFLARED%" --no-autoupdate tunnel run --token %TUNNEL_TOKEN%
+
+    :: Run cloudflared in foreground (keeps bat file alive)
+    "!CLOUDFLARED!" --no-autoupdate tunnel run --token !TUNNEL_TOKEN!
+
 ) else (
-    echo Using quick tunnel (URL changes each restart, auto-updates Railway)...
+    echo       Using quick tunnel (URL changes each restart)...
     echo.
 
-    :: Start tunnel and pipe output through update_railway.py
-    :: This script reads cloudflared output, finds the URL, and POSTs it to Flask
-    :: Flask then updates Railway's HOME_PROXY_URL automatically
-    echo Starting Cloudflare tunnel with auto-update...
+    :: Start cloudflared and pipe through update_railway.py to auto-detect URL
+    echo [6/6] Detecting tunnel URL...
     echo.
     echo ====================================================
-    echo   HOME PROXY IS RUNNING (Quick Tunnel + Auto-Update)
+    echo   CLIPT HOME PROXY READY
     echo ====================================================
-    echo   Tunnel URL will be detected and sent to Railway
-    echo   automatically. No manual steps needed.
+    echo   Port:    !PROXY_PORT!
+    echo   Tunnel:  detecting URL...
+    echo   Railway: will auto-update when URL found
     echo.
-    echo   Keep this window open while using AI Highlights.
-    echo   Close to stop the proxy.
+    echo   STATUS: ONLINE - YouTube downloads ENABLED
+    echo.
+    echo   Keep this window open while using Clipt.
+    echo   Close to stop all proxy services.
     echo ====================================================
     echo.
 
-    :: Run cloudflared and pipe stderr through update_railway.py
-    :: The 2>&1 merges stderr to stdout so Python can read the URL
-    "%CLOUDFLARED%" tunnel --url http://localhost:5050 --no-autoupdate 2>&1 | python "%~dp0update_railway.py"
+    :: Run cloudflared piped through update_railway.py (keeps bat file alive)
+    "!CLOUDFLARED!" tunnel --url http://localhost:!PROXY_PORT! --no-autoupdate 2>&1 | python "%~dp0update_railway.py"
 )
 
-:: Cleanup
-taskkill /FI "WINDOWTITLE eq Clipt*" /F >nul 2>&1
+:: ── Cleanup on exit ──
+echo.
+echo Shutting down...
+taskkill /F /FI "WINDOWTITLE eq Clipt-Proxy*" >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq Clipt-Tunnel*" >nul 2>&1
+del "%TEMP%\clipt_proxy_port.txt" >nul 2>&1
 echo Proxy stopped.

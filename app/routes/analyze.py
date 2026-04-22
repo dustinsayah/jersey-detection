@@ -90,9 +90,51 @@ _KEEPALIVE_INTERVAL = 15
 # Ensure only 1 pipeline runs at a time (thread-safe, unlike asyncio.Semaphore)
 _PIPELINE_LOCK = threading.Lock()
 
-# In-memory async job store for /analyze-async polling
+# Async job store — in-memory for active jobs, file-backed for persistence across restarts
 _jobs: dict[str, dict] = {}
 _JOB_TTL_SECONDS = 1800  # reap finished jobs after 30 min
+_JOB_STORE_PATH = "/tmp/clipt_analyze_jobs.json"
+_job_store_lock = threading.Lock()
+
+
+def _persist_job(job_id: str, job: dict) -> None:
+    """Save a job to the file-backed store (for persistence across restarts)."""
+    try:
+        with _job_store_lock:
+            store = _load_job_store()
+            # Strip non-serializable fields (cancel_event)
+            serializable = {k: v for k, v in job.items() if k != "cancel_event"}
+            serializable["updated_at"] = time.time()
+            store[job_id] = serializable
+            # Clean old jobs (older than 24 hours)
+            now = time.time()
+            store = {k: v for k, v in store.items()
+                     if now - v.get("updated_at", v.get("created", now)) < 86400}
+            with open(_JOB_STORE_PATH, "w") as f:
+                json.dump(store, f)
+    except Exception as exc:
+        LOGGER.warning("Job persist error: %s", exc)
+
+
+def _load_job_store() -> dict:
+    """Load the file-backed job store."""
+    try:
+        import os
+        if os.path.exists(_JOB_STORE_PATH):
+            with open(_JOB_STORE_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _get_job(job_id: str) -> dict | None:
+    """Get a job from memory first, then file store as fallback."""
+    if job_id in _jobs:
+        return _jobs[job_id]
+    # Check file store for completed jobs from before a restart
+    store = _load_job_store()
+    return store.get(job_id)
 
 
 @router.post("/analyze")
@@ -269,6 +311,7 @@ def _run_analyze_job_in_thread(job_id: str, pipeline_params: dict) -> None:
 
     job["status"] = "queued"
     job["message"] = "Waiting for pipeline lock"
+    _persist_job(job_id, job)
 
     # Wait up to 5 minutes for the lock — long enough that a previous job finishes
     acquired = _PIPELINE_LOCK.acquire(timeout=300)
@@ -276,18 +319,21 @@ def _run_analyze_job_in_thread(job_id: str, pipeline_params: dict) -> None:
         job["status"] = "failed"
         job["error"] = "Server busy — another analysis is in progress"
         job["progress"] = 100
+        _persist_job(job_id, job)
         return
     if cancel_event.is_set():
         _PIPELINE_LOCK.release()
         job["status"] = "failed"
         job["error"] = "Cancelled before start"
         job["progress"] = 100
+        _persist_job(job_id, job)
         return
 
     try:
         job["status"] = "processing"
         job["progress"] = 10
         job["message"] = "Downloading video and loading models"
+        _persist_job(job_id, job)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -302,6 +348,7 @@ def _run_analyze_job_in_thread(job_id: str, pipeline_params: dict) -> None:
             job["progress"] = 100
             job["result"] = result
             job["message"] = f"Found {clip_count} highlights in {elapsed_s}s"
+            _persist_job(job_id, job)
             LOGGER.info("analyze-async.complete job_id=%s clips=%d elapsed=%.2fs",
                         job_id, clip_count, elapsed_s)
         except Exception as exc:
@@ -310,6 +357,7 @@ def _run_analyze_job_in_thread(job_id: str, pipeline_params: dict) -> None:
             job["progress"] = 100
             job["error"] = str(exc)[:300]
             job["message"] = f"Analysis failed: {str(exc)[:200]}"
+            _persist_job(job_id, job)
         finally:
             loop.close()
     finally:
@@ -367,6 +415,7 @@ async def analyze_async(
         "created": time.time(),
         "cancel_event": threading.Event(),
     }
+    _persist_job(job_id, _jobs[job_id])
 
     # Start a real background thread (not BackgroundTasks) so the response returns immediately
     thread = threading.Thread(
@@ -384,14 +433,18 @@ async def analyze_async(
 
 @router.get("/analyze-jobs/{job_id}")
 async def get_analyze_job(job_id: str) -> JSONResponse:
-    """Poll an analyze job. Returns status, progress, and result (when complete)."""
-    if job_id not in _jobs:
+    """Poll an analyze job. Returns status, progress, and result (when complete).
+
+    Checks in-memory store first (for active jobs), then falls back to
+    file-based store (for jobs that survived a restart).
+    """
+    job = _get_job(job_id)
+    if job is None:
         return JSONResponse(status_code=404, content={"status": "not_found", "job_id": job_id})
-    job = _jobs[job_id]
     return JSONResponse(content={
-        "job_id": job["job_id"],
+        "job_id": job.get("job_id", job_id),
         "status": job["status"],
-        "progress": job["progress"],
+        "progress": job.get("progress", 0),
         "message": job.get("message", ""),
         "result": job.get("result"),
         "error": job.get("error"),

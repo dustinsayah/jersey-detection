@@ -224,11 +224,17 @@ def download():
 
         # Format selection: with ffmpeg we can merge best video + audio.
         # Without ffmpeg, we must use pre-muxed formats (lower quality but no merge needed).
+        # NOTE: Do NOT constrain bestvideo to [ext=mp4] — YouTube's 720p streams
+        # are often VP9/webm. yt-dlp + ffmpeg can merge any format into mp4.
         if has_ffmpeg:
-            fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
+            fmt = (
+                f"bestvideo[height<={quality}]+bestaudio/"
+                f"best[height<={quality}][ext=mp4]/"
+                f"best[height<={quality}]/best"
+            )
         else:
             fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
-            log.info("ffmpeg not installed — using pre-muxed format (360p max)")
+            log.info("ffmpeg not installed — using pre-muxed format (may be limited to 360p)")
 
         base_opts = {
             "format": fmt,

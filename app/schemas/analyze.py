@@ -99,6 +99,25 @@ class AnalyzeRequest(BaseModel):
     time_range_start: float = Field(default=0, alias="timeRangeStart")
     time_range_end: float = Field(default=0, alias="timeRangeEnd")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_snake_case_aliases(cls, data: Any) -> Any:
+        """Accept common snake_case field names in addition to camelCase aliases.
+
+        Maps: start_time → timeRangeStart, end_time → timeRangeEnd,
+              jersey_number → jerseyNumber, jersey_color → jerseyColor,
+              video_url → videoUrl
+        """
+        if isinstance(data, dict):
+            _ALIAS_MAP = {
+                "start_time": "timeRangeStart",
+                "end_time": "timeRangeEnd",
+            }
+            for snake, camel in _ALIAS_MAP.items():
+                if snake in data and camel not in data:
+                    data[camel] = data.pop(snake)
+        return data
+
     enable_audio: bool = Field(default=True, alias="enableAudio")
     enable_tracking: bool = Field(default=True, alias="enableTracking")
     enable_pose: bool = Field(default=True, alias="enablePose")

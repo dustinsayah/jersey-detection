@@ -77,6 +77,24 @@ htmlcov/
 # Secrets
 scripts/.railway-token
 scripts/.tunnel-token
+cookies.txt
 *.cookies.txt
 youtube_cookies.txt
 app/youtube_cookies.txt
+
+# Database files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# WARP / Cloudflare local files
+wgcf*
+
+# OneDrive problem files — never create NUL/CON/PRN/AUX named files
+NUL
+nul
+
+# Large model files (use Git LFS or copy separately)
+app/model/videomae_*/
+app/model/*.zip

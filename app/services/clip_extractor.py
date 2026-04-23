@@ -428,7 +428,8 @@ def extract_clips(
     # Full-game football: very low threshold — cadence clips score low but are real plays
     _is_football_fg = _is_full_game and sport.lower() == "football"
     if _is_football_fg:
-        result = [c for c in merged if c.score >= 10]
+        # At 360p, cadence clips score very low — take everything, cap at 40
+        result = list(merged)
     elif _is_full_game:
         result = [c for c in merged if c.score >= 20]
     else:

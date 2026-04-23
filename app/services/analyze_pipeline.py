@@ -2441,6 +2441,32 @@ async def _run_analyze_pipeline_impl(
             clip_dict["caption"] = _generate_clip_caption(clip_dict, sport, position, jersey_number)
             clip_dict["recruitingScore"] = _compute_recruiting_score(clip_dict, sport, position)
             clip_dict["estimatedQuarter"] = _estimate_game_quarter(clip.start_time, video_duration, sport)
+
+            # Player position for spotlight circle (normalized 0-1, then *100 for frontend)
+            # Find the best bbox from detections within this clip's time range
+            best_bbox = None
+            best_bbox_conf = 0.0
+            for det in all_layer_dets:
+                det_t = det.get("timestamp", 0)
+                if clip.start_time - 1 <= det_t <= clip.end_time + 1:
+                    pbbox = det.get("player_bbox") or det.get("bbox")
+                    if pbbox and isinstance(pbbox, (list, tuple)) and len(pbbox) >= 4:
+                        det_conf = det.get("confidence", 0)
+                        if det_conf > best_bbox_conf:
+                            best_bbox = pbbox
+                            best_bbox_conf = det_conf
+            if best_bbox:
+                # bbox is [x1, y1, x2, y2] in pixel coords
+                # Normalize to 0-100 percentage for Remotion spotlight
+                _fw = frames[0].shape[1] if frames else 1920
+                _fh = frames[0].shape[0] if frames else 1080
+                cx = (best_bbox[0] + best_bbox[2]) / 2
+                cy = (best_bbox[1] + best_bbox[3]) / 2
+                clip_dict["playerX"] = round(cx / _fw, 4)
+                clip_dict["playerY"] = round(cy / _fh, 4)
+                clip_dict["markX"] = round(cx / _fw * 100, 1)
+                clip_dict["markY"] = round(cy / _fh * 100, 1)
+
             clips_out.append(clip_dict)
 
         # Sort clips in highlight reel order (TDs first, then big plays, etc.)
@@ -3336,6 +3362,29 @@ async def _run_chunked_full_game(
         clip_dict["caption"] = _generate_clip_caption(clip_dict, sport, position, jersey_number)
         clip_dict["recruitingScore"] = _compute_recruiting_score(clip_dict, sport, position)
         clip_dict["estimatedQuarter"] = _estimate_game_quarter(clip.start_time, video_duration, sport)
+
+        # Player position for spotlight circle (same as standard path)
+        best_bbox_c = None
+        best_bbox_conf_c = 0.0
+        for det in all_layer_dets:
+            det_t = det.get("timestamp", 0)
+            if clip.start_time - 1 <= det_t <= clip.end_time + 1:
+                pbbox = det.get("player_bbox") or det.get("bbox")
+                if pbbox and isinstance(pbbox, (list, tuple)) and len(pbbox) >= 4:
+                    det_conf = det.get("confidence", 0)
+                    if det_conf > best_bbox_conf_c:
+                        best_bbox_c = pbbox
+                        best_bbox_conf_c = det_conf
+        if best_bbox_c:
+            _fw_c = 1920  # chunked path frames are freed
+            _fh_c = 1080
+            cx = (best_bbox_c[0] + best_bbox_c[2]) / 2
+            cy = (best_bbox_c[1] + best_bbox_c[3]) / 2
+            clip_dict["playerX"] = round(cx / _fw_c, 4)
+            clip_dict["playerY"] = round(cy / _fh_c, 4)
+            clip_dict["markX"] = round(cx / _fw_c * 100, 1)
+            clip_dict["markY"] = round(cy / _fh_c * 100, 1)
+
         clips_out.append(clip_dict)
 
     # Sort clips in highlight reel order (TDs first, then big plays, etc.)

@@ -383,17 +383,25 @@ def extract_clips(
     # ── Step 3.5: Quality gate — require at least one meaningful signal ──
     # Clips with no jersey, no v4 outcome, low motion, and no audio event
     # are likely noise from dead ball frames or camera pans.
-    # Special teams (kickoff/punt) without jersey are always filtered.
-    _SPECIAL_TEAMS = {"kickoff", "punt"}
+    # Special teams (kickoff/punt) are always filtered for QB/skill positions.
+    _SPECIAL_TEAMS = {"kickoff", "punt", "kickoff_return", "punt_return",
+                       "field_goal", "extra_point", "special_teams"}
+    # QB/skill positions never play special teams — hard filter ALL of them
+    _is_qb = position and position.lower() in ("qb", "quarterback")
+    _is_skill = position and position.lower() in (
+        "qb", "quarterback", "wr", "wide receiver", "rb", "running back",
+        "te", "tight end",
+    )
     gated: list[ExtractedClip] = []
     for clip in merged:
-        # Always filter special teams without jersey — not player's highlight
-        if clip.play_type in _SPECIAL_TEAMS and not clip.jersey_visible:
-            LOGGER.debug(
-                "Quality gate: dropped special teams clip %.1f-%.1f (%s, no jersey)",
-                clip.start_time, clip.end_time, clip.play_type,
-            )
-            continue
+        # Hard filter: QBs don't play special teams — remove ALL kickoffs/punts
+        if clip.play_type in _SPECIAL_TEAMS:
+            if _is_skill or not clip.jersey_visible:
+                LOGGER.info(
+                    "Quality gate: dropped special teams clip %.1f-%.1f (%s, position=%s)",
+                    clip.start_time, clip.end_time, clip.play_type, position,
+                )
+                continue
 
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))

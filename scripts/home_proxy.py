@@ -136,12 +136,16 @@ _YT_CLIENTS = [
 @app.route("/health")
 def health():
     """Health check — Railway pings this to see if proxy is online."""
+    import shutil
+
     try:
         import yt_dlp
         ver = yt_dlp.version.__version__
     except Exception:
         ver = "unknown"
     cookie_file = _find_cookie_file()
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
     return jsonify({
         "status": "ok",
         "type": "home_proxy",
@@ -149,6 +153,10 @@ def health():
         "active_downloads": _active_downloads,
         "has_cookies": cookie_file is not None,
         "cookie_file": cookie_file,
+        "ffmpeg_available": bool(ffmpeg_path),
+        "ffmpeg_path": ffmpeg_path,
+        "ffprobe_available": bool(ffprobe_path),
+        "max_quality": "720p" if ffmpeg_path else "360p (ffmpeg missing!)",
     })
 
 
@@ -364,7 +372,13 @@ def download():
 
         elapsed = round(time.time() - t0, 1)
         size_mb = round(os.path.getsize(output_path) / 1_048_576, 1)
-        log.info("Done: %dp, %sMB, %ss", height, size_mb, elapsed)
+        quality_label = (
+            "1080p" if height >= 1080 else
+            "720p" if height >= 720 else
+            "480p" if height >= 480 else
+            f"{height}p (LOW — ffmpeg may be missing)"
+        )
+        log.info("Done: %s (%dp), %sMB, %ss, ffmpeg=%s", quality_label, height, size_mb, elapsed, has_ffmpeg)
 
         # Schedule cleanup
         _cleanup_later(output_path, delay=120)

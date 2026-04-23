@@ -398,11 +398,18 @@ def extract_clips(
         has_jersey = clip.jersey_visible
         has_outcome = bool(clip.signals.get("v4_outcome"))
         clip_motion = clip.signals.get("motion", 0) or 0
-        has_high_motion = clip_motion > 50  # Raised from 30 — excludes sideline/huddle
         has_audio = bool(clip.signals.get("audio"))
+        # Full-game football at 360p: motion scores are 0-10 (wide-angle JV),
+        # cadence supplement is the primary clip source — lower thresholds
+        _is_football = sport.lower() == "football"
+        if _is_full_game and _is_football:
+            has_high_motion = clip_motion > 3
+            motion_solo_threshold = 8
+        else:
+            has_high_motion = clip_motion > 50
+            motion_solo_threshold = 65
         # Require jersey OR (high motion + audio) OR outcome for quality
-        # Pure motion-only clips with no jersey are usually false positives
-        if has_jersey or has_outcome or (has_high_motion and has_audio) or (clip_motion > 65):
+        if has_jersey or has_outcome or (has_high_motion and has_audio) or (clip_motion > motion_solo_threshold):
             gated.append(clip)
         else:
             LOGGER.debug(
@@ -418,15 +425,18 @@ def extract_clips(
     merged.sort(key=lambda c: c.score, reverse=True)
 
     # Filter out "Cut" grade clips
-    # Full-game mode: lower cut threshold to include more clips (target 20+)
-    if _is_full_game:
+    # Full-game football: very low threshold — cadence clips score low but are real plays
+    _is_football_fg = _is_full_game and sport.lower() == "football"
+    if _is_football_fg:
+        result = [c for c in merged if c.score >= 10]
+    elif _is_full_game:
         result = [c for c in merged if c.score >= 20]
     else:
         result = [c for c in merged if c.grade != "Cut"]
 
     # ── Rescue logic: if ALL clips were "Cut", rescue the best ones ──────
     # Football: rescue aggressively — jersey OCR rarely works on football footage
-    rescue_threshold = 15 if sport.lower() == "football" else 25
+    rescue_threshold = 5 if sport.lower() == "football" else 25
     if not result and merged:
         rescued = [c for c in merged if c.score >= rescue_threshold]
         if rescued:
@@ -437,6 +447,12 @@ def extract_clips(
                 "Rescue: all %d clips were Cut — rescued %d with score >= %d (sport=%s)",
                 len(merged), len(result), rescue_threshold, sport,
             )
+
+    # ── Cap: full-game mode — keep top 40 clips to avoid overwhelming the UI ──
+    _MAX_FULL_GAME_CLIPS = 40
+    if _is_full_game and len(result) > _MAX_FULL_GAME_CLIPS:
+        LOGGER.info("Full game clip cap: %d → %d clips", len(result), _MAX_FULL_GAME_CLIPS)
+        result = result[:_MAX_FULL_GAME_CLIPS]
 
     LOGGER.info(
         "Extracted %d clips from %d detections (%d clusters, %d after merge/filter)",

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,44 @@ import requests as _requests
 from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
+
+
+def _find_ffmpeg() -> str | None:
+    """Find ffmpeg executable — PATH first, then common Windows install locations."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # Hardcoded Windows locations (Dustin's machines)
+    for candidate in [
+        r"C:\ffmpeg\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\tools\ffmpeg\bin\ffmpeg.exe",
+        os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"),
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _find_ffprobe() -> str | None:
+    """Find ffprobe — same logic as ffmpeg."""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    ffmpeg = FFMPEG_PATH
+    if ffmpeg:
+        probe = ffmpeg.replace("ffmpeg.exe", "ffprobe.exe").replace("ffmpeg", "ffprobe")
+        if os.path.isfile(probe):
+            return probe
+    return None
+
+
+FFMPEG_PATH = _find_ffmpeg()
+FFPROBE_PATH = _find_ffprobe()
+
+# Log at startup so bat file output shows ffmpeg status
+print(f"ffmpeg: {'FOUND at ' + FFMPEG_PATH if FFMPEG_PATH else 'NOT FOUND — downloads limited to 360p'}", flush=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("home_proxy")
 
@@ -136,16 +175,12 @@ _YT_CLIENTS = [
 @app.route("/health")
 def health():
     """Health check — Railway pings this to see if proxy is online."""
-    import shutil
-
     try:
         import yt_dlp
         ver = yt_dlp.version.__version__
     except Exception:
         ver = "unknown"
     cookie_file = _find_cookie_file()
-    ffmpeg_path = shutil.which("ffmpeg")
-    ffprobe_path = shutil.which("ffprobe")
     return jsonify({
         "status": "ok",
         "type": "home_proxy",
@@ -153,10 +188,10 @@ def health():
         "active_downloads": _active_downloads,
         "has_cookies": cookie_file is not None,
         "cookie_file": cookie_file,
-        "ffmpeg_available": bool(ffmpeg_path),
-        "ffmpeg_path": ffmpeg_path,
-        "ffprobe_available": bool(ffprobe_path),
-        "max_quality": "720p" if ffmpeg_path else "360p (ffmpeg missing!)",
+        "ffmpeg_available": bool(FFMPEG_PATH),
+        "ffmpeg_path": FFMPEG_PATH,
+        "ffprobe_available": bool(FFPROBE_PATH),
+        "max_quality": "720p" if FFMPEG_PATH else "360p (ffmpeg missing!)",
     })
 
 
@@ -218,17 +253,8 @@ def download():
         # Use yt-dlp Python API for reliability (avoids Windows exe alias issues)
         import yt_dlp as _ytdl
 
-        # Check if ffmpeg is available (needed for merging separate video+audio)
-        has_ffmpeg = False
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True, timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            has_ffmpeg = True
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            pass
+        # Use pre-detected ffmpeg path (handles PATH and hardcoded locations)
+        has_ffmpeg = bool(FFMPEG_PATH)
 
         # Format selection: with ffmpeg we can merge best video + audio.
         # Without ffmpeg, we must use pre-muxed formats (lower quality but no merge needed).
@@ -260,6 +286,8 @@ def download():
 
         if has_ffmpeg:
             base_opts["merge_output_format"] = "mp4"
+            # Tell yt-dlp exactly where ffmpeg lives (bypasses PATH issues)
+            base_opts["ffmpeg_location"] = os.path.dirname(FFMPEG_PATH)
 
         # Add time range if specified (requires ffmpeg)
         if has_ffmpeg and end_sec > start_sec > 0:
@@ -361,11 +389,13 @@ def download():
 
         # Get video height via ffprobe
         height = 0
+        _ffprobe_cmd = FFPROBE_PATH or "ffprobe"
         try:
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                [_ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=height", "-of", "csv=p=0", output_path],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             height = int(probe.stdout.strip())
         except Exception:
             pass

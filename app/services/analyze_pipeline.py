@@ -298,6 +298,64 @@ def _get_highlight_sort_key(clip_dict: dict[str, Any]) -> tuple[int, int]:
     return (tier, -clip_dict.get("recruitingScore", 0))
 
 
+# Play types that should be excluded for offensive-skill positions (QB/RB/WR)
+_SPECIAL_TEAMS_PLAYS = frozenset({
+    "punt", "kickoff", "kickoff_return", "punt_return",
+    "field_goal", "special_teams", "extra_point", "onside_kick",
+})
+_OFFENSIVE_POSITIONS = frozenset({
+    "quarterback", "qb", "running_back", "rb", "wide_receiver", "wr",
+    "tight_end", "te", "offensive_line", "ol",
+})
+
+
+def _filter_unwanted_clips(
+    clips: list[dict[str, Any]],
+    sport: str,
+    position: str,
+) -> list[dict[str, Any]]:
+    """Remove special-teams plays and dead-ball clips.
+
+    - Special teams (punt/kickoff/FG) are never useful for QB/RB/WR reels.
+    - Dead ball clips (huddles, timeouts) have low motion with generic labels.
+    """
+    pos_lower = (position or "").lower().replace(" ", "_")
+    is_offensive = pos_lower in _OFFENSIVE_POSITIONS
+
+    kept = []
+    for c in clips:
+        pt = (c.get("playType") or "").lower()
+
+        # 1) Filter special teams for offensive positions
+        if is_offensive and pt in _SPECIAL_TEAMS_PLAYS:
+            LOGGER.info(
+                "Filtered special-teams clip: %s at %.0fs (position=%s)",
+                pt, c.get("startTime", 0), position,
+            )
+            continue
+
+        # 2) Filter dead-ball clips (low motion + generic label)
+        motion = 0.0
+        signals = c.get("signals") or {}
+        if isinstance(signals, dict):
+            motion = float(signals.get("motion", 0) or 0)
+        if pt in ("game_action", "formation") and motion < 25 and not c.get("jerseyVisible"):
+            LOGGER.info(
+                "Filtered dead-ball clip: %s at %.0fs (motion=%.1f, jersey=%s)",
+                pt, c.get("startTime", 0), motion, c.get("jerseyVisible"),
+            )
+            continue
+
+        kept.append(c)
+
+    if len(kept) < len(clips):
+        LOGGER.info(
+            "Clip filter: %d → %d (removed %d special-teams/dead-ball)",
+            len(clips), len(kept), len(clips) - len(kept),
+        )
+    return kept
+
+
 def _estimate_game_quarter(
     clip_start_time: float,
     video_duration: float,
@@ -2472,6 +2530,9 @@ async def _run_analyze_pipeline_impl(
         # Sort clips in highlight reel order (TDs first, then big plays, etc.)
         clips_out.sort(key=_get_highlight_sort_key)
 
+        # ── Filter: remove special-teams and dead-ball clips ──────────
+        clips_out = _filter_unwanted_clips(clips_out, sport, position)
+
         # Add sequenceNote to each clip
         for i, clip_dict in enumerate(clips_out):
             prev = clips_out[i - 1] if i > 0 else None
@@ -3389,6 +3450,9 @@ async def _run_chunked_full_game(
 
     # Sort clips in highlight reel order (TDs first, then big plays, etc.)
     clips_out.sort(key=_get_highlight_sort_key)
+
+    # ── Filter: remove special-teams and dead-ball clips ──────────
+    clips_out = _filter_unwanted_clips(clips_out, sport, position)
 
     # Add sequenceNote to each clip
     for i, clip_dict in enumerate(clips_out):

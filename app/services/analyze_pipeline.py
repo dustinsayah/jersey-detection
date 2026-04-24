@@ -334,12 +334,13 @@ def _filter_unwanted_clips(
             )
             continue
 
-        # 2) Filter dead-ball clips (low motion + generic label)
+        # 2) Filter dead-ball clips (low motion + generic label + no jersey)
+        #    Threshold=40 catches huddles/timeouts that still have camera movement
         motion = 0.0
         signals = c.get("signals") or {}
         if isinstance(signals, dict):
             motion = float(signals.get("motion", 0) or 0)
-        if pt in ("game_action", "formation") and motion < 25 and not c.get("jerseyVisible"):
+        if pt in ("game_action", "formation") and motion < 40 and not c.get("jerseyVisible"):
             LOGGER.info(
                 "Filtered dead-ball clip: %s at %.0fs (motion=%.1f, jersey=%s)",
                 pt, c.get("startTime", 0), motion, c.get("jerseyVisible"),

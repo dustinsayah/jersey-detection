@@ -429,6 +429,32 @@ def extract_clips(
     else:
         LOGGER.info("Quality gate: all clips filtered — keeping all (fallback)")
 
+    # ── Step 3.6: Dead ball camera-pan filter (full-game football) ───────
+    # Camera pans during timeouts/huddles generate moderate motion (30-65)
+    # without any confirming signal (jersey, outcome, audio).  Real plays
+    # almost always have at least one confirming signal.
+    if _is_full_game and sport.lower() == "football":
+        _pre_dead = len(merged)
+        _dead_filtered: list[ExtractedClip] = []
+        for clip in merged:
+            _cm = clip.signals.get("motion", 0) or 0
+            _hj = clip.jersey_visible
+            _ho = bool(clip.signals.get("v4_outcome"))
+            _ha = bool(clip.signals.get("audio"))
+            # Camera-pan pattern: moderate motion, no confirming signal
+            if not _hj and not _ho and not _ha and 30 <= _cm < 65:
+                LOGGER.info(
+                    "Dead ball filter: dropped camera-pan clip %.1f-%.1f "
+                    "(motion=%.0f, no jersey/outcome/audio)",
+                    clip.start_time, clip.end_time, _cm,
+                )
+                continue
+            _dead_filtered.append(clip)
+        if _dead_filtered:
+            merged = _dead_filtered
+            if _pre_dead != len(merged):
+                LOGGER.info("Dead ball filter: %d → %d clips", _pre_dead, len(merged))
+
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)
 

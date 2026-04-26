@@ -643,8 +643,11 @@ def extract_clips(
                 len(merged), len(result), rescue_threshold, sport,
             )
 
-    # ── Cap: full-game mode — keep top 40 clips to avoid overwhelming the UI ──
-    _MAX_FULL_GAME_CLIPS = 40
+    # ── Cap: full-game mode — keep top clips for a focused highlight reel ──
+    # v8.29: reduced from 40 to 10 — vision verification showed most clips
+    # beyond top 6-8 are dead ball or low quality. Better to have fewer,
+    # higher-quality clips than many mediocre ones.
+    _MAX_FULL_GAME_CLIPS = 10
     if _is_full_game and len(result) > _MAX_FULL_GAME_CLIPS:
         LOGGER.info("Full game clip cap: %d → %d clips", len(result), _MAX_FULL_GAME_CLIPS)
         result = result[:_MAX_FULL_GAME_CLIPS]

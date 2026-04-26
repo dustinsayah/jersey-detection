@@ -318,6 +318,11 @@ def _filter_unwanted_clips(
 
     - Special teams (punt/kickoff/FG) are never useful for QB/RB/WR reels.
     - Dead ball clips (huddles, timeouts) have low motion with generic labels.
+
+    v8.29: Use jersey CONFIDENCE (not boolean) since distance-weighted
+    attribution sets jerseyVisible=True on ALL clips. Only clips with
+    real OCR proximity (jconf >= 0.20) count as "jersey confirmed."
+    Raised motion threshold from 40 → 55 to catch walking/huddle clips.
     """
     pos_lower = (position or "").lower().replace(" ", "_")
     is_offensive = pos_lower in _OFFENSIVE_POSITIONS
@@ -325,6 +330,11 @@ def _filter_unwanted_clips(
     kept = []
     for c in clips:
         pt = (c.get("playType") or "").lower()
+        signals = c.get("signals") or {}
+        motion = float(signals.get("motion", 0) or 0) if isinstance(signals, dict) else 0.0
+        jconf = float(signals.get("jersey", 0) or 0) if isinstance(signals, dict) else 0.0
+        has_outcome = bool(signals.get("v4_outcome")) if isinstance(signals, dict) else False
+        has_audio = bool(signals.get("audio")) if isinstance(signals, dict) else False
 
         # 1) Filter special teams for offensive positions
         if is_offensive and pt in _SPECIAL_TEAMS_PLAYS:
@@ -334,26 +344,47 @@ def _filter_unwanted_clips(
             )
             continue
 
-        # 2) Filter dead-ball clips (low motion + generic label + no jersey)
-        #    Threshold=40 catches huddles/timeouts that still have camera movement
-        motion = 0.0
-        signals = c.get("signals") or {}
-        if isinstance(signals, dict):
-            motion = float(signals.get("motion", 0) or 0)
-        if pt in ("game_action", "formation") and motion < 40 and not c.get("jerseyVisible"):
-            LOGGER.info(
-                "Filtered dead-ball clip: %s at %.0fs (motion=%.1f, jersey=%s)",
-                pt, c.get("startTime", 0), motion, c.get("jerseyVisible"),
-            )
-            continue
+        # 2) Filter dead-ball clips — v8.29 multi-signal check
+        #    Use jersey CONFIDENCE not boolean (distance-weighted attribution
+        #    sets jerseyVisible=True on all clips, making boolean useless).
+        #    A clip is "confirmed" if: jconf>=0.20 OR v4_outcome OR high motion
+        _jersey_confirmed = jconf >= 0.20
+        _is_confirmed = _jersey_confirmed or has_outcome or motion > 60
+
+        if not _is_confirmed and pt in ("game_action", "formation"):
+            # Pattern A: Low motion (< 40) = obvious dead ball (huddle/timeout)
+            if motion < 40:
+                LOGGER.info(
+                    "Dead ball filter: dropped %.0fs-%.0fs (motion=%.0f < 40, jconf=%.2f)",
+                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf,
+                )
+                continue
+
+            # Pattern B: Moderate motion (40-55) without audio = walking between plays
+            # Vision verification showed clips with motion 44-50 and no audio
+            # are consistently dead ball (walking, huddle break, sideline).
+            if 40 <= motion <= 55 and not has_audio:
+                LOGGER.info(
+                    "Dead ball filter: dropped %.0fs-%.0fs (motion=%.0f in 40-55, "
+                    "no audio, jconf=%.2f)",
+                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf,
+                )
+                continue
 
         kept.append(c)
 
     if len(kept) < len(clips):
+        removed = len(clips) - len(kept)
         LOGGER.info(
             "Clip filter: %d → %d (removed %d special-teams/dead-ball)",
-            len(clips), len(kept), len(clips) - len(kept),
+            len(clips), len(kept), removed,
         )
+
+    # Safety: if filter removed everything, fall back to top clips by score
+    if not kept and clips:
+        LOGGER.warning("Dead ball filter removed ALL clips — falling back to top 4 by score")
+        kept = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)[:4]
+
     return kept
 
 
@@ -3539,8 +3570,13 @@ async def _run_chunked_full_game(
             else:
                 _attr_conf = 0.10  # Very far from any OCR hit
 
-            clip.jersey_visible = True
-            clip.jersey_number_seen = jersey_number
+            # Only mark jersey_visible if confidence is meaningful (>= 0.20)
+            # v8.29: distance-weighted attribution was setting jersey_visible=True
+            # on ALL clips including those with jconf=0.10, which bypassed the
+            # dead ball filter (it checked jerseyVisible boolean).
+            if _attr_conf >= 0.20:
+                clip.jersey_visible = True
+                clip.jersey_number_seen = jersey_number
             # Store the distance-weighted confidence as the jersey signal
             if not clip.signals:
                 clip.signals = {}

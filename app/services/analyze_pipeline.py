@@ -2306,6 +2306,43 @@ async def _run_analyze_pipeline_impl(
                         boosted_count, len(detection_points),
                         len(confirmed_timestamps),
                     )
+
+                    # ── Training data collection ──────────────────────────
+                    # Save high-confidence confirmed detections as training crops
+                    try:
+                        from app.services.training_pipeline import collect_training_crop
+                        _training_saved = 0
+                        for cd in confirmed_dets:
+                            _cd_conf = cd.get("confidence", 0)
+                            _cd_ts = cd.get("timestamp", 0)
+                            _cd_bbox = cd.get("player_bbox")
+                            if _cd_conf >= 0.5 and _cd_bbox and frames:
+                                # Find closest frame to this timestamp
+                                _best_frame = None
+                                _best_dt = float("inf")
+                                for _fi, (_fts, _fimg) in enumerate(frames):
+                                    _dt = abs(_fts - _cd_ts)
+                                    if _dt < _best_dt:
+                                        _best_dt = _dt
+                                        _best_frame = _fimg
+                                if _best_frame is not None and _best_dt < 2.0:
+                                    crop = collect_training_crop(
+                                        frame=_best_frame,
+                                        bbox=_cd_bbox,
+                                        jersey_number=jersey_number,
+                                        confidence=_cd_conf,
+                                        source_video=video_url or video_path or "unknown",
+                                        timestamp=_cd_ts,
+                                        sport=sport,
+                                    )
+                                    if crop:
+                                        _training_saved += 1
+                        if _training_saved > 0:
+                            LOGGER.info("Pipeline: saved %d training crops from confirmed detections",
+                                        _training_saved)
+                    except Exception as _train_exc:
+                        LOGGER.debug("Training data collection skipped: %s", _train_exc)
+
                 else:
                     # Consensus found 0 confirmed — keep detection_points anyway
                     # The jitter filter in clip_extractor handles false positives

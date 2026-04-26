@@ -1077,7 +1077,7 @@ async def _run_analyze_pipeline_impl(
         # This provides player-specific signals independent of jersey OCR.
         player_boxes_per_frame: dict[int, list[list[float]]] = {}
         frame_heights: dict[int, int] = {}
-        player_specific_data: dict[str, Any] = {}
+        player_specific_data: dict[str, Any] = {"jersey_number": jersey_number}
         _is_football_sport = sport.lower() == "football"
 
         if _is_football_sport and frames:

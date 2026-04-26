@@ -429,36 +429,71 @@ def extract_clips(
     else:
         LOGGER.info("Quality gate: all clips filtered — keeping all (fallback)")
 
-    # ── Step 3.6: Late-game dead ball filter (full-game football) ──────
-    # Camera pans during late-game timeouts/huddles (>95 min) generate
-    # moderate motion with no confirming signal.  Only applied to clips
-    # deep in the game where dead ball frequency is highest.
-    # Safety valve: never remove more than 20 % of clips.
+    # ── Step 3.6: Broadcast sideline/dead ball/replay filter ──────────
+    # v8.26: Improved false positive filtering for broadcast footage.
+    # Sideline shots: no jersey visible, low motion, no audio event
+    # Dead ball: no confirming signal, moderate motion (huddle/timeout)
+    # Applied to all full-game football, not just late-game.
+    # Safety valve: never remove more than 30% of clips.
     if _is_full_game and sport.lower() == "football":
-        _pre_dead = len(merged)
-        _dead_filtered: list[ExtractedClip] = []
+        _pre_filter = len(merged)
+        _broadcast_filtered: list[ExtractedClip] = []
         for clip in merged:
             _cm = clip.signals.get("motion", 0) or 0
             _hj = clip.jersey_visible
             _ho = bool(clip.signals.get("v4_outcome"))
             _ha = bool(clip.signals.get("audio"))
-            _late_game = clip.start_time > 5700  # >95 minutes
-            # Late-game dead ball: no confirming signal + moderate motion
-            if _late_game and not _hj and not _ho and not _ha and _cm < 65:
+
+            # Sideline/dead ball: no jersey, no outcome, no audio, low-moderate motion
+            if not _hj and not _ho and not _ha and _cm < 40:
                 LOGGER.info(
-                    "Dead ball filter: dropped late-game clip %.1f-%.1f "
-                    "(motion=%.0f, no jersey/outcome/audio, t>95min)",
+                    "Broadcast filter: dropped low-signal clip %.1f-%.1f "
+                    "(motion=%.0f, no jersey/outcome/audio)",
                     clip.start_time, clip.end_time, _cm,
                 )
                 continue
-            _dead_filtered.append(clip)
-        # Safety valve: keep at least 80 % of clips
-        if _dead_filtered and len(_dead_filtered) >= _pre_dead * 0.8:
-            merged = _dead_filtered
-            if _pre_dead != len(merged):
-                LOGGER.info("Dead ball filter: %d → %d clips", _pre_dead, len(merged))
-        elif _pre_dead != len(_dead_filtered):
-            LOGGER.info("Dead ball filter: would remove >20%% — skipping")
+
+            # Very short clips (<5s) with generic labels are often replay stingers
+            _clip_dur = clip.end_time - clip.start_time
+            if _clip_dur < 5 and not _hj and not _ho:
+                LOGGER.info(
+                    "Broadcast filter: dropped short clip %.1f-%.1f (%.1fs, no jersey/outcome)",
+                    clip.start_time, clip.end_time, _clip_dur,
+                )
+                continue
+
+            _broadcast_filtered.append(clip)
+
+        # Safety valve: keep at least 70% of clips
+        if _broadcast_filtered and len(_broadcast_filtered) >= _pre_filter * 0.7:
+            merged = _broadcast_filtered
+            if _pre_filter != len(merged):
+                LOGGER.info("Broadcast filter: %d → %d clips", _pre_filter, len(merged))
+        elif _pre_filter != len(_broadcast_filtered):
+            LOGGER.info("Broadcast filter: would remove >30%% — skipping")
+
+    # ── Step 3.7: Jersey-specific scoring ──────────────────────────────
+    # When a target jersey number is specified, boost clips with confirmed
+    # matching jersey and penalize clips with wrong jersey visible.
+    if position and position.lower() in ("qb", "quarterback", "wr", "wide receiver",
+                                          "rb", "running back", "te", "tight end"):
+        # Extract target jersey from detections (most common number seen)
+        _all_jersey_nums = [c.jersey_number_seen for c in merged if c.jersey_number_seen is not None]
+        _target_jersey = max(set(_all_jersey_nums), key=_all_jersey_nums.count) if _all_jersey_nums else None
+
+        if _target_jersey is not None:
+            for clip in merged:
+                if clip.jersey_visible and clip.jersey_number_seen == _target_jersey:
+                    # Confirmed target jersey — boost score
+                    clip.score = min(100, int(clip.score * 1.3))
+                elif clip.jersey_visible and clip.jersey_number_seen is not None and clip.jersey_number_seen != _target_jersey:
+                    # Wrong jersey visible — moderate penalty
+                    clip.score = max(10, int(clip.score * 0.7))
+                elif not clip.jersey_visible:
+                    # No jersey visible — slight penalty for skill positions
+                    clip.score = max(10, int(clip.score * 0.85))
+            LOGGER.info("Jersey scoring: target jersey #%s, adjusted scores for %d clips",
+                        _target_jersey, len(merged))
 
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)

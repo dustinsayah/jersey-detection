@@ -535,72 +535,70 @@ def extract_clips(
 
     # ── Step 3.9: Hard jersey/player-specific filter ─────────────────────
     # The KEY differentiator: different jersey numbers MUST return different
-    # clips. We separate clips into tiers based on jersey confirmation and
-    # only use unconfirmed clips as padding when needed.
+    # clips. Uses OCR CONFIDENCE thresholds (not just boolean jersey_visible)
+    # because the pipeline pre-filters detections to only the target number,
+    # making jersey_visible true for all clips. Confidence varies and is the
+    # real signal — a 0.77 confidence means the number was clearly read vs
+    # 0.35 which is barely legible and may be wrong.
+    _STRONG_JERSEY_CONF = 0.55   # High confidence — clearly the target player
+    _WEAK_JERSEY_CONF = 0.30     # Low confidence — possibly visible
+
     if position and sport.lower() == "football":
         _target_jersey_num = None
-        # Find the target jersey number from player_specific_data or detections
         if player_specific_data:
             _target_jersey_num = player_specific_data.get("jersey_number")
         if _target_jersey_num is None and _target_jersey is not None:
             _target_jersey_num = _target_jersey
 
         if _target_jersey_num is not None:
-            # Tier 1: Clips where the TARGET jersey was confirmed by OCR
-            _confirmed = [c for c in merged
-                          if c.jersey_visible and c.jersey_number_seen == _target_jersey_num]
+            # Use jersey signal confidence from clip signals dict
+            def _jersey_conf(clip: ExtractedClip) -> float:
+                return float(clip.signals.get("jersey", 0.0))
 
-            # Tier 2: Clips where NO jersey was read (motion/audio only — compatible)
-            _compatible = [c for c in merged
-                           if not c.jersey_visible or c.jersey_number_seen is None]
-
-            # Tier 3: Clips where a DIFFERENT jersey was confirmed (wrong player)
-            _conflicting = [c for c in merged
-                            if c.jersey_visible
-                            and c.jersey_number_seen is not None
-                            and c.jersey_number_seen != _target_jersey_num]
+            # Tier 1: STRONG — jersey OCR confidence >= 0.55
+            _strong = [c for c in merged if _jersey_conf(c) >= _STRONG_JERSEY_CONF]
+            # Tier 2: WEAK — jersey seen but confidence 0.30-0.55
+            _weak = [c for c in merged
+                     if _WEAK_JERSEY_CONF <= _jersey_conf(c) < _STRONG_JERSEY_CONF]
+            # Tier 3: NONE — no jersey or confidence < 0.30
+            _none = [c for c in merged if _jersey_conf(c) < _WEAK_JERSEY_CONF]
 
             LOGGER.info(
-                "Jersey hard filter: jersey #%s — %d confirmed, %d compatible, %d conflicting (of %d total)",
-                _target_jersey_num, len(_confirmed), len(_compatible), len(_conflicting), len(merged),
+                "Jersey hard filter: jersey #%s — %d strong (>=%.2f), %d weak, %d none (of %d total)",
+                _target_jersey_num, len(_strong), _STRONG_JERSEY_CONF,
+                len(_weak), len(_none), len(merged),
             )
 
-            # Decision logic:
-            # - If we have >=3 confirmed clips, use ONLY confirmed + high-score compatible
-            # - If 1-2 confirmed, use confirmed first then fill with compatible
-            # - If 0 confirmed, use all compatible (no filtering possible)
-            _MIN_CONFIRMED_FOR_HARD_FILTER = 3
+            _MIN_STRONG_FOR_HARD = 3
             _MIN_CLIPS_TOTAL = 4
 
-            if len(_confirmed) >= _MIN_CONFIRMED_FOR_HARD_FILTER:
-                # Strong jersey evidence — prioritize confirmed, add compatible as padding
-                # Sort each tier by score
-                _confirmed.sort(key=lambda c: c.score, reverse=True)
-                _compatible.sort(key=lambda c: c.score, reverse=True)
-                # Confirmed clips are primary; add top compatible to reach min count
-                _needed = max(0, _MIN_CLIPS_TOTAL - len(_confirmed))
-                merged = _confirmed + _compatible[:_needed]
+            if len(_strong) >= _MIN_STRONG_FOR_HARD:
+                # HARD mode: only use clips where this jersey was CLEARLY identified
+                _strong.sort(key=lambda c: c.score, reverse=True)
+                _weak.sort(key=lambda c: c.score, reverse=True)
+                # Fill with weak clips only if needed to reach minimum count
+                _needed = max(0, _MIN_CLIPS_TOTAL - len(_strong))
+                merged = _strong + _weak[:_needed]
+                # Drop any clips without strong jersey evidence
                 LOGGER.info(
-                    "Jersey hard filter: HARD mode — %d confirmed + %d compatible padding",
-                    len(_confirmed), min(_needed, len(_compatible)),
+                    "Jersey hard filter: HARD mode — %d strong + %d weak padding (dropped %d none)",
+                    len(_strong), min(_needed, len(_weak)), len(_none),
                 )
-            elif len(_confirmed) >= 1:
-                # Some jersey evidence — confirmed first, then compatible, exclude conflicting
-                _confirmed.sort(key=lambda c: c.score, reverse=True)
-                _compatible.sort(key=lambda c: c.score, reverse=True)
-                merged = _confirmed + _compatible
-                # Apply score penalty to conflicting but include as last resort
-                for c in _conflicting:
-                    c.score = max(5, int(c.score * 0.4))
-                    c.grade = "Cut"
-                merged.extend(_conflicting)
+            elif len(_strong) >= 1:
+                # SOFT mode: strong first, then weak, then none (penalized)
+                _strong.sort(key=lambda c: c.score, reverse=True)
+                _weak.sort(key=lambda c: c.score, reverse=True)
+                _none.sort(key=lambda c: c.score, reverse=True)
+                # Penalize "none" clips — they likely don't feature the target player
+                for c in _none:
+                    c.score = max(5, int(c.score * 0.5))
+                merged = _strong + _weak + _none
                 LOGGER.info(
-                    "Jersey hard filter: SOFT mode — %d confirmed + %d compatible + %d conflicting (penalized)",
-                    len(_confirmed), len(_compatible), len(_conflicting),
+                    "Jersey hard filter: SOFT mode — %d strong + %d weak + %d none (penalized)",
+                    len(_strong), len(_weak), len(_none),
                 )
             else:
-                # No jersey confirmation at all — boost clips with player-specific signals
-                # (team color, zoom, formation) to differentiate positions
+                # NO-JERSEY mode: use player-specific signals to differentiate
                 _ps_clips = [c for c in merged if c.signals.get("player_specific", 0) > 15]
                 _other = [c for c in merged if c.signals.get("player_specific", 0) <= 15]
 
@@ -609,13 +607,13 @@ def extract_clips(
                     _other.sort(key=lambda c: c.score, reverse=True)
                     merged = _ps_clips + _other
                     LOGGER.info(
-                        "Jersey hard filter: NO-JERSEY mode — %d player-specific-boosted + %d other",
+                        "Jersey hard filter: NO-JERSEY mode — %d ps-boosted + %d other",
                         len(_ps_clips), len(_other),
                     )
                 else:
                     LOGGER.info("Jersey hard filter: NO-JERSEY mode — no filtering possible")
         else:
-            LOGGER.info("Jersey hard filter: no target jersey number available — skipping")
+            LOGGER.info("Jersey hard filter: no target jersey number — skipping")
 
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)

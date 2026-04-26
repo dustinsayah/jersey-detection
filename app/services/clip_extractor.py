@@ -38,7 +38,7 @@ _OUTCOME_SCORE_BOOSTS = {
 # Clip boundary expansion — sport-specific defaults (seconds)
 _SPORT_EXPAND = {
     "basketball": (1.5, 3.0),  # Fast game, tighter clips
-    "football": (3.0, 6.0),    # Pre-snap lineup + post-play follow-through
+    "football": (2.0, 6.0),    # 2s pre-snap + 6s post-play follow-through
     "lacrosse": (1.5, 3.5),    # Fast transitions
 }
 _DEFAULT_EXPAND = (2.0, 4.0)

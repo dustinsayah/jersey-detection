@@ -2282,29 +2282,56 @@ async def _run_analyze_pipeline_impl(
                     tc_stats["cross_layer_confirmed"],
                 )
 
-                # Boost (don't filter) detection_points near confirmed timestamps.
-                # Previously this REMOVED detection_points not near jersey sightings,
-                # which threw away valid motion/pose/audio detections and caused
-                # only 4 clips from 288 detections.  Now we keep ALL detection_points
-                # but boost confidence of those near confirmed jersey timestamps.
-                if confirmed_dets:
+                # Boost detection_points near confirmed timestamps AND propagate
+                # jersey_visible / jersey_number so clip-level jersey confidence
+                # is non-zero.  Also use RAW (pre-consensus) detection timestamps
+                # with a wider window — the consensus filter is too aggressive at
+                # low resolution (360p), dropping 97% of valid detections.
+                #
+                # Two tiers of jersey attribution:
+                # 1. Near CONFIRMED (consensus-passed): high boost + jersey_visible
+                # 2. Near RAW (any OCR hit): moderate boost + jersey_visible
+                if confirmed_dets or all_layer_dets:
                     confirmed_timestamps = set()
-                    for cd in confirmed_dets:
+                    for cd in (confirmed_dets or []):
                         confirmed_timestamps.add(cd.get("timestamp", 0))
+
+                    # RAW timestamps: any frame where OCR detected the target number
+                    raw_timestamps = set()
+                    for rd in all_layer_dets:
+                        raw_timestamps.add(rd.get("timestamp", 0))
+
                     boosted_count = 0
+                    jersey_attributed = 0
                     for dp in detection_points:
                         near_confirmed = any(
                             abs(dp.timestamp - cts) < 2.0
                             for cts in confirmed_timestamps
-                        )
+                        ) if confirmed_timestamps else False
+
+                        near_raw = any(
+                            abs(dp.timestamp - rts) < 3.0
+                            for rts in raw_timestamps
+                        ) if raw_timestamps else False
+
                         if near_confirmed and not dp.jersey_visible:
-                            dp.confidence = min(1.0, dp.confidence + 0.1)
+                            dp.confidence = min(1.0, dp.confidence + 0.15)
+                            dp.jersey_visible = True
+                            dp.jersey_number = jersey_number
                             boosted_count += 1
+                            jersey_attributed += 1
+                        elif near_raw and not dp.jersey_visible:
+                            dp.confidence = min(1.0, dp.confidence + 0.08)
+                            dp.jersey_visible = True
+                            dp.jersey_number = jersey_number
+                            jersey_attributed += 1
+
                     LOGGER.info(
-                        "Pipeline: temporal consensus boosted %d of %d "
-                        "detection_points (kept all, %d confirmed timestamps)",
-                        boosted_count, len(detection_points),
-                        len(confirmed_timestamps),
+                        "Pipeline: jersey attribution — %d boosted (confirmed), "
+                        "%d total attributed of %d detection_points "
+                        "(%d confirmed ts, %d raw ts)",
+                        boosted_count, jersey_attributed, len(detection_points),
+                        len(confirmed_timestamps), len(raw_timestamps),
                     )
 
                     # ── Training data collection ──────────────────────────
@@ -3453,14 +3480,15 @@ async def _run_chunked_full_game(
     # Full video might be 7200s but we only extracted 0-1200s.
     # Passing full duration forces _is_full_game=True → cluster_gap=5.0 (too wide).
     _effective_clip_dur = extract_end - extract_start
-    # Note: player_specific_data not passed in chunked path yet —
-    # chunked full-game processing will get PS scoring in a future version
+    # Pass jersey_number for the hard jersey filter in clip_extractor
+    _chunked_ps_data = {"jersey_number": jersey_number}
     clips = extract_clips(
         detections=detection_points,
         audio_result=audio_result if audio_result.has_audio else None,
         sport=sport,
         position=position,
         video_duration=_effective_clip_dur,
+        player_specific_data=_chunked_ps_data,
     )
     layer_timings["clip_extraction"] = {
         "elapsed_ms": round((time.perf_counter() - _t_clip_extract) * 1000),
@@ -3478,47 +3506,52 @@ async def _run_chunked_full_game(
     LOGGER.info("Chunked: %d clips (max_dur=%.0fs, no splitting)", len(clips), _max_c)
 
     # ── Temporal jersey attribution (global post-processing) ──
-    # Collect ALL jersey detections across ALL chunks, then attribute to clips.
-    # Uses 300s window (covers nearly half a football quarter).
-    # If jersey is confirmed ANYWHERE, also attribute to active clips (motion > 20).
+    # Attribute jersey to clips using DISTANCE-WEIGHTED confidence.
+    # Clips near actual OCR hits get high confidence; clips far away get low.
+    # This is KEY for differentiation: different jersey numbers have OCR hits
+    # at different timestamps, so clips get different confidence levels.
     _jersey_ts = sorted(
         d["timestamp"] for d in all_layer_dets
         if d.get("number_detected") == jersey_number
     ) if all_layer_dets else []
-    _jersey_attr_window_c = 300  # 5 min window (was 120s)
     _has_any_jersey = len(_jersey_ts) > 0
     if _jersey_ts and clips:
         _attr_count = 0
         for clip in clips:
             if clip.jersey_visible:
                 continue
-            # Method 1: temporal proximity — jersey detected within 300s
+            # Find closest OCR detection to this clip
+            clip_center = (clip.start_time + clip.end_time) / 2
+            min_dist = float("inf")
             for jts in _jersey_ts:
-                if clip.start_time - _jersey_attr_window_c <= jts <= clip.end_time + _jersey_attr_window_c:
-                    clip.jersey_visible = True
-                    clip.jersey_number_seen = jersey_number
-                    _attr_count += 1
-                    break
-        # Method 2: motion-based — if jersey confirmed ANYWHERE and clip has
-        # very high motion, the player is likely on field during active plays.
-        # Raised threshold from 20 to 50 to avoid attributing jersey to
-        # random sideline/huddle clips.
-        if _has_any_jersey:
-            _motion_attr_count = 0
-            for clip in clips:
-                if clip.jersey_visible:
-                    continue
-                clip_motion = (clip.signals or {}).get("motion", 0) or 0
-                if clip_motion > 50:
-                    clip.jersey_visible = True
-                    clip.jersey_number_seen = jersey_number
-                    _motion_attr_count += 1
-            if _motion_attr_count:
-                _attr_count += _motion_attr_count
-                LOGGER.info("Chunked: motion-based jersey attribution: %d clips (motion>50)", _motion_attr_count)
+                dist = abs(clip_center - jts)
+                min_dist = min(min_dist, dist)
+
+            # Distance-weighted confidence (decays with distance from OCR hit)
+            # 0s → 0.75, 10s → 0.65, 30s → 0.50, 60s → 0.35, 120s → 0.20
+            if min_dist <= 5.0:
+                # OCR hit is INSIDE or very near this clip
+                _attr_conf = 0.75
+            elif min_dist <= 30.0:
+                _attr_conf = max(0.40, 0.75 - (min_dist - 5) * 0.014)
+            elif min_dist <= 120.0:
+                _attr_conf = max(0.20, 0.40 - (min_dist - 30) * 0.0022)
+            else:
+                _attr_conf = 0.10  # Very far from any OCR hit
+
+            clip.jersey_visible = True
+            clip.jersey_number_seen = jersey_number
+            # Store the distance-weighted confidence as the jersey signal
+            if not clip.signals:
+                clip.signals = {}
+            clip.signals["jersey"] = round(_attr_conf, 2)
+            clip.signals["jersey_dist"] = round(min_dist, 1)
+            _attr_count += 1
+
         if _attr_count:
-            LOGGER.info("Chunked: total jersey attribution: %d clips gained jersey=%d (window=%ds)",
-                        _attr_count, jersey_number, _jersey_attr_window_c)
+            LOGGER.info("Chunked: distance-weighted jersey attribution: %d clips, "
+                        "jersey=%d, %d OCR timestamps",
+                        _attr_count, jersey_number, len(_jersey_ts))
 
     # ── Fallback: user-claimed jersey when OCR found ZERO detections ──
     # Full-game OCR often fails on navy/dark jerseys at broadcast distance.
@@ -3539,6 +3572,11 @@ async def _run_chunked_full_game(
             if (clip_motion > 5 and has_audio) or clip_motion > 20:
                 clip.jersey_visible = True
                 clip.jersey_number_seen = jersey_number
+                # Low confidence — user-claimed, not OCR-confirmed
+                if not clip.signals:
+                    clip.signals = {}
+                clip.signals["jersey"] = 0.15
+                clip.signals["jersey_dist"] = 9999.0
                 _user_attr_count += 1
         if _user_attr_count:
             LOGGER.info(

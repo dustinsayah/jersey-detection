@@ -380,9 +380,24 @@ def _filter_unwanted_clips(
             len(clips), len(kept), removed,
         )
 
-    # Safety: if filter removed everything, fall back to top clips by score
-    if not kept and clips:
-        LOGGER.warning("Dead ball filter removed ALL clips — falling back to top 4 by score")
+    # Safety: guarantee at least 4 clips for a viable reel
+    # At 360p, OCR rarely hits so most clips have jconf=0.10, causing
+    # the filter to be very aggressive. Backfill with top-scoring clips.
+    _MIN_CLIPS = 4
+    if len(kept) < _MIN_CLIPS and len(clips) >= _MIN_CLIPS:
+        by_score = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)
+        for c in by_score:
+            if c not in kept:
+                kept.append(c)
+                LOGGER.info(
+                    "Dead ball backfill: added %.0fs-%.0fs (score=%s) to meet minimum %d",
+                    c.get("startTime", 0), c.get("endTime", 0),
+                    c.get("score", 0), _MIN_CLIPS,
+                )
+            if len(kept) >= _MIN_CLIPS:
+                break
+    elif not kept and clips:
+        LOGGER.warning("Dead ball filter removed ALL clips -- falling back to top 4 by score")
         kept = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)[:4]
 
     return kept

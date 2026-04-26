@@ -1071,6 +1071,168 @@ async def _run_analyze_pipeline_impl(
                 layer_timings["audio_analysis"] = {"elapsed_ms": round((time.perf_counter() - t0) * 1000), "status": "error", "error": str(exc)}
                 LOGGER.warning("Pipeline: audio analysis failed: %s", exc)
 
+        # ── Step 5.5: Player-specific detection (v8.27) ─��──────────────
+        # Run lightweight person detection to get bounding boxes for ALL frames,
+        # then use those boxes for team color + zoom + formation detection.
+        # This provides player-specific signals independent of jersey OCR.
+        player_boxes_per_frame: dict[int, list[list[float]]] = {}
+        frame_heights: dict[int, int] = {}
+        player_specific_data: dict[str, Any] = {}
+        _is_football_sport = sport.lower() == "football"
+
+        if _is_football_sport and frames:
+            t0 = time.perf_counter()
+            try:
+                from ultralytics import YOLO
+                _person_model = YOLO("yolo11n.pt")  # Nano model, fast on CPU
+                _sample_step = max(1, len(frames) // 60)  # Sample ~60 frames max
+
+                for i in range(0, len(frames), _sample_step):
+                    _, frame = frames[i]
+                    h, w = frame.shape[:2]
+                    frame_heights[i] = h
+                    try:
+                        results = _person_model(frame, classes=[0], conf=0.3, verbose=False)
+                        if results and results[0].boxes is not None:
+                            boxes = results[0].boxes.xyxy.cpu().numpy().tolist()
+                            player_boxes_per_frame[i] = boxes
+                    except Exception:
+                        pass
+
+                del _person_model
+                LOGGER.info(
+                    "Pipeline: person detection for player-specific scoring: "
+                    "%d frames sampled, %d with detections",
+                    len(range(0, len(frames), _sample_step)),
+                    len(player_boxes_per_frame),
+                )
+                layer_timings["person_detection_ps"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "frames_sampled": len(range(0, len(frames), _sample_step)),
+                    "frames_with_players": len(player_boxes_per_frame),
+                }
+            except Exception as exc:
+                LOGGER.warning("Pipeline: person detection for PS scoring failed: %s", exc)
+                layer_timings["person_detection_ps"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error", "error": str(exc),
+                }
+
+        # ── Step 5.6: Team color detection ──────────────────────────────
+        team_frame_counts: list[tuple[float, int, int]] = []
+        if _is_football_sport and player_boxes_per_frame and frames:
+            t0 = time.perf_counter()
+            try:
+                from app.services.team_color_detector import TeamColorDetector
+                tc_detector = TeamColorDetector(jersey_color=jersey_color)
+
+                # Calibrate from sample frames
+                tc_detector.calibrate(frames, player_boxes_per_frame)
+
+                # Classify players in each sampled frame
+                for frame_idx, boxes in player_boxes_per_frame.items():
+                    if frame_idx >= len(frames):
+                        continue
+                    ts, frame = frames[frame_idx]
+                    assignments = tc_detector.classify_players(frame, boxes)
+                    my_c, opp_c = tc_detector.count_my_team_in_center(
+                        assignments, frame.shape[1]
+                    )
+                    team_frame_counts.append((ts, my_c, opp_c))
+
+                player_specific_data["team_frame_counts"] = team_frame_counts
+                if tc_detector.profile.calibrated:
+                    phases_used.append("team_color_detection")
+                layer_timings["team_color"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "calibrated": tc_detector.profile.calibrated,
+                    "frames_classified": len(team_frame_counts),
+                }
+                LOGGER.info(
+                    "Pipeline: team color detection — calibrated=%s, %d frames classified",
+                    tc_detector.profile.calibrated, len(team_frame_counts),
+                )
+            except Exception as exc:
+                LOGGER.warning("Pipeline: team color detection failed: %s", exc)
+                layer_timings["team_color"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error", "error": str(exc),
+                }
+
+        # ── Step 5.7: Zoom detection ───────────────────────────────────
+        if _is_football_sport and player_boxes_per_frame and frames:
+            t0 = time.perf_counter()
+            try:
+                from app.services.zoom_detector import ZoomDetector
+                zoom_det = ZoomDetector()
+                _timestamps = [frames[i][0] for i in range(len(frames))]
+                zoom_analysis = zoom_det.analyze_frames(
+                    _timestamps, player_boxes_per_frame, frame_heights,
+                )
+                player_specific_data["zoom_analysis"] = zoom_analysis
+                if zoom_analysis.events:
+                    phases_used.append("zoom_detection")
+                layer_timings["zoom_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "events": len(zoom_analysis.events),
+                    "close_ups": len(zoom_analysis.close_up_timestamps),
+                    "transitions": len(zoom_analysis.transition_timestamps),
+                }
+            except Exception as exc:
+                LOGGER.warning("Pipeline: zoom detection failed: %s", exc)
+                layer_timings["zoom_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error", "error": str(exc),
+                }
+
+        # ── Step 5.8: Formation detection ──────────────────────────────
+        if _is_football_sport and player_boxes_per_frame and frames:
+            t0 = time.perf_counter()
+            try:
+                from app.services.formation_detector import FormationDetector
+                form_det = FormationDetector(target_position=position or "")
+
+                # Build team assignments per frame for formation detector
+                _team_assign_per_frame: dict[int, list[dict]] = {}
+                if team_frame_counts:
+                    # Re-run team color classify for formation frames
+                    from app.services.team_color_detector import TeamColorDetector
+                    _tc_det2 = TeamColorDetector(jersey_color=jersey_color)
+                    _tc_det2.profile = tc_detector.profile if 'tc_detector' in dir() else _tc_det2.profile
+                    for frame_idx, boxes in player_boxes_per_frame.items():
+                        if frame_idx >= len(frames):
+                            continue
+                        _, frame = frames[frame_idx]
+                        assignments = _tc_det2.classify_players(frame, boxes)
+                        _team_assign_per_frame[frame_idx] = [
+                            {"bbox": list(a.bbox), "team": a.team}
+                            for a in assignments
+                        ]
+
+                formation_analysis = form_det.analyze_frames(
+                    frames, player_boxes_per_frame, motion_scores,
+                    _team_assign_per_frame,
+                )
+                player_specific_data["formation_analysis"] = formation_analysis
+                if formation_analysis.results:
+                    phases_used.append("formation_detection")
+                layer_timings["formation_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "presnap_frames": len(formation_analysis.presnap_timestamps),
+                    "qb_detected": len(formation_analysis.qb_timestamps),
+                }
+                LOGGER.info(
+                    "Pipeline: formation detection — %d pre-snap frames, %d with QB",
+                    len(formation_analysis.presnap_timestamps),
+                    len(formation_analysis.qb_timestamps),
+                )
+            except Exception as exc:
+                LOGGER.warning("Pipeline: formation detection failed: %s", exc)
+                layer_timings["formation_detection"] = {
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                    "status": "error", "error": str(exc),
+                }
+
         # ── Step 6: Player tracking ──────────────────────────────────────
         tracking_result = None
         if enable_tracking and frames:
@@ -2354,6 +2516,7 @@ async def _run_analyze_pipeline_impl(
             sport=sport,
             position=position,
             video_duration=video_duration,
+            player_specific_data=player_specific_data if player_specific_data else None,
         )
 
         # ── Unload request-specific models to free memory ──
@@ -3253,6 +3416,8 @@ async def _run_chunked_full_game(
     # Full video might be 7200s but we only extracted 0-1200s.
     # Passing full duration forces _is_full_game=True → cluster_gap=5.0 (too wide).
     _effective_clip_dur = extract_end - extract_start
+    # Note: player_specific_data not passed in chunked path yet —
+    # chunked full-game processing will get PS scoring in a future version
     clips = extract_clips(
         detections=detection_points,
         audio_result=audio_result if audio_result.has_audio else None,

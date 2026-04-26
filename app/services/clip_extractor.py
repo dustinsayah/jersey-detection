@@ -95,6 +95,7 @@ def extract_clips(
     sport: str = "basketball",
     position: str | None = None,
     video_duration: float = 0.0,
+    player_specific_data: dict | None = None,
 ) -> list[ExtractedClip]:
     """Merge all detection signals into ranked, scored clips.
 
@@ -494,6 +495,42 @@ def extract_clips(
                     clip.score = max(10, int(clip.score * 0.85))
             LOGGER.info("Jersey scoring: target jersey #%s, adjusted scores for %d clips",
                         _target_jersey, len(merged))
+
+    # ── Step 3.8: Player-specific scoring (v8.27 — team color + zoom + formation) ──
+    # Adds 0-60 points based on team color match, broadcast zoom, and
+    # formation position detection. This is the key differentiator that
+    # makes QB reels different from WR reels on the same game film.
+    if player_specific_data and sport.lower() == "football":
+        _psd = player_specific_data
+        _zoom_analysis = _psd.get("zoom_analysis")
+        _formation_analysis = _psd.get("formation_analysis")
+        _team_frame_counts = _psd.get("team_frame_counts")  # list[(ts, my_count, opp_count)]
+
+        try:
+            from app.services.player_specific_scorer import calculate_player_specific_score
+            _ps_boosted = 0
+            for clip in merged:
+                ps_score = calculate_player_specific_score(
+                    clip_start=clip.start_time,
+                    clip_end=clip.end_time,
+                    position=position or "",
+                    my_team_frame_counts=_team_frame_counts,
+                    zoom_analysis=_zoom_analysis,
+                    formation_analysis=_formation_analysis,
+                )
+                if ps_score.total > 0:
+                    clip.score = min(100, clip.score + int(ps_score.total))
+                    clip.signals["player_specific"] = ps_score.total
+                    clip.signals["ps_details"] = ps_score.details
+                    _ps_boosted += 1
+
+            if _ps_boosted > 0:
+                LOGGER.info(
+                    "Player-specific scoring: boosted %d/%d clips (position=%s)",
+                    _ps_boosted, len(merged), position,
+                )
+        except Exception as exc:
+            LOGGER.warning("Player-specific scoring failed: %s", exc)
 
     # ── Step 4: Sort by score descending ─────────────────────────────────
     merged.sort(key=lambda c: c.score, reverse=True)

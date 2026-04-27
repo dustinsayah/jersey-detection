@@ -518,10 +518,16 @@ def _finalize_clip(
     else:
         grade = "Cut"
 
-    # Build signals dict compatible with existing pipeline consumers
+    # Build signals dict compatible with existing pipeline consumers.
+    # v8.31.1: signals.jersey is the post-filter's "jersey confirmed" gate
+    # (jconf >= 0.20). Without persistence gating here, a single-frame OCR
+    # misread (jersey_conf=0.21, target_visible in 1/4 frames) would pass
+    # the gate and bypass the dead-ball filter — re-introducing the exact
+    # 461s false positive we just filtered. Mirror the persistence-gated
+    # jersey_confirmed flag into signals.jersey so both filters agree.
     motion_score = avg_players * 5  # 10 players → 50 motion score
     signals = {
-        "jersey": round(max_jersey_conf, 3),
+        "jersey": round(max_jersey_conf, 3) if jersey_confirmed else 0.0,
         "motion": round(motion_score, 1),
         "audio": False,
         "audio_confidence": 0.0,

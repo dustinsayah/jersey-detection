@@ -374,6 +374,26 @@ def _filter_unwanted_clips(
                 )
                 continue
 
+        # v8.31: Even when jersey IS confirmed, very low motion + no audio + no
+        # outcome means the camera is zoomed on a player during a timeout/dead
+        # ball (e.g., post-play stand-around with #2 in frame). Drop these.
+        if _jersey_confirmed and not has_outcome and not has_audio and motion < 30 and pt in ("game_action", "formation"):
+            LOGGER.info(
+                "Dead ball filter (jersey-zoom): dropped %.0fs-%.0fs (jconf=%.2f, motion=%.0f, no audio/outcome)",
+                c.get("startTime", 0), c.get("endTime", 0), jconf, motion,
+            )
+            continue
+
+        # v8.31: Universal floor — game_action clips with motion < 25 indicate
+        # fewer than ~5 avg players in the ByteTrack synthetic motion (avg_players*5).
+        # These are almost always sideline/transition flukes regardless of jersey.
+        if pt == "game_action" and motion < 25:
+            LOGGER.info(
+                "Dead ball filter (low-motion floor): dropped %.0fs-%.0fs (motion=%.0f < 25)",
+                c.get("startTime", 0), c.get("endTime", 0), motion,
+            )
+            continue
+
         kept.append(c)
 
     if len(kept) < len(clips):

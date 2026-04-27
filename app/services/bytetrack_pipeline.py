@@ -171,7 +171,13 @@ def classify_frame_state(
     heights = [(b[3] - b[1]) / frame_h for b in boxes]
 
     x_spread = max(cx) - min(cx) if cx else 0
+    y_spread = max(cy) - min(cy) if cy else 0
     avg_height = float(np.mean(heights)) if heights else 0
+
+    # If most detections near frame edges — coaches/sideline crew, not on-field play
+    edge_count = sum(1 for x in cx if x < 0.08 or x > 0.92)
+    if edge_count > n * 0.4:
+        return "sideline"
 
     # If players near bottom of frame only — sideline shot
     bottom_count = sum(1 for y in cy if y > 0.75)
@@ -185,6 +191,18 @@ def classify_frame_state(
     # If players clustered (low spread) — huddle or dead ball
     if x_spread < 0.25:
         return "dead_ball"
+
+    # Transition detection: players spread out but no formation lines.
+    # In a real pre-snap formation, offense and defense form two distinct
+    # y-bands (line of scrimmage). Walking-between-plays is a single blob
+    # with even y-distribution. Look for the largest y-gap between adjacent
+    # mid-field players — a real LOS produces a >0.04 gap.
+    middle_y = sorted(y for y in cy if 0.25 < y < 0.75)
+    if len(middle_y) >= 8:
+        gaps = [middle_y[i + 1] - middle_y[i] for i in range(len(middle_y) - 1)]
+        max_gap = max(gaps) if gaps else 0.0
+        if max_gap < 0.04 and y_spread < 0.30:
+            return "transition"
 
     # If enough players spread across field — active play
     if n >= 8 and x_spread > 0.35:
@@ -439,6 +457,10 @@ def _cluster_to_clips(
 
     clips = []
     for cluster in clusters:
+        # Require at least 2 valid play moments per cluster — singletons are
+        # almost always frame-state classifier flukes (a single misread frame).
+        if len(cluster) < 2:
+            continue
         clip = _finalize_clip(cluster, video_duration, target_jersey)
         if clip:
             clips.append(clip)

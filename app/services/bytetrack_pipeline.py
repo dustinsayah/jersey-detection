@@ -486,7 +486,17 @@ def _finalize_clip(
     start = max(0, peak_time - 3)
     end = min(video_duration, peak_time + 8)
 
-    jersey_confirmed = any(m["target_visible"] for m in moments)
+    # v8.31: Multi-frame persistence for target visibility.
+    # A single-frame OCR misread can flip target_visible=True on one moment
+    # and give the whole cluster a "jersey confirmed" stamp. Require the
+    # target to be seen in multiple frames OR the cluster to be very tight
+    # (≤3 moments where 1-frame visibility is plausible).
+    target_visible_count = sum(1 for m in moments if m["target_visible"])
+    target_visibility_ratio = target_visible_count / len(moments)
+    jersey_confirmed = (
+        target_visible_count >= 2
+        or (len(moments) <= 3 and target_visible_count >= 1)
+    )
     max_score = max(m["score"] for m in moments)
     avg_players = int(np.mean([m["player_count"] for m in moments]))
     max_jersey_conf = max(m["jersey_conf"] for m in moments)
@@ -499,8 +509,9 @@ def _finalize_clip(
     else:
         play_type = "formation"
 
-    # Determine grade
-    if max_score >= 60:
+    # v8.31: Grade respects target persistence — a +80 single-frame OCR boost
+    # shouldn't promote a clip to "Strong" if the target was barely visible.
+    if max_score >= 60 and target_visibility_ratio >= 0.20:
         grade = "Strong"
     elif max_score >= 35:
         grade = "Decent"
@@ -538,6 +549,8 @@ def _finalize_clip(
         "peakTimestamp": peak_time,
         "playerCount": avg_players,
         "momentCount": len(moments),
+        "targetVisibleFrames": target_visible_count,
+        "targetVisibilityRatio": round(target_visibility_ratio, 3),
         "recruitingScore": round(max_score),
         "playerSpecificScore": round(max_score * 0.5),
         "caption": f"{'#' + target_jersey + ' — ' if jersey_confirmed else ''}{play_type.replace('_', ' ').title()}",

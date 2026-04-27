@@ -63,6 +63,12 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolo26n-seg.pt')" \
 # bundle YOLO pose model for pose estimation
 RUN python -c "from ultralytics import YOLO; m=YOLO('yolo11n-pose.pt'); import shutil; shutil.move('yolo11n-pose.pt', '/app/app/model/yolo11n-pose.pt')" || true
 
+# bundle YOLOv8n for ByteTrack detection pipeline
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" || true
+
+# Pre-download EasyOCR models for jersey OCR
+RUN python -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False); print('EasyOCR models cached')" || true
+
 # Pre-download YAMNet TFLite model for audio classification (non-fatal if fails)
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://tfhub.dev/google/lite-model/yamnet/tflite/1?lite-format=tflite', '/app/app/model/yamnet.tflite'); print('YAMNet downloaded')" \
     || echo "YAMNet download skipped"
@@ -105,7 +111,7 @@ RUN mkdir -p /app/app/model
 # Uninstall deprecated yt-dlp-get-pot if leftover from Docker cache layers
 RUN pip uninstall -y yt-dlp-get-pot 2>/dev/null || true
 
-ARG CACHE_BUST=v8.21.1
+ARG CACHE_BUST=v8.30.0
 RUN echo "Build version: $CACHE_BUST"
 
 COPY app /app/app

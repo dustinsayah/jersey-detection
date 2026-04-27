@@ -54,6 +54,9 @@ from app.services.youtube_proxy import (
 
 LOGGER = logging.getLogger(__name__)
 
+# ── New ByteTrack pipeline toggle ──
+USE_NEW_DETECTION = os.getenv("USE_NEW_DETECTION", "true").lower() == "true"
+
 # Football-specific overrides
 FOOTBALL_CONF_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.06"))  # env-tunable, default lowered for wide-angle JV footage
 FOOTBALL_MIN_CLIP = 3.0
@@ -884,6 +887,70 @@ async def _run_analyze_pipeline_impl(
                     )
             except Exception as exc:
                 LOGGER.warning("Pipeline: trim failed (using full video): %s", exc)
+
+        # ── NEW: ByteTrack pipeline (replaces legacy multi-layer detection) ──
+        if USE_NEW_DETECTION and sport.lower() == "football" and local_video_path and local_video_path.exists():
+            LOGGER.info("Pipeline: USING NEW ByteTrack detection pipeline (v1)")
+            try:
+                from app.services.bytetrack_pipeline import run_bytetrack_detection
+
+                t_bt = time.perf_counter()
+                bt_clips = await run_in_threadpool(
+                    partial(
+                        run_bytetrack_detection,
+                        video_path=str(local_video_path),
+                        target_jersey=str(jersey_number),
+                        target_color=jersey_color,
+                        position=position or "quarterback",
+                        sample_fps=1.0,
+                    )
+                )
+                bt_elapsed = time.perf_counter() - t_bt
+
+                # Restore absolute timestamps if video was trimmed
+                if _time_offset > 0:
+                    for _c in bt_clips:
+                        _c["startTime"] = round(_c.get("startTime", 0) + _time_offset, 2)
+                        _c["endTime"] = round(_c.get("endTime", 0) + _time_offset, 2)
+
+                LOGGER.info(
+                    "Pipeline: ByteTrack found %d clips in %.1fs",
+                    len(bt_clips), bt_elapsed,
+                )
+
+                # Apply dead ball filter
+                bt_clips = _filter_unwanted_clips(bt_clips, sport)
+
+                layer_timings["bytetrack_v1"] = {
+                    "elapsed_ms": round(bt_elapsed * 1000),
+                    "clips_found": len(bt_clips),
+                    "status": "success",
+                }
+
+                return {
+                    "clips": bt_clips,
+                    "detections": bt_clips,
+                    "elapsed": round(bt_elapsed, 1),
+                    "framesProcessed": 0,
+                    "layerUsed": "bytetrack_v1",
+                    "strategy": "yolov8n_bytetrack_easyocr",
+                    "sport": sport,
+                    "jersey_number": jersey_number,
+                    "jersey_color": jersey_color,
+                    "youtube_strategy": youtube_strategy_used,
+                    "layer_timings": layer_timings,
+                    "video_duration": video_duration,
+                }
+            except Exception as exc:
+                LOGGER.error("Pipeline: ByteTrack failed, falling back to legacy: %s", exc)
+                import traceback
+                traceback.print_exc()
+                layer_timings["bytetrack_v1"] = {
+                    "elapsed_ms": round((time.perf_counter() - t_bt) * 1000),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                # Fall through to legacy detection
 
         # ── Determine effective duration for chunked vs standard path ──
         _effective_duration = video_duration

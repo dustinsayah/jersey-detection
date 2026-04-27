@@ -913,17 +913,23 @@ async def _run_analyze_pipeline_impl(
                         _c["startTime"] = round(_c.get("startTime", 0) + _time_offset, 2)
                         _c["endTime"] = round(_c.get("endTime", 0) + _time_offset, 2)
 
+                bt_raw_count = len(bt_clips)
                 LOGGER.info(
                     "Pipeline: ByteTrack found %d clips in %.1fs",
-                    len(bt_clips), bt_elapsed,
+                    bt_raw_count, bt_elapsed,
                 )
 
                 # Apply dead ball filter
-                bt_clips = _filter_unwanted_clips(bt_clips, sport)
+                bt_clips = _filter_unwanted_clips(bt_clips, sport, position or "quarterback")
+
+                # Count jersey-confirmed clips
+                jersey_clips = sum(1 for c in bt_clips if c.get("jerseyDetected"))
 
                 layer_timings["bytetrack_v1"] = {
                     "elapsed_ms": round(bt_elapsed * 1000),
-                    "clips_found": len(bt_clips),
+                    "clips_raw": bt_raw_count,
+                    "clips_after_filter": len(bt_clips),
+                    "jersey_confirmed": jersey_clips,
                     "status": "success",
                 }
 
@@ -931,7 +937,7 @@ async def _run_analyze_pipeline_impl(
                     "clips": bt_clips,
                     "detections": bt_clips,
                     "elapsed": round(bt_elapsed, 1),
-                    "framesProcessed": 0,
+                    "framesProcessed": bt_raw_count,
                     "layerUsed": "bytetrack_v1",
                     "strategy": "yolov8n_bytetrack_easyocr",
                     "sport": sport,
@@ -940,6 +946,13 @@ async def _run_analyze_pipeline_impl(
                     "youtube_strategy": youtube_strategy_used,
                     "layer_timings": layer_timings,
                     "video_duration": video_duration,
+                    "debug": {
+                        "pipeline": "bytetrack_v1",
+                        "clips_raw": bt_raw_count,
+                        "clips_after_filter": len(bt_clips),
+                        "jersey_confirmed": jersey_clips,
+                        "elapsed_s": round(bt_elapsed, 1),
+                    },
                 }
             except Exception as exc:
                 LOGGER.error("Pipeline: ByteTrack failed, falling back to legacy: %s", exc)

@@ -485,20 +485,38 @@ def _finalize_clip(
     else:
         grade = "Cut"
 
+    # Build signals dict compatible with existing pipeline consumers
+    motion_score = avg_players * 5  # 10 players → 50 motion score
+    signals = {
+        "jersey": round(max_jersey_conf, 3),
+        "motion": round(motion_score, 1),
+        "audio": False,
+        "audio_confidence": 0.0,
+        "pose": "standing",
+        "crowd": 0.0,
+        "v4_outcome": None,
+        "jersey_dist": 0.0 if jersey_confirmed else 9999.0,
+    }
+
     return {
         "startTime": round(start, 1),
         "endTime": round(end, 1),
         "playType": play_type,
+        "confidence": round(max_jersey_conf, 3),
         "score": round(max_score),
         "jerseyDetected": jersey_confirmed,
         "jerseyConfidence": round(max_jersey_conf, 3),
-        "motionScore": avg_players * 3,
+        "jerseyVisible": jersey_confirmed,
+        "jerseyNumberSeen": int(target_jersey) if jersey_confirmed else None,
+        "trackingId": None,
+        "description": "Game Action" if play_type == "game_action" else "Formation",
+        "signals": signals,
+        "motionScore": round(motion_score, 1),
         "grade": grade,
         "peakTimestamp": peak_time,
         "playerCount": avg_players,
         "momentCount": len(moments),
-        # Fields expected by existing pipeline consumers
-        "jerseyVisible": jersey_confirmed,
         "recruitingScore": round(max_score),
         "playerSpecificScore": round(max_score * 0.5),
+        "caption": f"{'#' + target_jersey + ' — ' if jersey_confirmed else ''}{play_type.replace('_', ' ').title()}",
     }

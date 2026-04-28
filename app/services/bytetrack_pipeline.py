@@ -197,13 +197,15 @@ def classify_frame_state(
     # y-bands (line of scrimmage). Walking-between-plays is a single blob
     # with even y-distribution. Look for the largest y-gap between adjacent
     # mid-field players — a real LOS produces a meaningful gap.
-    # v8.31.3: loosen to max_gap < 0.06 and y_spread < 0.35 — vision-verified
-    # transitions at 461s/426s slipped through the previous 0.04/0.30 thresholds.
+    # v8.31.4: reverted to strict 0.04/0.30/count>=8 thresholds. The looser
+    # v8.31.3 thresholds caught more transitions but also flagged real
+    # pre-snap formations as transitions when the camera angle made both
+    # team y-bands sit close together (1686s real play came back as 0 clips).
     middle_y = sorted(y for y in cy if 0.25 < y < 0.75)
-    if len(middle_y) >= 7:
+    if len(middle_y) >= 8:
         gaps = [middle_y[i + 1] - middle_y[i] for i in range(len(middle_y) - 1)]
         max_gap = max(gaps) if gaps else 0.0
-        if max_gap < 0.06 and y_spread < 0.35:
+        if max_gap < 0.04 and y_spread < 0.30:
             return "transition"
 
     # If enough players spread across field — active play

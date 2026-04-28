@@ -196,12 +196,14 @@ def classify_frame_state(
     # In a real pre-snap formation, offense and defense form two distinct
     # y-bands (line of scrimmage). Walking-between-plays is a single blob
     # with even y-distribution. Look for the largest y-gap between adjacent
-    # mid-field players — a real LOS produces a >0.04 gap.
+    # mid-field players — a real LOS produces a meaningful gap.
+    # v8.31.3: loosen to max_gap < 0.06 and y_spread < 0.35 — vision-verified
+    # transitions at 461s/426s slipped through the previous 0.04/0.30 thresholds.
     middle_y = sorted(y for y in cy if 0.25 < y < 0.75)
-    if len(middle_y) >= 8:
+    if len(middle_y) >= 7:
         gaps = [middle_y[i + 1] - middle_y[i] for i in range(len(middle_y) - 1)]
         max_gap = max(gaps) if gaps else 0.0
-        if max_gap < 0.04 and y_spread < 0.30:
+        if max_gap < 0.06 and y_spread < 0.35:
             return "transition"
 
     # If enough players spread across field — active play
@@ -479,12 +481,26 @@ def _finalize_clip(
     if not moments:
         return None
 
+    # v8.31.3: drop suspiciously long clusters. Real football plays produce
+    # 5-15 sampled "play" frames at 1fps. Clusters with >25 moments are
+    # almost always long static dead-ball shots (timeouts, end-of-quarter,
+    # injury delays) where the camera holds on a wide field view with
+    # players present but not playing. Vision-verified examples: clip at
+    # 2338s with mom=45 was a 30+s static dead ball.
+    if len(moments) > 25:
+        return None
+
     peak = max(moments, key=lambda m: m["score"])
     peak_time = peak["timestamp"]
 
-    # Clip window: 3s before peak, 8s after
+    # v8.31.3: extend window end from peak+8 to peak+12. The score peaks
+    # when OCR fires (typically pre-snap when QB jersey faces camera). With
+    # the old +8s end, plays where peak hit during huddle/walkup cut off
+    # before the actual snap. Vision-verified examples: clips 1/4/11 in
+    # the v8.31.2 full-game run all showed pre-snap formation at end frame
+    # because the actual play happened past the +8s boundary.
     start = max(0, peak_time - 3)
-    end = min(video_duration, peak_time + 8)
+    end = min(video_duration, peak_time + 12)
 
     # v8.31: Multi-frame persistence for target visibility.
     # A single-frame OCR misread can flip target_visible=True on one moment

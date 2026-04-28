@@ -313,6 +313,10 @@ def run_bytetrack_detection(
     frame_idx = 0
     frames_processed = 0
     last_progress = 0
+    # v8.32.0: real frame-diff motion. At 360p categories overlap with camera
+    # pans (walking+pan can exceed a tight-zoom play), so this is recorded as
+    # a signal only — no hard-drop filter until 720p data validates separation.
+    prev_gray_motion: Optional[np.ndarray] = None
 
     while True:
         ret, frame = cap.read()
@@ -326,6 +330,14 @@ def run_bytetrack_detection(
         frames_processed += 1
         timestamp = frame_idx / fps
         fh, fw = frame.shape[:2]
+
+        # Real frame-diff motion (computed before YOLO so it's always available)
+        gray_motion = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray_motion is not None and prev_gray_motion.shape == gray_motion.shape:
+            real_motion = float(cv2.absdiff(prev_gray_motion, gray_motion).mean())
+        else:
+            real_motion = 0.0
+        prev_gray_motion = gray_motion
 
         # Progress reporting
         pct = int(frame_idx / total_frames * 100)
@@ -405,6 +417,7 @@ def run_bytetrack_detection(
                     "target_team_count": target_team_count,
                     "score": round(score),
                     "state": state,
+                    "real_motion": round(real_motion, 2),
                 })
 
         except Exception as exc:
@@ -519,6 +532,13 @@ def _finalize_clip(
     avg_players = int(np.mean([m["player_count"] for m in moments]))
     max_jersey_conf = max(m["jersey_conf"] for m in moments)
 
+    # v8.32.0: real motion stats per clip. Recorded only — no filter applied at
+    # 360p (categories overlap with camera pan). Used for downstream analysis
+    # and will become a filter once 720p downloads land.
+    _rm_vals = [m.get("real_motion", 0.0) for m in moments if m.get("real_motion") is not None]
+    real_motion_avg = float(np.mean(_rm_vals)) if _rm_vals else 0.0
+    real_motion_max = float(max(_rm_vals)) if _rm_vals else 0.0
+
     # Determine play type
     if jersey_confirmed:
         play_type = "game_action"
@@ -577,5 +597,7 @@ def _finalize_clip(
         "targetVisibilityRatio": round(target_visibility_ratio, 3),
         "recruitingScore": round(max_score),
         "playerSpecificScore": round(max_score * 0.5),
+        "realMotionAvg": round(real_motion_avg, 2),
+        "realMotionMax": round(real_motion_max, 2),
         "caption": f"{'#' + target_jersey + ' — ' if jersey_confirmed else ''}{play_type.replace('_', ' ').title()}",
     }

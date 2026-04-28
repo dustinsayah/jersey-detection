@@ -232,10 +232,26 @@ _DASH_H264_FORMAT = (
     "best[height>=720][ext=mp4]/"
     "best[ext=mp4]/18/best"
 )
-# Muxed-only format (no DASH merge needed) — safe fallback, usually 360p
-_MUXED_FORMAT = "best[height<=1080][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
-# Fallback for android client (muxed only, usually 360p)
-_ANDROID_FORMAT = "best[height<=720][ext=mp4]/best[ext=mp4]/18/best"
+# Muxed-only format (no DASH merge needed) — safe fallback, usually 360p.
+# v8.32.0: try DASH 720p first (requires ffmpeg, which is in Docker). If DASH
+# fails the muxed itag-18 (360p) tail still works.
+_MUXED_FORMAT = (
+    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=720]+bestaudio/"
+    "best[height<=720][ext=mp4]/"
+    "best[height<=480][ext=mp4]/"
+    "best[height<=480]/best"
+)
+# Fallback for android client. v8.32.0: same 720p-first chain; android client
+# rarely serves DASH but keeping the prefix is harmless and lets the chain
+# upgrade automatically if the streaming response includes higher res.
+_ANDROID_FORMAT = (
+    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=720]+bestaudio/"
+    "best[height<=720][ext=mp4]/"
+    "best[height<=480][ext=mp4]/"
+    "best[height<=480]/best"
+)
 
 
 def is_youtube_url(url: str) -> bool:
@@ -509,7 +525,31 @@ def _yt_dlp_python_download(
 
         if output_path.exists() and output_path.stat().st_size > 1000:
             file_mb = round(output_path.stat().st_size / 1024 / 1024, 1)
-            LOGGER.info("%s: SUCCESS — %sMB (Python lib, client=%s)", strategy_name, file_mb, client)
+            # v8.32.0: probe actual resolution so we can confirm 720p downloads
+            try:
+                import subprocess as _sp
+                import json as _json
+                _probe = _sp.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_streams", str(output_path)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                _info = _json.loads(_probe.stdout or "{}")
+                _w = _h = 0
+                for _s in _info.get("streams", []):
+                    if _s.get("codec_type") == "video":
+                        _w = int(_s.get("width") or 0)
+                        _h = int(_s.get("height") or 0)
+                        break
+                LOGGER.info(
+                    "%s: SUCCESS — %sMB %dx%d (Python lib, client=%s)",
+                    strategy_name, file_mb, _w, _h, client,
+                )
+            except Exception:
+                LOGGER.info(
+                    "%s: SUCCESS — %sMB (Python lib, client=%s)",
+                    strategy_name, file_mb, client,
+                )
             return True
 
         LOGGER.warning("%s: file missing or too small after download", strategy_name)

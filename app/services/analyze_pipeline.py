@@ -338,8 +338,17 @@ def _filter_unwanted_clips(
         jconf = float(signals.get("jersey", 0) or 0) if isinstance(signals, dict) else 0.0
         has_outcome = bool(signals.get("v4_outcome")) if isinstance(signals, dict) else False
         has_audio = bool(signals.get("audio")) if isinstance(signals, dict) else False
+        moment_count = int(c.get("momentCount", 0) or 0)
+
+        # v8.31.2: At 360p (which is Railway's typical YouTube download
+        # resolution), OCR rarely fires — even real plays come back with
+        # signals.jersey=0.0 and tvf=0. Trust the frame-state classifier:
+        # 5+ moments of confirmed "play" state in the cluster is strong
+        # evidence the clip is a genuine play, even without OCR persistence.
+        sustained_play = moment_count >= 5
 
         # 1) Filter special teams for offensive positions
+        # (applies even to sustained plays — punts are still punts)
         if is_offensive and pt in _SPECIAL_TEAMS_PLAYS:
             LOGGER.info(
                 "Filtered special-teams clip: %s at %.0fs (position=%s)",
@@ -354,12 +363,12 @@ def _filter_unwanted_clips(
         _jersey_confirmed = jconf >= 0.20
         _is_confirmed = _jersey_confirmed or has_outcome or motion > 60
 
-        if not _is_confirmed and pt in ("game_action", "formation"):
+        if not _is_confirmed and not sustained_play and pt in ("game_action", "formation"):
             # Pattern A: Low motion (< 40) = obvious dead ball (huddle/timeout)
             if motion < 40:
                 LOGGER.info(
-                    "Dead ball filter: dropped %.0fs-%.0fs (motion=%.0f < 40, jconf=%.2f)",
-                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf,
+                    "Dead ball filter: dropped %.0fs-%.0fs (motion=%.0f < 40, jconf=%.2f, mom=%d)",
+                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf, moment_count,
                 )
                 continue
 
@@ -369,28 +378,34 @@ def _filter_unwanted_clips(
             if 40 <= motion <= 55 and not has_audio:
                 LOGGER.info(
                     "Dead ball filter: dropped %.0fs-%.0fs (motion=%.0f in 40-55, "
-                    "no audio, jconf=%.2f)",
-                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf,
+                    "no audio, jconf=%.2f, mom=%d)",
+                    c.get("startTime", 0), c.get("endTime", 0), motion, jconf, moment_count,
                 )
                 continue
 
         # v8.31: Even when jersey IS confirmed, very low motion + no audio + no
         # outcome means the camera is zoomed on a player during a timeout/dead
         # ball (e.g., post-play stand-around with #2 in frame). Drop these.
-        if _jersey_confirmed and not has_outcome and not has_audio and motion < 30 and pt in ("game_action", "formation"):
+        if (
+            _jersey_confirmed and not has_outcome and not has_audio
+            and motion < 30 and not sustained_play
+            and pt in ("game_action", "formation")
+        ):
             LOGGER.info(
-                "Dead ball filter (jersey-zoom): dropped %.0fs-%.0fs (jconf=%.2f, motion=%.0f, no audio/outcome)",
-                c.get("startTime", 0), c.get("endTime", 0), jconf, motion,
+                "Dead ball filter (jersey-zoom): dropped %.0fs-%.0fs (jconf=%.2f, motion=%.0f, no audio/outcome, mom=%d)",
+                c.get("startTime", 0), c.get("endTime", 0), jconf, motion, moment_count,
             )
             continue
 
         # v8.31: Universal floor — game_action clips with motion < 25 indicate
         # fewer than ~5 avg players in the ByteTrack synthetic motion (avg_players*5).
         # These are almost always sideline/transition flukes regardless of jersey.
-        if pt == "game_action" and motion < 25:
+        # v8.31.2: bypass for sustained plays (5+ moments) which can have low
+        # motion at 360p when only a few players are in the frame for a real play.
+        if pt == "game_action" and motion < 25 and not sustained_play:
             LOGGER.info(
-                "Dead ball filter (low-motion floor): dropped %.0fs-%.0fs (motion=%.0f < 25)",
-                c.get("startTime", 0), c.get("endTime", 0), motion,
+                "Dead ball filter (low-motion floor): dropped %.0fs-%.0fs (motion=%.0f < 25, mom=%d)",
+                c.get("startTime", 0), c.get("endTime", 0), motion, moment_count,
             )
             continue
 
@@ -419,9 +434,12 @@ def _filter_unwanted_clips(
                 )
             if len(kept) >= _MIN_CLIPS:
                 break
-    elif not kept and clips:
-        LOGGER.warning("Dead ball filter removed ALL clips -- falling back to top 4 by score")
-        kept = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)[:4]
+    # v8.31.2: Removed the "elif not kept and clips" branch that resurrected
+    # all dropped clips when the filter judged them ALL dead-ball. With v8.31
+    # filtering being more accurate (transition state, edge-cluster, persistence),
+    # that resurrection was undoing legitimate filter decisions on short
+    # segments — defeating Phase 1 validation. If filtering drops everything,
+    # return empty; the caller can fall back to a different strategy.
 
     return kept
 

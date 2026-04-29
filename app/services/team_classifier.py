@@ -28,9 +28,22 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 SIGLIP_MODEL = "google/siglip-base-patch16-224"
-WARMUP_TARGET = 30  # min crops collected before fitting
-WARMUP_MAX = 80  # max collected before forcing fit
-HSV_TIEBREAKER_SAMPLES = 8  # how many crops per cluster to score for target match
+WARMUP_TARGET = 60  # min crops collected before fitting (was 30 — too few for KMeans)
+WARMUP_MAX = 120  # max collected before forcing fit
+HSV_TIEBREAKER_SAMPLES = 16  # how many crops per cluster to score for target match
+
+# Hue buckets used by _detect_dominant_color: (h_lo, h_hi, color_name)
+# Hues are in OpenCV's 0-179 range. Buckets ordered by visual specificity.
+HUE_BUCKETS = [
+    (0, 10, "red"),
+    (10, 20, "orange"),
+    (20, 35, "yellow"),    # gold maps here too
+    (35, 80, "green"),
+    (80, 100, "blue"),     # cyan-ish
+    (100, 130, "navy"),    # darker blue / royal
+    (130, 160, "purple"),
+    (160, 179, "red"),     # red wraps
+]
 
 
 def _is_enabled() -> bool:
@@ -55,7 +68,13 @@ class TeamClassifier:
     """
 
     def __init__(self, target_color: str = "white", device: str | None = None):
+        # User-supplied "navy" is often the accent color of a navy/yellow team
+        # (e.g. St. Mark's wears yellow jerseys with navy numbers). _try_fit
+        # auto-detects the dominant saturated hue from warmup crops; if that
+        # disagrees with target_color we update target_color before scoring.
         self.target_color = (target_color or "white").lower().strip()
+        self._user_supplied_color = self.target_color
+        self._auto_detected_color: str | None = None
         self.device = device or ("cuda" if _torch_cuda_available() else "cpu")
         self._enabled = _is_enabled()
         self._fitted = False
@@ -69,6 +88,8 @@ class TeamClassifier:
         # subsequent calls with the same track_id reuse that decision without
         # another SigLIP forward pass. This keeps Railway's CPU-only inference
         # at one embedding per unique track instead of one per (frame, track).
+        # v8.33.2: cleared on _try_fit so warmup HSV-fallback decisions don't
+        # outlive the KMeans fit.
         self._track_cache: dict[int, str] = {}
         # Stats for debug
         self.n_predictions = 0
@@ -123,6 +144,13 @@ class TeamClassifier:
             self._broken = True
             return self._hsv_fallback(crop)
 
+    def add_to_warmup(self, crop: np.ndarray) -> None:
+        """Test/debug helper: push a crop into the warmup pool without prediction."""
+        if crop is None or crop.size == 0:
+            return
+        if len(self._warmup_crops) < WARMUP_MAX:
+            self._warmup_crops.append(crop.copy())
+
     def stats(self) -> dict:
         return {
             "enabled": self._enabled,
@@ -130,9 +158,13 @@ class TeamClassifier:
             "broken": self._broken,
             "warmup_crops": len(self._warmup_crops),
             "target_cluster_id": self._target_cluster_id,
+            "user_supplied_color": self._user_supplied_color,
+            "auto_detected_color": self._auto_detected_color,
+            "active_target_color": self.target_color,
             "n_predictions": self.n_predictions,
             "n_target": self.n_target,
             "n_opponent": self.n_opponent,
+            "n_cache_hits": self.n_cache_hits,
         }
 
     # ─── Internal ───────────────────────────────────────────────────────────
@@ -179,7 +211,17 @@ class TeamClassifier:
         return emb
 
     def _try_fit(self) -> None:
-        """One-shot KMeans fit on warmup crops. Sets _target_cluster_id via HSV scoring."""
+        """One-shot KMeans fit on warmup crops. Sets _target_cluster_id via HSV scoring.
+
+        v8.33.2 fixes:
+          - Auto-detect dominant saturated hue per cluster; if user-supplied
+            target_color doesn't match either cluster strongly, replace it
+            with the more vivid cluster's detected color.
+          - Score both clusters across the user color AND its likely teammate
+            colors (navy ↔ yellow/gold, white ↔ blue, etc.) so a navy/yellow
+            team scored against "navy" still picks the yellow cluster as target.
+          - Clear track cache so warmup HSV-fallback decisions don't stick.
+        """
         if self._fitted or self._broken:
             return
         if not self._load_model():
@@ -190,25 +232,146 @@ class TeamClassifier:
             self._kmeans = KMeans(n_clusters=2, n_init=10, random_state=42).fit(embs)
             labels = self._kmeans.labels_
 
-            # Tiebreaker: which cluster has higher HSV target_color overlap?
-            cluster_score = {0: 0.0, 1: 0.0}
+            # Detect each cluster's dominant saturated hue from warmup crops.
+            cluster_crops: dict[int, list] = {0: [], 1: []}
+            for crop, lbl in zip(self._warmup_crops, labels):
+                if len(cluster_crops[lbl]) < HSV_TIEBREAKER_SAMPLES:
+                    cluster_crops[lbl].append(crop)
+            cluster_color = {
+                0: _detect_dominant_color(cluster_crops[0]) or "unknown",
+                1: _detect_dominant_color(cluster_crops[1]) or "unknown",
+            }
+
+            # Empirical insight (vision-verified on St. Mark's 2024 footage):
+            # the user's accent color (e.g. "navy") shows up on BOTH teams
+            # because every team has navy/dark numbers/trim somewhere. The
+            # target team's distinctive partner color (yellow/gold) only
+            # appears on the target team. So score each cluster on the
+            # PARTNER colors (palette[1:]) — the user color is excluded
+            # from scoring because it's not discriminative.
+            target_palette = _expand_target_palette(self._user_supplied_color)
+            partner_colors = target_palette[1:] if len(target_palette) > 1 else target_palette
+            cluster_partner_score = {0: 0.0, 1: 0.0}
+            cluster_primary_score = {0: 0.0, 1: 0.0}
             cluster_n = {0: 0, 1: 0}
             for crop, lbl in zip(self._warmup_crops, labels):
                 cluster_n[lbl] += 1
                 if cluster_n[lbl] <= HSV_TIEBREAKER_SAMPLES:
-                    cluster_score[lbl] += _hsv_target_ratio(crop, self.target_color)
-            self._target_cluster_id = (
-                0 if cluster_score[0] > cluster_score[1] else 1
-            )
+                    cluster_partner_score[lbl] += max(
+                        _hsv_target_ratio(crop, c) for c in partner_colors
+                    )
+                    cluster_primary_score[lbl] += _hsv_target_ratio(
+                        crop, target_palette[0]
+                    )
+
+            # Pick the cluster with HIGHER partner-color presence. Partner
+            # colors are the discriminative ones; whichever cluster has
+            # more of them is the target team.
+            picked: int
+            if cluster_partner_score[0] != cluster_partner_score[1]:
+                picked = 0 if cluster_partner_score[0] > cluster_partner_score[1] else 1
+            else:
+                # No partner-color signal at all. Fall back to vivid_rank on
+                # detected colors — pick the more saturated cluster.
+                vivid_rank = {
+                    "yellow": 6, "gold": 6, "orange": 5, "red": 5, "green": 4,
+                    "navy": 3, "blue": 3, "purple": 3, "white": 1, "black": 1,
+                    "unknown": 0,
+                }
+                if vivid_rank.get(cluster_color[1], 0) > vivid_rank.get(cluster_color[0], 0):
+                    picked = 1
+                else:
+                    picked = 0
+
+            self._target_cluster_id = picked
+            cluster_score = {  # kept for the log line below
+                0: f"partner={cluster_partner_score[0]:.3f}/primary={cluster_primary_score[0]:.3f}",
+                1: f"partner={cluster_partner_score[1]:.3f}/primary={cluster_primary_score[1]:.3f}",
+            }
+
+            self._auto_detected_color = cluster_color[picked]
+            # Sync target_color so downstream HSV fallbacks use the right color.
+            if self._auto_detected_color and self._auto_detected_color != "unknown":
+                self.target_color = self._auto_detected_color
+
             self._fitted = True
             self._warmup_crops = []  # release memory
+
+            # CRITICAL: clear track cache so warmup HSV-fallback decisions
+            # don't lock in the wrong team for the rest of the video.
+            n_cleared = len(self._track_cache)
+            self._track_cache.clear()
+
             LOGGER.info(
-                "TeamClassifier: fitted (target=cluster %d, scores: %s)",
-                self._target_cluster_id, cluster_score,
+                "TeamClassifier: fitted target=cluster_%d cluster_colors=%s "
+                "palette_scores=%s user_color=%s auto_color=%s cleared_cache=%d",
+                self._target_cluster_id, cluster_color, cluster_score,
+                self._user_supplied_color, self._auto_detected_color, n_cleared,
             )
         except Exception as exc:
             LOGGER.warning("TeamClassifier: fit failed (%s) — using HSV fallback", exc)
             self._broken = True
+
+
+def _expand_target_palette(color: str) -> list[str]:
+    """Return user color plus its likely *teammate* (paired) colors.
+
+    Many high-school teams pair a dark accent with a vivid base — 'navy'
+    jerseys are often actually yellow with navy numbers, 'maroon' often
+    pairs with gold, etc. The returned palette deliberately EXCLUDES
+    common opponent colors (e.g. plain white) so the cluster-scoring
+    favors the target team's distinctive coloration.
+    """
+    base = (color or "").lower().strip()
+    pairings = {
+        "navy":   ["navy", "yellow", "gold"],
+        "blue":   ["blue", "navy", "yellow"],
+        "white":  ["white", "red", "blue"],   # white-base teams usually have a colored accent
+        "red":    ["red", "white", "gold"],
+        "maroon": ["maroon", "gold", "yellow"],
+        "black":  ["black", "gold", "red"],
+        "gold":   ["gold", "yellow", "navy"],
+        "yellow": ["yellow", "gold", "navy"],
+        "green":  ["green", "gold", "yellow"],
+        "purple": ["purple", "gold", "yellow"],
+        "orange": ["orange", "navy", "black"],
+    }
+    return pairings.get(base, [base] if base else ["white"])
+
+
+def _detect_dominant_color(crops: list[np.ndarray]) -> str | None:
+    """Return the dominant saturated hue across crops as a color name.
+
+    Masks out low-saturation/low-value pixels (skin, gray, white, black)
+    before histogramming hues, so the result reflects actual jersey color
+    rather than skin tone or shadows.
+    """
+    if not crops:
+        return None
+    import cv2
+    hue_counts: dict[int, int] = {}
+    for crop in crops:
+        if crop is None or crop.size == 0:
+            continue
+        try:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            sat_mask = (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 60)
+            hues = hsv[:, :, 0][sat_mask]
+            for h in hues.tolist():
+                hue_counts[h] = hue_counts.get(h, 0) + 1
+        except Exception:
+            continue
+    if not hue_counts:
+        return None
+    # Find the color bucket with the most matching hues.
+    best_color = None
+    best_count = 0
+    for h_lo, h_hi, name in HUE_BUCKETS:
+        cnt = sum(c for h, c in hue_counts.items() if h_lo <= h < h_hi)
+        if cnt > best_count:
+            best_count = cnt
+            best_color = name
+    return best_color
 
 
 def _hsv_target_ratio(crop: np.ndarray, target_color: str) -> float:

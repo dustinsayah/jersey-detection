@@ -340,6 +340,16 @@ def _filter_unwanted_clips(
         has_audio = bool(signals.get("audio")) if isinstance(signals, dict) else False
         moment_count = int(c.get("momentCount", 0) or 0)
 
+        # v8.33.1: drop clips already graded "Cut" upstream (e.g. opponent-
+        # majority team clusters from the SigLIP team classifier).
+        if (c.get("grade") or "").strip() == "Cut":
+            LOGGER.info(
+                "Filtered Cut-graded clip: %.0fs-%.0fs (team_majority=%s)",
+                c.get("startTime", 0), c.get("endTime", 0),
+                c.get("teamMajority", "?"),
+            )
+            continue
+
         # v8.31.2: At 360p (which is Railway's typical YouTube download
         # resolution), OCR rarely fires — even real plays come back with
         # signals.jersey=0.0 and tvf=0. Trust the frame-state classifier:

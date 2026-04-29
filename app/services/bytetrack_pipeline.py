@@ -307,6 +307,13 @@ def run_bytetrack_detection(
     # Per-track jersey accumulator: {track_id: {jersey_num_str: count}}
     track_jerseys: dict[int, dict[str, int]] = {}
 
+    # SigLIP team classifier — falls back to HSV during warmup and on any failure.
+    # v8.33.1: replaces fixed HSV ranges with data-driven 2-cluster KMeans on
+    # SigLIP embeddings of torso crops. Robust to unusual jersey colors and
+    # broadcast lighting.
+    from app.services.team_classifier import TeamClassifier
+    team_clf = TeamClassifier(target_color=target_color)
+
     # Moments where play is happening with target visible or target team on field
     play_moments: list[dict] = []
 
@@ -382,7 +389,7 @@ def run_bytetrack_detection(
                 if crop is None:
                     continue
 
-                team = classify_team_hsv(crop, target_color)
+                team = team_clf.predict(crop)
                 if team == "target":
                     target_team_count += 1
 
@@ -409,12 +416,24 @@ def run_bytetrack_detection(
                     + (min(target_team_count, 5) * 5)
                     + (min(len(tracked), 15) * 2)
                 )
+                # team_majority: 'target' if more than half tracked players are target,
+                # 'opponent' if more than half are opponent, else 'mixed'.
+                # Used downstream in _cluster_to_clips to demote clips that are
+                # mostly opponent-on-offense.
+                _opp_count = max(0, len(tracked) - target_team_count)
+                if target_team_count > _opp_count:
+                    team_majority = "target"
+                elif _opp_count > target_team_count:
+                    team_majority = "opponent"
+                else:
+                    team_majority = "mixed"
                 play_moments.append({
                     "timestamp": round(timestamp, 1),
                     "player_count": len(tracked),
                     "target_visible": target_seen,
                     "jersey_conf": round(best_jersey_conf, 3),
                     "target_team_count": target_team_count,
+                    "team_majority": team_majority,
                     "score": round(score),
                     "state": state,
                     "real_motion": round(real_motion, 2),
@@ -539,6 +558,18 @@ def _finalize_clip(
     real_motion_avg = float(np.mean(_rm_vals)) if _rm_vals else 0.0
     real_motion_max = float(max(_rm_vals)) if _rm_vals else 0.0
 
+    # v8.33.1: team-majority signal (SigLIP-clustered). If the cluster is
+    # mostly opponent-on-offense, the clip is showing the wrong team's play —
+    # demote to Cut so the post-filter drops it.
+    _team_counts = {"target": 0, "opponent": 0, "mixed": 0, "unknown": 0}
+    for m in moments:
+        tm = m.get("team_majority", "unknown")
+        _team_counts[tm] = _team_counts.get(tm, 0) + 1
+    opponent_majority = (
+        _team_counts["opponent"] > _team_counts["target"]
+        and _team_counts["opponent"] >= len(moments) * 0.5
+    )
+
     # Determine play type
     if jersey_confirmed:
         play_type = "game_action"
@@ -549,7 +580,11 @@ def _finalize_clip(
 
     # v8.31: Grade respects target persistence — a +80 single-frame OCR boost
     # shouldn't promote a clip to "Strong" if the target was barely visible.
-    if max_score >= 60 and target_visibility_ratio >= 0.20:
+    # v8.33.1: opponent-majority forces grade = Cut regardless of score, since
+    # the clip is showing the other team's play.
+    if opponent_majority and not jersey_confirmed:
+        grade = "Cut"
+    elif max_score >= 60 and target_visibility_ratio >= 0.20:
         grade = "Strong"
     elif max_score >= 35:
         grade = "Decent"
@@ -599,5 +634,9 @@ def _finalize_clip(
         "playerSpecificScore": round(max_score * 0.5),
         "realMotionAvg": round(real_motion_avg, 2),
         "realMotionMax": round(real_motion_max, 2),
+        "teamMajority": "opponent" if opponent_majority else (
+            "target" if _team_counts["target"] >= _team_counts["opponent"] else "mixed"
+        ),
+        "teamMajorityCounts": {k: int(v) for k, v in _team_counts.items()},
         "caption": f"{'#' + target_jersey + ' — ' if jersey_confirmed else ''}{play_type.replace('_', ' ').title()}",
     }

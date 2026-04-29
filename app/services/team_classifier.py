@@ -28,8 +28,11 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 SIGLIP_MODEL = "google/siglip-base-patch16-224"
-WARMUP_TARGET = 60  # min crops collected before fitting (was 30 — too few for KMeans)
-WARMUP_MAX = 120  # max collected before forcing fit
+# v8.33.3: kept at 30 (was bumped to 60 in v8.33.2). For short windows
+# (e.g. 200s phase1 segments) a larger pool delays the fit past most of
+# the window, leaving warmup HSV labels in place for nearly every play.
+WARMUP_TARGET = 30
+WARMUP_MAX = 80
 HSV_TIEBREAKER_SAMPLES = 16  # how many crops per cluster to score for target match
 
 # Hue buckets used by _detect_dominant_color: (h_lo, h_hi, color_name)
@@ -267,22 +270,29 @@ class TeamClassifier:
             # Pick the cluster with HIGHER partner-color presence. Partner
             # colors are the discriminative ones; whichever cluster has
             # more of them is the target team.
+            #
+            # CRITICAL guardrail (v8.33.3): if the warmup pool didn't see
+            # both teams (e.g. a 200s window where only one team is on
+            # offense), neither cluster will have meaningful partner signal.
+            # Picking arbitrarily then mislabels REAL target plays as
+            # opponent and the downstream filter drops them. When that
+            # happens, mark broken=True so all subsequent predicts use the
+            # HSV fallback (matches v8.33.1 behavior — never false-cuts a
+            # real target play just because we couldn't separate teams).
+            partner_max = max(cluster_partner_score[0], cluster_partner_score[1])
+            partner_diff = abs(cluster_partner_score[0] - cluster_partner_score[1])
             picked: int
-            if cluster_partner_score[0] != cluster_partner_score[1]:
-                picked = 0 if cluster_partner_score[0] > cluster_partner_score[1] else 1
-            else:
-                # No partner-color signal at all. Fall back to vivid_rank on
-                # detected colors — pick the more saturated cluster.
-                vivid_rank = {
-                    "yellow": 6, "gold": 6, "orange": 5, "red": 5, "green": 4,
-                    "navy": 3, "blue": 3, "purple": 3, "white": 1, "black": 1,
-                    "unknown": 0,
-                }
-                if vivid_rank.get(cluster_color[1], 0) > vivid_rank.get(cluster_color[0], 0):
-                    picked = 1
-                else:
-                    picked = 0
-
+            if partner_max < 0.10 or partner_diff < 0.05:
+                LOGGER.warning(
+                    "TeamClassifier: weak partner-color signal "
+                    "(max=%.3f diff=%.3f) — disabling SigLIP, falling back "
+                    "to HSV. cluster_colors=%s",
+                    partner_max, partner_diff, cluster_color,
+                )
+                self._broken = True
+                self._fitted = False
+                return
+            picked = 0 if cluster_partner_score[0] > cluster_partner_score[1] else 1
             self._target_cluster_id = picked
             cluster_score = {  # kept for the log line below
                 0: f"partner={cluster_partner_score[0]:.3f}/primary={cluster_primary_score[0]:.3f}",

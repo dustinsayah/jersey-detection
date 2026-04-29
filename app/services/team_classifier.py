@@ -65,18 +65,34 @@ class TeamClassifier:
         self._processor: Any = None
         self._kmeans: Any = None
         self._target_cluster_id: int | None = None
+        # Per-track cluster cache: once we've decided track_id N is cluster 0,
+        # subsequent calls with the same track_id reuse that decision without
+        # another SigLIP forward pass. This keeps Railway's CPU-only inference
+        # at one embedding per unique track instead of one per (frame, track).
+        self._track_cache: dict[int, str] = {}
         # Stats for debug
         self.n_predictions = 0
         self.n_target = 0
         self.n_opponent = 0
+        self.n_cache_hits = 0
 
     # ─── Public API ─────────────────────────────────────────────────────────
 
-    def predict(self, crop: np.ndarray) -> str:
-        """Return 'target' or 'opponent' (or 'unknown' on bad crop)."""
+    def predict(self, crop: np.ndarray, track_id: int | None = None) -> str:
+        """Return 'target' or 'opponent' (or 'unknown' on bad crop).
+
+        If track_id is provided, the cluster decision is cached so each
+        unique track gets at most one SigLIP forward pass over the lifetime
+        of this classifier — critical for CPU-only deployment.
+        """
         self.n_predictions += 1
         if crop is None or crop.size == 0:
             return "unknown"
+
+        # Track cache (post-fit only): same track keeps the same team
+        if track_id is not None and track_id in self._track_cache:
+            self.n_cache_hits += 1
+            return self._track_cache[track_id]
 
         # Disabled or already broken → HSV path
         if not self._enabled or self._broken:
@@ -90,11 +106,13 @@ class TeamClassifier:
                 self._try_fit()
             return self._hsv_fallback(crop)
 
-        # Post-fit: SigLIP embed → KMeans predict
+        # Post-fit: SigLIP embed → KMeans predict, cache by track
         try:
             emb = self._embed([crop])
             cluster = int(self._kmeans.predict(emb)[0])
             label = "target" if cluster == self._target_cluster_id else "opponent"
+            if track_id is not None:
+                self._track_cache[track_id] = label
             if label == "target":
                 self.n_target += 1
             else:

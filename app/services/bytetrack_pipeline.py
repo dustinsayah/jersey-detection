@@ -389,7 +389,7 @@ def run_bytetrack_detection(
                 if crop is None:
                     continue
 
-                team = team_clf.predict(crop)
+                team = team_clf.predict(crop, track_id=track_id)
                 if team == "target":
                     target_team_count += 1
 

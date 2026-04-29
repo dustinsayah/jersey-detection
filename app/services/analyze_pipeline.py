@@ -593,6 +593,31 @@ def _build_player_summary(
     }
 
 
+def _build_source_meta(
+    local_video_path: "Path | None",
+    video_url: str | None,
+) -> dict:
+    """Return sourceUrl + downloadResolution for inclusion in /analyze-jobs result.
+
+    sourceUrl is the original requested URL (YouTube or direct).
+    downloadResolution is the actual probed resolution of the file Railway
+    fetched — this is the only authoritative answer to "what did we download
+    this game at?" since the YouTube format chain can fall back below the
+    requested ceiling.
+    """
+    out: dict = {"sourceUrl": video_url or None}
+    if local_video_path and local_video_path.exists():
+        try:
+            w, h = get_video_resolution(local_video_path)
+            out["downloadResolution"] = {"width": int(w), "height": int(h)}
+            out["downloadSizeMb"] = round(local_video_path.stat().st_size / 1024 / 1024, 1)
+        except Exception:
+            out["downloadResolution"] = None
+    else:
+        out["downloadResolution"] = None
+    return out
+
+
 def _detect_play_type_rules(
     motion_score: float,
     pose: str,
@@ -984,6 +1009,7 @@ async def _run_analyze_pipeline_impl(
                     "youtube_strategy": youtube_strategy_used,
                     "layer_timings": layer_timings,
                     "video_duration": video_duration,
+                    **_build_source_meta(local_video_path, video_url),
                     "debug": {
                         "pipeline": "bytetrack_v1",
                         "clips_raw": bt_raw_count,
@@ -3077,6 +3103,7 @@ async def _run_analyze_pipeline_impl(
             "gameStats": stat_result.get("game_stats", {}),
             "perClipStats": stat_result.get("per_clip_stats", []),
             "actionsDetected": stat_result.get("actions_detected", []),
+            **_build_source_meta(local_video_path, video_url),
             "debug": debug,
         }
 
@@ -3950,6 +3977,7 @@ async def _run_chunked_full_game(
         "gameStats": {},
         "perClipStats": [],
         "actionsDetected": [],
+        **_build_source_meta(local_video_path, video_url),
         "debug": debug,
     }
 

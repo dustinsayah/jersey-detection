@@ -455,8 +455,13 @@ def run_bytetrack_detection(
                             best_jersey_conf = jersey_conf
 
             # 6. Score this moment
-            # Only keep moments where we see target team or target jersey
-            if target_seen or target_team_count >= 3:
+            # Keep moments where the target jersey OCR fired, OR any
+            # yellow torso was seen (target team is on the field). The
+            # earlier >= 3 threshold was tuned to v8.33.1's permissive
+            # HSV which counted nearly everyone as target; v8.33.4's
+            # selective HSV typically reports 1-4 yellow torsos for a
+            # target play, so the gate is lowered to 1 to match.
+            if target_seen or target_team_count >= 1:
                 score = (
                     (80 if target_seen else 0)
                     + (best_jersey_conf * 30)

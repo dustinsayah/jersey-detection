@@ -223,7 +223,16 @@ def classify_team_hsv(
     crop: np.ndarray,
     target_color: str,
 ) -> str:
-    """Classify a player crop as 'target' or 'opponent' based on jersey color."""
+    """Classify a player crop as 'target' or 'opponent' based on jersey color.
+
+    v8.33.4: discriminates by PARTNER color presence rather than the user's
+    primary color. Many teams' user-supplied color (e.g. "navy") is the
+    accent that BOTH teams' jerseys carry as numbers/trim — so checking
+    primary-color overlap mislabels everything as target. Partner colors
+    (yellow/gold for navy, etc.) are the team's distinctive base hue and
+    only appear on the actual target team. Fallback to primary if we have
+    no partner palette for the user color.
+    """
     if crop is None or crop.size == 0:
         return "unknown"
 
@@ -246,15 +255,49 @@ def classify_team_hsv(
     if key not in color_ranges:
         return "unknown"
 
-    lower, upper = color_ranges[key]
-    lower = np.array(lower)
-    upper = np.array(upper)
+    # Partner-color discriminator: pick the team-distinctive partner colors
+    # for the user-supplied accent. Vision-verified on St. Mark's 2024
+    # footage: yellow appears in 10-20% of target torsos, 0% of opponent
+    # torsos — a much cleaner signal than navy itself.
+    from app.services.team_classifier import _expand_target_palette
+    palette = _expand_target_palette(key)
+    partner_colors = [c for c in palette[1:] if c in color_ranges]
 
     try:
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, lower, upper)
-        ratio = np.sum(mask > 0) / mask.size
-        return "target" if ratio > 0.06 else "opponent"
+        # Compute partner-color presence (the discriminative signal)
+        partner_max = 0.0
+        for pc in partner_colors:
+            lower_p, upper_p = color_ranges[pc]
+            mask_p = cv2.inRange(hsv, np.array(lower_p), np.array(upper_p))
+            partner_max = max(partner_max, np.sum(mask_p > 0) / mask_p.size)
+
+        # Compute primary-color presence (legacy signal, kept as backstop)
+        lower, upper = color_ranges[key]
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        primary_ratio = np.sum(mask > 0) / mask.size
+
+        # Decision rule:
+        # 1. partner_max > 0.005 → "target" (any visible yellow/gold means
+        #    this is a target-team player; threshold tuned empirically on
+        #    St. Mark's footage where target torsos average 0.001-0.16
+        #    yellow ratio and opponent torsos average ~0.0).
+        # 2. partner_max == 0 AND primary_ratio > 0.06 → "opponent"
+        #    (player wears the accent color but no partner — typical of
+        #    opponents whose base jerseys are blue/white/navy without
+        #    yellow accents).
+        # 3. otherwise → "unknown" (target player with back to camera, in
+        #    shadow, or too far away to register yellow). Returning
+        #    "unknown" instead of defaulting to "opponent" stops the
+        #    downstream filter from cutting target plays where most
+        #    target players happen to be facing away.
+        if partner_colors:
+            if partner_max > 0.005:
+                return "target"
+            if primary_ratio > 0.06:
+                return "opponent"
+            return "unknown"
+        return "target" if primary_ratio > 0.06 else "opponent"
     except Exception:
         return "unknown"
 
@@ -379,6 +422,7 @@ def run_bytetrack_detection(
             target_seen = False
             best_jersey_conf = 0.0
             target_team_count = 0
+            opp_team_count = 0  # v8.33.4: explicit opp count (was inferred)
 
             for i in range(len(tracked)):
                 track_id = int(tracked.tracker_id[i])
@@ -392,6 +436,9 @@ def run_bytetrack_detection(
                 team = team_clf.predict(crop, track_id=track_id)
                 if team == "target":
                     target_team_count += 1
+                elif team == "opponent":
+                    opp_team_count += 1
+                # else "unknown" — don't count as either team
 
                 # Jersey OCR (only on every 3rd tracked player to save CPU)
                 if i % 3 == 0 or target_team_count > 0:
@@ -416,14 +463,19 @@ def run_bytetrack_detection(
                     + (min(target_team_count, 5) * 5)
                     + (min(len(tracked), 15) * 2)
                 )
-                # team_majority: 'target' if more than half tracked players are target,
-                # 'opponent' if more than half are opponent, else 'mixed'.
-                # Used downstream in _cluster_to_clips to demote clips that are
-                # mostly opponent-on-offense.
-                _opp_count = max(0, len(tracked) - target_team_count)
-                if target_team_count > _opp_count:
+                # Asymmetric team-majority rule (v8.33.4):
+                #   target_team_count >= 1  → "target"  (any visible yellow
+                #     torso means the target team is on the field — a
+                #     high-confidence signal because the opponent never
+                #     wears yellow on St. Mark's footage)
+                #   opp_team_count >= 1     → "opponent"
+                #   otherwise               → "mixed"
+                # Yellow DETECTION is high-confidence; yellow ABSENCE is
+                # not (target players facing away show no yellow). So we
+                # trust the positive signal asymmetrically.
+                if target_team_count >= 1:
                     team_majority = "target"
-                elif _opp_count > target_team_count:
+                elif opp_team_count >= 1:
                     team_majority = "opponent"
                 else:
                     team_majority = "mixed"

@@ -726,6 +726,14 @@ def _finalize_clip(
     # Replaces the generic recruitingScore with a rubric tuned to what college
     # coaches actually want to see for the requested position.  The legacy
     # max_score is preserved as `legacyScore` for debugging.
+    #
+    # v8.34.1: do NOT override the upstream ``grade`` field with the rubric's
+    # grade. The upstream grade encodes hard-cut signals (opponent_majority,
+    # max_score < 35) that the post-filter (analyze_pipeline._filter_unwanted_clips)
+    # uses to drop clips. The rubric grade is conservative and would cause every
+    # clip to fall under the post-filter's ``grade == "Cut"`` rule, dropping
+    # legitimate plays. positionScore.grade is exposed separately so the UI/render
+    # can prefer it without the back-end filter dropping the clip.
     try:
         from app.services.position_scorer import score_clip
         formations = [m.get("formation") for m in moments if m.get("formation")]
@@ -734,7 +742,7 @@ def _finalize_clip(
         clip_dict["legacyScore"] = clip_dict["recruitingScore"]
         clip_dict["recruitingScore"] = round(scoring.final_score)
         clip_dict["positionScore"] = scoring_dict
-        clip_dict["grade"] = scoring.grade
+        # NOTE: clip_dict["grade"] left unchanged on purpose (see above).
         # qb_track_id consensus for downstream use (spotlight, render hint)
         if formations:
             from app.services.qb_detector import vote_qb_track_id

@@ -357,6 +357,13 @@ def run_bytetrack_detection(
     from app.services.team_classifier import TeamClassifier
     team_clf = TeamClassifier(target_color=target_color)
 
+    # v8.34.0: QB position detector — formation-clustering approach (no new
+    # model). Identifies the line of scrimmage as the densest target-team
+    # y-band and the QB as the target player furthest behind it. Pure NumPy.
+    # Only applied when position == "quarterback".
+    from app.services.qb_detector import QBDetector
+    qb_detector = QBDetector() if position.lower() == "quarterback" else None
+
     # Moments where play is happening with target visible or target team on field
     play_moments: list[dict] = []
 
@@ -423,6 +430,9 @@ def run_bytetrack_detection(
             best_jersey_conf = 0.0
             target_team_count = 0
             opp_team_count = 0  # v8.33.4: explicit opp count (was inferred)
+            # v8.34.0: collect target-team bboxes for QB position detection
+            target_bbox_list: list[np.ndarray] = []
+            target_track_id_list: list[int] = []
 
             for i in range(len(tracked)):
                 track_id = int(tracked.tracker_id[i])
@@ -436,6 +446,8 @@ def run_bytetrack_detection(
                 team = team_clf.predict(crop, track_id=track_id)
                 if team == "target":
                     target_team_count += 1
+                    target_bbox_list.append(bbox)
+                    target_track_id_list.append(track_id)
                 elif team == "opponent":
                     opp_team_count += 1
                 # else "unknown" — don't count as either team
@@ -484,6 +496,14 @@ def run_bytetrack_detection(
                     team_majority = "opponent"
                 else:
                     team_majority = "mixed"
+                # v8.34.0: per-frame QB position analysis (only for QB jobs)
+                formation_dict: dict | None = None
+                if qb_detector is not None and len(target_bbox_list) >= 4:
+                    target_bb = np.array(target_bbox_list, dtype=float)
+                    target_ids = np.array(target_track_id_list, dtype=int)
+                    formation = qb_detector.analyze_frame(target_bb, target_ids, fh, fw)
+                    formation_dict = formation.as_dict()
+
                 play_moments.append({
                     "timestamp": round(timestamp, 1),
                     "player_count": len(tracked),
@@ -494,6 +514,7 @@ def run_bytetrack_detection(
                     "score": round(score),
                     "state": state,
                     "real_motion": round(real_motion, 2),
+                    "formation": formation_dict,
                 })
 
         except Exception as exc:
@@ -514,8 +535,8 @@ def run_bytetrack_detection(
         best = max(votes, key=votes.get) if votes else "?"
         LOGGER.info("ByteTrack: track #%d → jersey votes: %s (best: #%s)", tid, votes, best)
 
-    # 7. Cluster moments into clips
-    clips = _cluster_to_clips(play_moments, duration, target_jersey)
+    # 7. Cluster moments into clips (passes position so finalize can score)
+    clips = _cluster_to_clips(play_moments, duration, target_jersey, position)
 
     LOGGER.info("ByteTrack: %d clips assembled in %.1fs total", len(clips), elapsed)
 
@@ -529,6 +550,7 @@ def _cluster_to_clips(
     moments: list[dict],
     video_duration: float,
     target_jersey: str,
+    position: str = "quarterback",
 ) -> list[dict]:
     """Cluster play moments into clip segments."""
     if not moments:
@@ -554,7 +576,7 @@ def _cluster_to_clips(
         # almost always frame-state classifier flukes (a single misread frame).
         if len(cluster) < 2:
             continue
-        clip = _finalize_clip(cluster, video_duration, target_jersey)
+        clip = _finalize_clip(cluster, video_duration, target_jersey, position)
         if clip:
             clips.append(clip)
 
@@ -567,6 +589,7 @@ def _finalize_clip(
     moments: list[dict],
     video_duration: float,
     target_jersey: str,
+    position: str = "quarterback",
 ) -> Optional[dict]:
     """Convert a cluster of play moments into a single clip."""
     if not moments:
@@ -667,7 +690,8 @@ def _finalize_clip(
         "jersey_dist": 0.0 if jersey_confirmed else 9999.0,
     }
 
-    return {
+    # Build the base clip dict first so we can pass it to the position scorer.
+    clip_dict = {
         "startTime": round(start, 1),
         "endTime": round(end, 1),
         "playType": play_type,
@@ -697,3 +721,34 @@ def _finalize_clip(
         "teamMajorityCounts": {k: int(v) for k, v in _team_counts.items()},
         "caption": f"{'#' + target_jersey + ' — ' if jersey_confirmed else ''}{play_type.replace('_', ' ').title()}",
     }
+
+    # v8.34.0: position-specific scoring rubric.
+    # Replaces the generic recruitingScore with a rubric tuned to what college
+    # coaches actually want to see for the requested position.  The legacy
+    # max_score is preserved as `legacyScore` for debugging.
+    try:
+        from app.services.position_scorer import score_clip
+        formations = [m.get("formation") for m in moments if m.get("formation")]
+        scoring = score_clip(position, clip_dict, moments, formations or None)
+        scoring_dict = scoring.as_dict()
+        clip_dict["legacyScore"] = clip_dict["recruitingScore"]
+        clip_dict["recruitingScore"] = round(scoring.final_score)
+        clip_dict["positionScore"] = scoring_dict
+        clip_dict["grade"] = scoring.grade
+        # qb_track_id consensus for downstream use (spotlight, render hint)
+        if formations:
+            from app.services.qb_detector import vote_qb_track_id
+            from app.services.qb_detector import FormationFrame  # noqa: F401
+            # vote_qb_track_id wants FormationFrame objects; rebuild lite shells
+            shells = []
+            for f in formations:
+                shell = type("F", (), {})()
+                shell.qb_track_id = f.get("qb_track_id")
+                shell.qb_confidence = f.get("qb_confidence", 0.0)
+                shells.append(shell)
+            qb_id = vote_qb_track_id(shells)
+            clip_dict["qbTrackId"] = qb_id
+    except Exception as exc:
+        LOGGER.warning("position_scorer failed (%s) — keeping legacy score", exc)
+
+    return clip_dict

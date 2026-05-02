@@ -112,6 +112,7 @@ class AnalyzeRequest(BaseModel):
             _ALIAS_MAP = {
                 "start_time": "timeRangeStart",
                 "end_time": "timeRangeEnd",
+                "recall_mode": "recallMode",
             }
             for snake, camel in _ALIAS_MAP.items():
                 if snake in data and camel not in data:
@@ -123,6 +124,12 @@ class AnalyzeRequest(BaseModel):
     enable_pose: bool = Field(default=True, alias="enablePose")
 
     quality_mode: str = Field(default="auto", alias="qualityMode")
+
+    # v8.34.2: recall mode for labeling pipeline. When true, the back-end
+    # skips most "Cut" filters and returns far more clip candidates. Used
+    # only by the labeling tool — production reels still use the default
+    # high-precision mode.
+    recall_mode: bool = Field(default=False, alias="recallMode")
 
     google_access_token: str | None = Field(default=None, alias="googleAccessToken")
 

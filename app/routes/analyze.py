@@ -191,6 +191,7 @@ async def analyze(
         enable_tracking=analyze_request.enable_tracking,
         enable_pose=analyze_request.enable_pose,
         quality_mode=analyze_request.quality_mode,
+        recall_mode=analyze_request.recall_mode,  # v8.34.2
     )
 
     result_holder: dict[str, Any] = {}

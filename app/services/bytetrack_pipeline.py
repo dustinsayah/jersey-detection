@@ -313,11 +313,18 @@ def run_bytetrack_detection(
     position: str = "quarterback",
     sample_fps: float = 1.0,
     progress_callback: Any = None,
+    recall_mode: bool = False,
 ) -> list[dict]:
     """
     Run the full ByteTrack detection pipeline on a video.
 
     Returns list of clip dicts compatible with the existing pipeline output format.
+
+    v8.34.2: ``recall_mode=True`` loosens the moment-recording gate, increases
+    the cluster-gap window, removes the moment-count cap, returns more clips
+    (top 60 vs top 15), and disables the opponent-majority-cuts-grade rule.
+    Used by the labeling tool — production reels still use the default
+    high-precision mode.
     """
     import supervision as sv
 
@@ -473,7 +480,12 @@ def run_bytetrack_detection(
             # HSV which counted nearly everyone as target; v8.33.4's
             # selective HSV typically reports 1-4 yellow torsos for a
             # target play, so the gate is lowered to 1 to match.
-            if target_seen or target_team_count >= 1:
+            #
+            # v8.34.2 recall_mode: drop the gate entirely — record every
+            # frame classified as "play" by classify_frame_state. The
+            # labeling tool decides what's worth keeping.
+            recall_gate_passed = recall_mode and len(tracked) >= 6
+            if target_seen or target_team_count >= 1 or recall_gate_passed:
                 score = (
                     (80 if target_seen else 0)
                     + (best_jersey_conf * 30)
@@ -536,7 +548,7 @@ def run_bytetrack_detection(
         LOGGER.info("ByteTrack: track #%d → jersey votes: %s (best: #%s)", tid, votes, best)
 
     # 7. Cluster moments into clips (passes position so finalize can score)
-    clips = _cluster_to_clips(play_moments, duration, target_jersey, position)
+    clips = _cluster_to_clips(play_moments, duration, target_jersey, position, recall_mode=recall_mode)
 
     LOGGER.info("ByteTrack: %d clips assembled in %.1fs total", len(clips), elapsed)
 
@@ -551,6 +563,7 @@ def _cluster_to_clips(
     video_duration: float,
     target_jersey: str,
     position: str = "quarterback",
+    recall_mode: bool = False,
 ) -> list[dict]:
     """Cluster play moments into clip segments."""
     if not moments:
@@ -558,12 +571,15 @@ def _cluster_to_clips(
 
     moments = sorted(moments, key=lambda m: m["timestamp"])
 
+    # v8.34.2: cluster gap 20s → 30s in recall mode so nearby plays
+    # group into single clips (matches the rhythm of plays in a series).
+    cluster_gap = 30 if recall_mode else 20
+
     clusters: list[list[dict]] = []
     current: list[dict] = [moments[0]]
 
     for m in moments[1:]:
-        # Gap > 20s → new cluster
-        if m["timestamp"] - current[-1]["timestamp"] > 20:
+        if m["timestamp"] - current[-1]["timestamp"] > cluster_gap:
             clusters.append(current)
             current = [m]
         else:
@@ -576,13 +592,15 @@ def _cluster_to_clips(
         # almost always frame-state classifier flukes (a single misread frame).
         if len(cluster) < 2:
             continue
-        clip = _finalize_clip(cluster, video_duration, target_jersey, position)
+        clip = _finalize_clip(cluster, video_duration, target_jersey, position, recall_mode=recall_mode)
         if clip:
             clips.append(clip)
 
-    # Sort by score descending
+    # Sort by score descending; recall_mode returns far more candidates so the
+    # labeling tool sees everything the detector found.
     clips.sort(key=lambda c: c.get("score", 0), reverse=True)
-    return clips[:15]
+    cap = 60 if recall_mode else 15
+    return clips[:cap]
 
 
 def _finalize_clip(
@@ -590,6 +608,7 @@ def _finalize_clip(
     video_duration: float,
     target_jersey: str,
     position: str = "quarterback",
+    recall_mode: bool = False,
 ) -> Optional[dict]:
     """Convert a cluster of play moments into a single clip."""
     if not moments:
@@ -601,7 +620,8 @@ def _finalize_clip(
     # injury delays) where the camera holds on a wide field view with
     # players present but not playing. Vision-verified examples: clip at
     # 2338s with mom=45 was a 30+s static dead ball.
-    if len(moments) > 25:
+    # v8.34.2: in recall_mode the labeling tool decides — keep up to 80.
+    if len(moments) > (80 if recall_mode else 25):
         return None
 
     peak = max(moments, key=lambda m: m["score"])
@@ -662,7 +682,16 @@ def _finalize_clip(
     # shouldn't promote a clip to "Strong" if the target was barely visible.
     # v8.33.1: opponent-majority forces grade = Cut regardless of score, since
     # the clip is showing the other team's play.
-    if opponent_majority and not jersey_confirmed:
+    # v8.34.2: in recall_mode, never auto-grade as Cut — the labeling tool will
+    # decide. Use a "Recall" grade so downstream filters can identify these.
+    if recall_mode:
+        if max_score >= 60 and target_visibility_ratio >= 0.20:
+            grade = "Strong"
+        elif max_score >= 30:
+            grade = "Decent"
+        else:
+            grade = "Recall"  # custom grade — passes the analyze_pipeline filter
+    elif opponent_majority and not jersey_confirmed:
         grade = "Cut"
     elif max_score >= 60 and target_visibility_ratio >= 0.20:
         grade = "Strong"

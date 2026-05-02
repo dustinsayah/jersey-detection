@@ -765,6 +765,7 @@ async def run_analyze_pipeline(
     enable_tracking: bool = True,
     enable_pose: bool = True,
     quality_mode: str = "auto",
+    recall_mode: bool = False,  # v8.34.2: high-recall mode for labeling
     cancel_event: "threading.Event | None" = None,
 ) -> dict[str, Any]:
     """Run the full analysis pipeline with single-request concurrency.
@@ -976,6 +977,7 @@ async def _run_analyze_pipeline_impl(
                         target_color=jersey_color,
                         position=position or "quarterback",
                         sample_fps=1.0,
+                        recall_mode=recall_mode,
                     )
                 )
                 bt_elapsed = time.perf_counter() - t_bt
@@ -988,12 +990,18 @@ async def _run_analyze_pipeline_impl(
 
                 bt_raw_count = len(bt_clips)
                 LOGGER.info(
-                    "Pipeline: ByteTrack found %d clips in %.1fs",
-                    bt_raw_count, bt_elapsed,
+                    "Pipeline: ByteTrack found %d clips in %.1fs (recall_mode=%s)",
+                    bt_raw_count, bt_elapsed, recall_mode,
                 )
 
-                # Apply dead ball filter
-                bt_clips = _filter_unwanted_clips(bt_clips, sport, position or "quarterback")
+                # Apply dead ball filter — skipped in recall mode so the
+                # labeling tool sees every candidate the detector emitted.
+                if not recall_mode:
+                    bt_clips = _filter_unwanted_clips(bt_clips, sport, position or "quarterback")
+                else:
+                    LOGGER.info("Pipeline: recall_mode=true — skipping _filter_unwanted_clips")
+                    for _c in bt_clips:
+                        _c["recall_mode"] = True
 
                 # Count jersey-confirmed clips
                 jersey_clips = sum(1 for c in bt_clips if c.get("jerseyDetected"))

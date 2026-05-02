@@ -795,6 +795,7 @@ async def run_analyze_pipeline(
             enable_tracking=enable_tracking,
             enable_pose=enable_pose,
             quality_mode=quality_mode,
+            recall_mode=recall_mode,  # v8.34.4: pass through
             cancel_event=cancel_event,
         )
 
@@ -813,6 +814,7 @@ async def _run_analyze_pipeline_impl(
     enable_tracking: bool = True,
     enable_pose: bool = True,
     quality_mode: str = "auto",
+    recall_mode: bool = False,  # v8.34.4: was missing here, caused NameError
     cancel_event: "threading.Event | None" = None,
 ) -> dict[str, Any]:
     """Internal pipeline implementation (called under semaphore)."""

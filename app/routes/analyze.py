@@ -403,6 +403,7 @@ async def analyze_async(
         enable_tracking=analyze_request.enable_tracking,
         enable_pose=analyze_request.enable_pose,
         quality_mode=analyze_request.quality_mode,
+        recall_mode=analyze_request.recall_mode,  # v8.34.5: was missing on /analyze-async
     )
 
     job_id = str(uuid.uuid4())

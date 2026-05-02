@@ -22,16 +22,16 @@ def code(src):
 
 
 CELLS = [
-    md("""# Clipt — X3D-S QB Highlight Classifier (Colab)
+    md("""# Clipt — X3D-XS QB Highlight Classifier (Colab)
 
-Fine-tune **X3D-S** (3.79M params) on Dustin's labels → export INT8 ONNX → drop into Railway.
+Fine-tune **X3D-XS** (3.79M params) on Dustin's labels → export INT8 ONNX → drop into Railway.
 
 **Inputs you provide on Drive at `MyDrive/Clipt/`:**
 - `training_manifest.json` (from `build_training_manifest.py`)
 - `labeling_clips/` directory of MP4s (~1-3MB each, 854x480)
 
 **Outputs (saved back to `MyDrive/Clipt/models/`):**
-- `qb_x3d_s_int8.onnx` — INT8 quantized, ~5MB, Railway-ready
+- `qb_x3d_xs_int8.onnx` — INT8 quantized, ~5MB, Railway-ready
 - training metrics + confusion matrix
 
 **Recommended runtime:** GPU (T4 minimum; A100 finishes in ~10 min)."""),
@@ -110,7 +110,7 @@ print(f'Usable samples: {len(samples)}')"""),
 
     md("""## Cell 5 — 16-frame clip extractor
 
-X3D-S input is 13×182×182 (channels first). We extract 16 evenly-spaced
+X3D-XS input is 13×182×182 (channels first). We extract 16 evenly-spaced
 frames across the labeled clip span, center-crop to square, resize to 182."""),
     code("""import cv2, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
@@ -183,10 +183,10 @@ print(f'class weights: {weights.tolist()}')
 train_dl = DataLoader(ClipDataset(train_s, augment=True),  batch_size=4, shuffle=True,  num_workers=2)
 val_dl   = DataLoader(ClipDataset(val_s,   augment=False), batch_size=4, shuffle=False, num_workers=2)"""),
 
-    md("## Cell 7 — Load X3D-S, swap head, fine-tune"),
+    md("## Cell 7 — Load X3D-XS, swap head, fine-tune"),
     code("""import torch, torch.nn as nn
 
-model = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_s', pretrained=True)
+model = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_xs', pretrained=True)
 in_features = model.blocks[5].proj.in_features
 model.blocks[5].proj = nn.Linear(in_features, NUM_CLASSES)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -226,13 +226,13 @@ for ep in range(EPOCHS):
     flag = ' <- best' if va_acc > best_val else ''
     if va_acc > best_val:
         best_val = va_acc
-        torch.save(model.state_dict(), f'{OUT_DIR}/qb_x3d_s.pth')
+        torch.save(model.state_dict(), f'{OUT_DIR}/qb_x3d_xs.pth')
     print(f'ep {ep+1:02d} | train loss {tr_loss:.3f} acc {tr_acc:.2%} | val loss {va_loss:.3f} acc {va_acc:.2%}{flag}')
 print(f'\\nbest val acc: {best_val:.2%}')"""),
 
     md("## Cell 8 — Confusion matrix on validation set"),
     code("""import torch, numpy as np
-model.load_state_dict(torch.load(f'{OUT_DIR}/qb_x3d_s.pth'))
+model.load_state_dict(torch.load(f'{OUT_DIR}/qb_x3d_xs.pth'))
 model.eval()
 
 ys, preds = [], []
@@ -264,10 +264,10 @@ for i, n in enumerate(class_names):
 
     md("## Cell 9 — ONNX export + INT8 quantize"),
     code("""import torch, os
-model.load_state_dict(torch.load(f'{OUT_DIR}/qb_x3d_s.pth'))
+model.load_state_dict(torch.load(f'{OUT_DIR}/qb_x3d_xs.pth'))
 model.eval().cpu()
 dummy = torch.randn(1, 3, T_FRAMES, SIZE, SIZE)
-fp32 = f'{OUT_DIR}/qb_x3d_s_fp32.onnx'
+fp32 = f'{OUT_DIR}/qb_x3d_xs_fp32.onnx'
 torch.onnx.export(
     model, dummy, fp32,
     input_names=['video'], output_names=['logits'],
@@ -277,13 +277,13 @@ torch.onnx.export(
 print('FP32 ONNX:', os.path.getsize(fp32) // 1024, 'KB')
 
 from onnxruntime.quantization import quantize_dynamic, QuantType
-int8 = f'{OUT_DIR}/qb_x3d_s_int8.onnx'
+int8 = f'{OUT_DIR}/qb_x3d_xs_int8.onnx'
 quantize_dynamic(fp32, int8, weight_type=QuantType.QInt8)
 print('INT8 ONNX:', os.path.getsize(int8) // 1024, 'KB')"""),
 
     md("## Cell 10 — CPU inference benchmark"),
     code("""import onnxruntime as ort, time, numpy as np
-sess = ort.InferenceSession(f'{OUT_DIR}/qb_x3d_s_int8.onnx',
+sess = ort.InferenceSession(f'{OUT_DIR}/qb_x3d_xs_int8.onnx',
                             providers=['CPUExecutionProvider'])
 x = np.random.randn(1, 3, T_FRAMES, SIZE, SIZE).astype(np.float32)
 for _ in range(3):
@@ -300,13 +300,13 @@ else:
 
     md("## Cell 11 — Wiring instructions"),
     code("""print(f'''
-Model file: {OUT_DIR}/qb_x3d_s_int8.onnx
+Model file: {OUT_DIR}/qb_x3d_xs_int8.onnx
 
 NEXT STEPS:
-1. Download {OUT_DIR}/qb_x3d_s_int8.onnx from Drive to your local machine.
+1. Download {OUT_DIR}/qb_x3d_xs_int8.onnx from Drive to your local machine.
 2. Upload to Cloudinary as raw resource:
      curl -X POST https://api.cloudinary.com/v1_1/dc33vjyyv/raw/upload \\
-       -F 'file=@qb_x3d_s_int8.onnx' \\
+       -F 'file=@qb_x3d_xs_int8.onnx' \\
        -F 'upload_preset=clipt_uploads'
    Copy the secure_url from the response.
 3. In Railway dashboard → jersey-detection service → Variables, add:

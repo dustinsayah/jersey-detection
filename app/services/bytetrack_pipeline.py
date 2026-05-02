@@ -371,6 +371,14 @@ def run_bytetrack_detection(
     from app.services.qb_detector import QBDetector
     qb_detector = QBDetector() if position.lower() == "quarterback" else None
 
+    # v8.34.6: optional video preprocessor (CLAHE + sharpen). Opt-in via
+    # CLIPT_PREPROCESS=true env var. Adds ~3-5ms per frame at 360p — negligible
+    # at 1fps sampling. Improves jersey OCR + team color separation.
+    from app.services.video_preprocessor import get_default_preprocessor
+    preprocessor = get_default_preprocessor()
+    if preprocessor:
+        LOGGER.info("ByteTrack: video preprocessing ENABLED")
+
     # Moments where play is happening with target visible or target team on field
     play_moments: list[dict] = []
 
@@ -394,6 +402,10 @@ def run_bytetrack_detection(
         frames_processed += 1
         timestamp = frame_idx / fps
         fh, fw = frame.shape[:2]
+
+        # v8.34.6: optional CLAHE + sharpen preprocessing
+        if preprocessor is not None:
+            frame = preprocessor.process_frame(frame)
 
         # Real frame-diff motion (computed before YOLO so it's always available)
         gray_motion = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

@@ -428,8 +428,15 @@ def run_bytetrack_detection(
                 continue
 
             # 4. Classify frame state
+            # v8.34.3: in recall_mode, also accept "formation" and
+            # "transition" states — only "sideline" and "dead_ball" are
+            # excluded. This is the real source of the 4-clip ceiling
+            # in v8.34.2: state filter dropped most candidate frames.
             state = classify_frame_state(tracked.xyxy, fh, fw)
-            if state != "play":
+            if recall_mode:
+                if state in ("sideline", "dead_ball"):
+                    continue
+            elif state != "play":
                 continue
 
             # 5. For each tracked person: team color + jersey OCR
@@ -587,10 +594,9 @@ def _cluster_to_clips(
     clusters.append(current)
 
     clips = []
+    min_cluster = 1 if recall_mode else 2  # v8.34.3: accept singletons in recall mode
     for cluster in clusters:
-        # Require at least 2 valid play moments per cluster — singletons are
-        # almost always frame-state classifier flukes (a single misread frame).
-        if len(cluster) < 2:
+        if len(cluster) < min_cluster:
             continue
         clip = _finalize_clip(cluster, video_duration, target_jersey, position, recall_mode=recall_mode)
         if clip:

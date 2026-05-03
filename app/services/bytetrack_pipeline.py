@@ -379,6 +379,13 @@ def run_bytetrack_detection(
     if preprocessor:
         LOGGER.info("ByteTrack: video preprocessing ENABLED")
 
+    # v8.34.8: formation classifier — drops frames the model is highly confident
+    # are defense/special_teams. Trained on Dustin's 95 ground-truth labels;
+    # CV ~46%, so we only skip when confidence > 0.7 to avoid false negatives
+    # on offense.
+    from app.services.formation_classifier import FormationClassifier
+    formation_clf = FormationClassifier()
+
     # Moments where play is happening with target visible or target team on field
     play_moments: list[dict] = []
 
@@ -450,6 +457,17 @@ def run_bytetrack_detection(
                     continue
             elif state != "play":
                 continue
+
+            # v8.34.8: formation situation filter — skip frames the classifier
+            # is highly confident are defense or special teams. The classifier
+            # is weak (CV ~46%), so the >0.7 confidence gate keeps offense
+            # recall while still filtering the obvious cases.
+            if not recall_mode:
+                situation, sit_conf = formation_clf.predict(
+                    np.asarray(tracked.xyxy), fh, fw
+                )
+                if situation in ("defense", "special_teams") and sit_conf > 0.7:
+                    continue
 
             # 5. For each tracked person: team color + jersey OCR
             target_seen = False
